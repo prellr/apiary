@@ -16,8 +16,32 @@ pub struct Completion {
     pub output_tokens: u64,
 }
 
+/// Dispatch callback: (tool_name, args) → result string. The HOST owns this —
+/// it checks caps, logs the call, and executes through custody. The model's
+/// tool_use blocks are requests into it, never direct capability.
+pub type ToolDispatch<'a> =
+    &'a mut dyn FnMut(&str, &serde_json::Value) -> Result<String, crate::Error>;
+
 pub trait Provider {
     fn complete(&self, model: &str, system: &str, prompt: &str) -> Result<Completion, crate::Error>;
+
+    /// Multi-turn tool loop. Providers without tool support fall back to a
+    /// plain completion (tools silently unavailable is wrong — so the
+    /// default also flags it in the outcome for the log).
+    fn complete_with_tools(
+        &self,
+        model: &str,
+        system: &str,
+        prompt: &str,
+        tools: &[crate::connector::ToolDef],
+        _dispatch: ToolDispatch,
+    ) -> Result<Completion, crate::Error> {
+        let mut c = self.complete(model, system, prompt)?;
+        if !tools.is_empty() {
+            c.outcome = format!("{} (provider has no tool support; tools unused)", c.outcome);
+        }
+        Ok(c)
+    }
 }
 
 /// Anthropic Messages API over raw HTTP.
@@ -62,8 +86,8 @@ impl AnthropicProvider {
     }
 }
 
-impl Provider for AnthropicProvider {
-    fn complete(&self, model: &str, system: &str, prompt: &str) -> Result<Completion, crate::Error> {
+impl AnthropicProvider {
+    fn request(&self, body: &serde_json::Value) -> Result<serde_json::Value, crate::Error> {
         let client = reqwest::blocking::Client::new();
         let mut req = client
             .post(format!("{}/v1/messages", self.base_url))
@@ -75,14 +99,8 @@ impl Provider for AnthropicProvider {
                 .header("authorization", format!("Bearer {}", t.as_str()))
                 .header("anthropic-beta", "oauth-2025-04-20"),
         };
-        let body = json!({
-            "model": model,
-            "max_tokens": 16000,
-            "system": system,
-            "messages": [{"role": "user", "content": prompt}],
-        });
         let resp = req
-            .json(&body)
+            .json(body)
             .send()
             .map_err(|e| crate::Error::Provider(format!("anthropic request: {e}")))?;
         let status = resp.status();
@@ -91,26 +109,39 @@ impl Provider for AnthropicProvider {
             .map_err(|e| crate::Error::Provider(format!("anthropic response parse: {e}")))?;
         if !status.is_success() {
             let msg = payload["error"]["message"].as_str().unwrap_or("unknown");
-            return Err(crate::Error::Provider(format!(
-                "anthropic {status}: {msg}"
-            )));
+            return Err(crate::Error::Provider(format!("anthropic {status}: {msg}")));
         }
+        Ok(payload)
+    }
+}
+
+fn extract_text(payload: &serde_json::Value) -> String {
+    payload["content"]
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b["type"] == "text")
+                .filter_map(|b| b["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+}
+
+impl Provider for AnthropicProvider {
+    fn complete(&self, model: &str, system: &str, prompt: &str) -> Result<Completion, crate::Error> {
+        let payload = self.request(&json!({
+            "model": model,
+            "max_tokens": 16000,
+            "system": system,
+            "messages": [{"role": "user", "content": prompt}],
+        }))?;
         // Check stop_reason before reading content — refusals return 200
         // with empty or partial content.
         let stop_reason = payload["stop_reason"].as_str().unwrap_or("unknown");
-        let text: String = payload["content"]
-            .as_array()
-            .map(|blocks| {
-                blocks
-                    .iter()
-                    .filter(|b| b["type"] == "text")
-                    .filter_map(|b| b["text"].as_str())
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
-            .unwrap_or_default();
         Ok(Completion {
-            text,
+            text: extract_text(&payload),
             model: payload["model"].as_str().unwrap_or(model).to_string(),
             outcome: match stop_reason {
                 "end_turn" | "stop_sequence" => "ok".into(),
@@ -118,6 +149,97 @@ impl Provider for AnthropicProvider {
             },
             input_tokens: payload["usage"]["input_tokens"].as_u64().unwrap_or(0),
             output_tokens: payload["usage"]["output_tokens"].as_u64().unwrap_or(0),
+        })
+    }
+
+    /// The tool loop: model requests → host dispatches → results return →
+    /// repeat until end_turn (or the iteration cap: bounded by construction).
+    fn complete_with_tools(
+        &self,
+        model: &str,
+        system: &str,
+        prompt: &str,
+        tools: &[crate::connector::ToolDef],
+        dispatch: ToolDispatch,
+    ) -> Result<Completion, crate::Error> {
+        const MAX_ITERATIONS: usize = 8;
+        let tool_defs: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.input_schema,
+                })
+            })
+            .collect();
+        let mut messages = vec![json!({"role": "user", "content": prompt})];
+        let (mut in_total, mut out_total) = (0u64, 0u64);
+        let mut served_model = model.to_string();
+
+        for _ in 0..MAX_ITERATIONS {
+            let payload = self.request(&json!({
+                "model": model,
+                "max_tokens": 16000,
+                "system": system,
+                "messages": messages,
+                "tools": tool_defs,
+            }))?;
+            in_total += payload["usage"]["input_tokens"].as_u64().unwrap_or(0);
+            out_total += payload["usage"]["output_tokens"].as_u64().unwrap_or(0);
+            if let Some(m) = payload["model"].as_str() {
+                served_model = m.to_string();
+            }
+            let stop_reason = payload["stop_reason"].as_str().unwrap_or("unknown");
+
+            if stop_reason != "tool_use" {
+                return Ok(Completion {
+                    text: extract_text(&payload),
+                    model: served_model,
+                    outcome: match stop_reason {
+                        "end_turn" | "stop_sequence" => "ok".into(),
+                        other => other.into(),
+                    },
+                    input_tokens: in_total,
+                    output_tokens: out_total,
+                });
+            }
+
+            // Execute every tool_use block; return ALL results in a single
+            // user turn. Failures go back as is_error tool_results so the
+            // model can adapt — they are not fatal to the run.
+            let assistant_content = payload["content"].clone();
+            let mut results = Vec::new();
+            if let Some(blocks) = assistant_content.as_array() {
+                for block in blocks.iter().filter(|b| b["type"] == "tool_use") {
+                    let id = block["id"].as_str().unwrap_or_default();
+                    let name = block["name"].as_str().unwrap_or_default();
+                    let input = &block["input"];
+                    match dispatch(name, input) {
+                        Ok(result) => results.push(json!({
+                            "type": "tool_result",
+                            "tool_use_id": id,
+                            "content": result,
+                        })),
+                        Err(e) => results.push(json!({
+                            "type": "tool_result",
+                            "tool_use_id": id,
+                            "content": e.to_string(),
+                            "is_error": true,
+                        })),
+                    }
+                }
+            }
+            messages.push(json!({"role": "assistant", "content": assistant_content}));
+            messages.push(json!({"role": "user", "content": results}));
+        }
+
+        Ok(Completion {
+            text: String::new(),
+            model: served_model,
+            outcome: "max-iterations".into(),
+            input_tokens: in_total,
+            output_tokens: out_total,
         })
     }
 }
@@ -176,6 +298,46 @@ impl Provider for MockProvider {
     }
 }
 
+/// Mock that exercises the tool path: calls each tool once (first required
+/// property = the prompt), then reports the results. Tests the full
+/// dispatch + logging pipeline without a network.
+pub struct MockToolProvider;
+
+impl Provider for MockToolProvider {
+    fn complete(&self, model: &str, system: &str, prompt: &str) -> Result<Completion, crate::Error> {
+        MockProvider.complete(model, system, prompt)
+    }
+
+    fn complete_with_tools(
+        &self,
+        model: &str,
+        _system: &str,
+        prompt: &str,
+        tools: &[crate::connector::ToolDef],
+        dispatch: ToolDispatch,
+    ) -> Result<Completion, crate::Error> {
+        let mut reports = Vec::new();
+        for tool in tools {
+            let arg_name = tool.input_schema["required"][0]
+                .as_str()
+                .unwrap_or("input")
+                .to_string();
+            let args = json!({ arg_name: prompt });
+            match dispatch(&tool.name, &args) {
+                Ok(r) => reports.push(format!("{} -> {}", tool.name, r)),
+                Err(e) => reports.push(format!("{} -> error: {}", tool.name, e)),
+            }
+        }
+        Ok(Completion {
+            text: format!("[mock-tool:{model}] {}", reports.join(" | ")),
+            model: model.to_string(),
+            outcome: "ok".into(),
+            input_tokens: prompt.len() as u64 / 4,
+            output_tokens: 32,
+        })
+    }
+}
+
 /// Bind a manifest inference slot to a concrete provider.
 /// `credential` is the already-decrypted secret when the slot carries one
 /// (JIT-decrypted by custody at call time — SPEC §5).
@@ -199,8 +361,9 @@ pub fn bind(
         }
         "ollama" => Ok(Box::new(OllamaProvider::default())),
         "mock" => Ok(Box::new(MockProvider)),
+        "mock-tool" => Ok(Box::new(MockToolProvider)),
         other => Err(crate::Error::Provider(format!(
-            "unknown provider '{other}' (host binds: anthropic, ollama, mock)"
+            "unknown provider '{other}' (host binds: anthropic, ollama, mock, mock-tool)"
         ))),
     }
 }

@@ -69,6 +69,111 @@ pub fn ratify(
     )
 }
 
+/// Build the ratification event UNSIGNED, for external signing — the path
+/// for humans whose master key rightly never enters Apiary custody. The
+/// caller exports this JSON, signs it with their own nostr tooling
+/// (extension, client, NIP-46 signer), and imports the signed event back.
+pub fn ratification_unsigned(
+    ratifier: PublicKey,
+    agent_npub: &str,
+    manifest_yaml: &str,
+) -> Result<UnsignedEvent, crate::Error> {
+    let body = EntryBody {
+        action: "founding.ratify".into(),
+        model: None,
+        cost: None,
+        outcome: "ratified".into(),
+        detail: Some(json!({
+            "agent": agent_npub,
+            "manifest_sha256": manifest_hash(manifest_yaml),
+        })),
+    };
+    let content = serde_json::to_string(&body)?;
+    let builder = EventBuilder::new(
+        Kind::Custom(crate::log::LOG_ENTRY_KIND),
+        content,
+    )
+    .tag(Tag::custom("tier", vec!["public".to_string()]))
+    .tag(Tag::custom("action", vec!["founding.ratify".to_string()]));
+    Ok(builder.finalize_unsigned(ratifier))
+}
+
+/// Verify and append an externally-signed ratification event. Checks: valid
+/// signature, signer is a listed suspend key, action and manifest hash
+/// match. The event is re-chained into the log (the prev-chain is a local
+/// storage property; the signature covers identity and content).
+pub fn import_ratification(
+    log: &EpisodicLog,
+    event: &Event,
+    manifest_yaml: &str,
+    suspend_keys: &[PublicKey],
+) -> Result<(), crate::Error> {
+    event
+        .verify()
+        .map_err(|e| crate::Error::Manifest(format!("bad signature on ratification: {e}")))?;
+    if !suspend_keys.contains(&event.pubkey) {
+        return Err(crate::Error::Manifest(
+            "ratification signer is not a listed suspend key".into(),
+        ));
+    }
+    let body = EpisodicLog::parse_body(event)?;
+    if body.action != "founding.ratify" {
+        return Err(crate::Error::Manifest("event is not a ratification".into()));
+    }
+    let want = manifest_hash(manifest_yaml);
+    let got = body
+        .detail
+        .as_ref()
+        .and_then(|d| d.get("manifest_sha256"))
+        .and_then(|v| v.as_str());
+    if got != Some(want.as_str()) {
+        return Err(crate::Error::Manifest(format!(
+            "ratification hash mismatch: manifest is {want}, event ratifies {got:?} — \
+             the manifest changed since export; re-export and re-sign"
+        )));
+    }
+    log.append_foreign(event)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::custody::Custody;
+
+    #[test]
+    fn external_ratification_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("apiary-extrat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = EpisodicLog::open(&dir);
+
+        // The human's key lives "outside" — we simulate their signer here.
+        let human = Keys::generate();
+        let manifest_yaml = "manifest_version: 1\n";
+
+        // Export unsigned → sign externally → import.
+        let unsigned = ratification_unsigned(human.public_key(), "npub1agent", manifest_yaml).unwrap();
+        let signed = human.sign_event(unsigned).unwrap();
+        import_ratification(&log, &signed, manifest_yaml, &[human.public_key()]).unwrap();
+        assert!(is_ratified(&log, manifest_yaml, &[human.public_key()]).unwrap());
+
+        // Wrong hash and wrong signer are both rejected.
+        assert!(import_ratification(&log, &signed, "different: manifest\n", &[human.public_key()]).is_err());
+        let stranger = Keys::generate();
+        assert!(import_ratification(&log, &signed, manifest_yaml, &[stranger.public_key()]).is_err());
+
+        // Chain still verifies with the foreign anchor, also after a
+        // custody-signed entry follows it.
+        let mut custody = Custody::new();
+        let agent = custody.admit(Keys::generate());
+        log.append(&custody, &agent, crate::log::Tier::Self_, &EntryBody {
+            action: "run.task".into(), model: None, cost: None,
+            outcome: "ok".into(), detail: None,
+        }).unwrap();
+        assert_eq!(log.verify().unwrap(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 /// True when the log contains a ratification whose hash matches this
 /// manifest, signed by one of the given suspend keys.
 pub fn is_ratified(

@@ -4,6 +4,7 @@
 //! has nothing to do with this binary.
 
 use apiary_core::{ceremony, custody::Custody, keystore::Keystore, log::EpisodicLog, manifest::Manifest};
+use nostr::prelude::*;
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use std::io::Read;
@@ -106,10 +107,17 @@ enum AgentCmd {
     Ratify {
         /// The agent's npub.
         npub: String,
-        /// The ratifying human's npub — must hold a key in this keystore and
-        /// be listed in the agent's governance.suspend_keys.
+        /// The ratifying human's npub. Without --export/--import the key must
+        /// be held in this keystore and listed in governance.suspend_keys.
         #[arg(long = "as", value_name = "NPUB")]
-        as_key: String,
+        as_key: Option<String>,
+        /// Emit the UNSIGNED ratification event for external signing (your
+        /// master key never enters Apiary). Requires --as for the signer.
+        #[arg(long)]
+        export: bool,
+        /// Import an externally-signed ratification event (JSON on stdin).
+        #[arg(long)]
+        import: bool,
     },
 }
 
@@ -176,19 +184,37 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                     "note": "provisional manifest — founding is the moment of maximum ignorance; ratify and amend"
                 }))
             }
-            AgentCmd::Ratify { npub, as_key } => {
+            AgentCmd::Ratify { npub, as_key, export, import } => {
                 let npub = &normalize_key(npub)?;
-                let as_key = &normalize_key(as_key)?;
-                let passphrase = require_passphrase(cli)?;
                 let raw = std::fs::read_to_string(ks.agent_dir(npub).join("manifest.yaml"))?;
                 let manifest = Manifest::from_yaml(&raw)?;
-                let ratifier_pk = apiary_core::identity::parse_npub(as_key)?;
                 let listed = manifest
                     .governance
                     .suspend_keys
                     .iter()
                     .map(|k| apiary_core::identity::parse_npub(k))
                     .collect::<Result<Vec<_>, _>>()?;
+                let log = EpisodicLog::open(&ks.agent_dir(npub));
+
+                if *import {
+                    // Externally-signed event on stdin; verify + append.
+                    let event = Event::from_json(read_stdin()?.trim())
+                        .map_err(|e| format!("could not parse event JSON: {e}"))?;
+                    ceremony::import_ratification(&log, &event, &raw, &listed)?;
+                    return Ok(json!({
+                        "ok": true,
+                        "agent": npub,
+                        "imported": event.id.to_hex(),
+                        "ratified_by": event.pubkey.to_hex(),
+                        "manifest_sha256": ceremony::manifest_hash(&raw),
+                    }));
+                }
+
+                let as_key_raw = as_key
+                    .as_deref()
+                    .ok_or("--as <npub> is required (the ratifying human)")?;
+                let as_key = &normalize_key(as_key_raw)?;
+                let ratifier_pk = apiary_core::identity::parse_npub(as_key)?;
                 if !listed.contains(&ratifier_pk) {
                     return Err(format!(
                         "{as_key} is not in this agent's governance.suspend_keys — \
@@ -196,10 +222,24 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                     )
                     .into());
                 }
+
+                if *export {
+                    // Emit the unsigned event; the human signs it elsewhere.
+                    let unsigned =
+                        ceremony::ratification_unsigned(ratifier_pk, npub, &raw)?;
+                    return Ok(json!({
+                        "ok": true,
+                        "agent": npub,
+                        "sign_as": as_key,
+                        "unsigned_event": serde_json::from_str::<serde_json::Value>(&unsigned.as_json())?,
+                        "note": "sign this with your own nostr tooling, then: apiary agent ratify <npub> --import < signed.json"
+                    }));
+                }
+
+                let passphrase = require_passphrase(cli)?;
                 let mut custody = Custody::new();
                 let agent_handle = custody.admit(ks.load(npub, passphrase)?);
                 let human_handle = custody.admit(ks.load(as_key, passphrase)?);
-                let log = EpisodicLog::open(&ks.agent_dir(npub));
                 let signed = ceremony::sign_manifest(&custody, &agent_handle, &log, &raw)?;
                 let ratified = ceremony::ratify(&custody, &human_handle, &log, npub, &raw)?;
                 Ok(json!({

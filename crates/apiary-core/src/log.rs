@@ -110,6 +110,25 @@ impl EpisodicLog {
         Ok(event)
     }
 
+    /// Append an event signed elsewhere (external ratification). Foreign
+    /// events carry no "prev" tag — they were signed without knowledge of
+    /// this log's tip — so they act as chain ANCHORS: the chain restarts
+    /// from them. Trade-off, stated plainly: deletion of entries immediately
+    /// before an anchor is not tamper-evident. Anchors are rare (external
+    /// ratifications), every entry is still individually signed, and the
+    /// relay-published log (Phase 3) closes the gap.
+    pub fn append_foreign(&self, event: &Event) -> Result<(), crate::Error> {
+        event
+            .verify()
+            .map_err(|e| crate::Error::Manifest(format!("foreign event: bad signature: {e}")))?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        writeln!(file, "{}", event.as_json())?;
+        Ok(())
+    }
+
     /// Read all entries in order.
     pub fn read_all(&self) -> Result<Vec<Event>, crate::Error> {
         if !self.path.exists() {
@@ -151,6 +170,9 @@ impl EpisodicLog {
             match (&prev_id, &claimed_prev) {
                 (None, None) => {}
                 (Some(expect), Some(got)) if expect == got => {}
+                // No prev tag mid-log = a foreign-signed anchor (external
+                // ratification): chain restarts here. See append_foreign.
+                (Some(_), None) => {}
                 _ => {
                     return Err(crate::Error::Manifest(format!(
                         "entry {i}: prev-chain broken (expected {prev_id:?}, got {claimed_prev:?})"

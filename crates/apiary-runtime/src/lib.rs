@@ -5,6 +5,7 @@
 //! routing is declarative policy decided before inference, and spend floors
 //! are enforced here in Rust — the model is never asked to be frugal.
 
+pub mod connector;
 pub mod inference;
 pub mod routing;
 pub mod runner;

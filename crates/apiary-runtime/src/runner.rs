@@ -102,8 +102,42 @@ pub fn run_task(
         },
     );
 
-    // 5. Infer.
-    let completion = provider.complete(&model, &system, task)?;
+    // 5. Bind connectors (default-deny: an empty manifest list means no
+    //    capabilities exist) and infer. Every dispatch is logged BEFORE the
+    //    result returns to the model — the track record sees each action.
+    let connectors = crate::connector::bind_connectors(manifest)?;
+    let completion = if connectors.is_empty() {
+        provider.complete(&model, &system, task)?
+    } else {
+        let tool_defs: Vec<crate::connector::ToolDef> =
+            connectors.iter().map(|c| c.def()).collect();
+        let mut dispatch = |name: &str, args: &serde_json::Value| {
+            let connector = connectors
+                .iter()
+                .find(|c| c.def().name == name)
+                .ok_or_else(|| {
+                    crate::Error::Provider(format!("model requested unknown tool '{name}'"))
+                })?;
+            let result = connector.execute(custody, agent, args);
+            log.append(
+                custody,
+                agent,
+                Tier::Self_,
+                &EntryBody {
+                    action: "tool.call".into(),
+                    model: Some(model.clone()),
+                    cost: None,
+                    outcome: match &result {
+                        Ok(_) => "ok".into(),
+                        Err(e) => format!("error: {e}"),
+                    },
+                    detail: Some(json!({ "tool": name, "args": args })),
+                },
+            )?;
+            result
+        };
+        provider.complete_with_tools(&model, &system, task, &tool_defs, &mut dispatch)?
+    };
 
     // 6. Record: signed log entry with acting model, cost, outcome — then
     //    fold spend back into the ledger.
@@ -202,6 +236,31 @@ governance:
         assert!(refused, "budget floor never triggered");
         // The refusal itself is in the log, and the chain still verifies.
         assert!(log.verify().unwrap() >= 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tool_dispatch_executes_and_logs() {
+        let (mut manifest, dir, custody, handle) = setup();
+        manifest.inference[0].provider = "mock-tool".into();
+        manifest.connectors = vec![apiary_core::manifest::Connector {
+            kind: "mock-echo".into(),
+            credential: None,
+            caps: Default::default(),
+        }];
+        let out = run_task(&manifest, &dir, &custody, &handle, "ping", &TaskContext::default())
+            .unwrap();
+        // The mock-tool provider dispatched mock_echo with the prompt.
+        assert!(out.completion.text.contains("mock_echo -> echo: ping"), "{}", out.completion.text);
+        // The log holds the tool.call entry AND the run.task entry, chained.
+        let log = EpisodicLog::open(&dir);
+        let entries = log.tail(10).unwrap();
+        let actions: Vec<String> = entries
+            .iter()
+            .map(|e| EpisodicLog::parse_body(e).unwrap().action)
+            .collect();
+        assert_eq!(actions, vec!["tool.call", "run.task"]);
+        assert_eq!(log.verify().unwrap(), 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 
