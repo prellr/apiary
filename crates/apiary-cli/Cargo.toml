@@ -1,0 +1,16 @@
+[package]
+name = "apiary-cli"
+description = "Apiary host CLI — JSON in/out front door (SPEC §2)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "apiary"
+path = "src/main.rs"
+
+[dependencies]
+apiary-core = { path = "../apiary-core" }
+nostr.workspace = true
+serde_json.workspace = true
+clap = { version = "4", features = ["derive", "env"] }
