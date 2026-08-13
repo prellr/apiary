@@ -48,6 +48,7 @@ pub fn run_task(
                 action: "run.task".into(),
                 model: None,
                 cost: None,
+                harness: None,
                 outcome: "budget-refused".into(),
                 detail: Some(json!({ "task": task })),
             },
@@ -143,6 +144,7 @@ pub fn run_task(
                     action: "tool.call".into(),
                     model: Some(model.clone()),
                     cost: None,
+                    harness: Some("native".into()),
                     outcome: match &result {
                         Ok(_) => "ok".into(),
                         Err(e) => format!("error: {e}"),
@@ -168,6 +170,7 @@ pub fn run_task(
                 input_tokens: completion.input_tokens,
                 output_tokens: completion.output_tokens,
             }),
+            harness: Some("native".into()),
             outcome: completion.outcome.clone(),
             detail: Some(json!({
                 "task": task,
@@ -181,6 +184,89 @@ pub fn run_task(
     Ok(RunOutcome {
         completion,
         slot: slot_name,
+        log_event_id: event.id.to_hex(),
+    })
+}
+
+pub struct AcpRunOutcome {
+    pub text: String,
+    pub stop_reason: String,
+    pub tool_calls: Vec<(String, String)>,
+    pub permissions: Vec<(String, String)>,
+    pub log_event_id: String,
+}
+
+/// Run a task through a FOREIGN harness (ACP sidecar) under the same
+/// governance shell as the native loop: budget floor first, permission
+/// requests decided by host policy, the whole session signed into the log
+/// with harness attribution. The loop is rented; the shell is ours.
+#[allow(clippy::too_many_arguments)]
+pub fn run_acp_task(
+    manifest: &Manifest,
+    agent_dir: &Path,
+    custody: &Custody,
+    agent: &AgentHandle,
+    task: &str,
+    command: &str,
+    args: &[String],
+    allow_permissions: bool,
+) -> Result<AcpRunOutcome, crate::Error> {
+    let log = EpisodicLog::open(agent_dir);
+    let ledger = SpendLedger::open(agent_dir);
+    let harness = format!("acp:{command}");
+
+    // Budget floor still gates entry. ACP runtimes don't report token usage
+    // on the wire, so spend inside the session is unmetered — recorded as
+    // such rather than pretended away. (Metering lands with provider-side
+    // accounting in the daemon.)
+    let cap = tokens_per_day(&manifest.governance.budgets);
+    if let Err(e) = ledger.check(cap) {
+        log.append(custody, agent, Tier::Self_, &EntryBody {
+            action: "run.task".into(),
+            model: None,
+            cost: None,
+            harness: Some(harness),
+            outcome: "budget-refused".into(),
+            detail: Some(json!({ "task": task })),
+        })?;
+        return Err(e);
+    }
+
+    let mode = if allow_permissions {
+        crate::acp::PermissionMode::Allow
+    } else {
+        crate::acp::PermissionMode::Deny
+    };
+    let result = crate::acp::run_acp_prompt(
+        command,
+        args,
+        agent_dir,
+        task,
+        mode,
+        std::time::Duration::from_secs(300),
+    )?;
+
+    let event = log.append(custody, agent, Tier::Self_, &EntryBody {
+        action: "run.task".into(),
+        model: None, // the foreign harness picks its own model
+        cost: None,
+        harness: Some(harness),
+        outcome: result.stop_reason.clone(),
+        detail: Some(json!({
+            "task": task,
+            "response_chars": result.text.len(),
+            "tool_calls": result.tool_calls,
+            "permission_decisions": result.permissions,
+            "permission_mode": if allow_permissions { "allow" } else { "deny" },
+            "tokens_unmetered": true,
+        })),
+    })?;
+
+    Ok(AcpRunOutcome {
+        text: result.text,
+        stop_reason: result.stop_reason,
+        tool_calls: result.tool_calls,
+        permissions: result.permissions,
         log_event_id: event.id.to_hex(),
     })
 }

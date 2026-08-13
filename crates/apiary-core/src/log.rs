@@ -61,6 +61,10 @@ pub struct EntryBody {
     pub cost: Option<Cost>,
     /// "ok", "refusal", "error: …", "budget-refused", …
     pub outcome: String,
+    /// Which loop ran the action: "native", "acp:<command>", … The harness
+    /// is rented machinery like the model — attribution needs both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
     /// Free-form detail (task text, result summary, manifest hash, …).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<serde_json::Value>,
@@ -205,6 +209,7 @@ mod tests {
             action: action.into(),
             model: None,
             cost: None,
+            harness: None,
             outcome: "ok".into(),
             detail: None,
         }

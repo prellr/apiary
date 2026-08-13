@@ -36,6 +36,7 @@ pub fn sign_manifest(
             action: "founding.manifest".into(),
             model: None,
             cost: None,
+            harness: None,
             outcome: "signed".into(),
             detail: Some(json!({ "manifest_sha256": manifest_hash(manifest_yaml) })),
         },
@@ -60,6 +61,7 @@ pub fn ratify(
             action: "founding.ratify".into(),
             model: None,
             cost: None,
+            harness: None,
             outcome: "ratified".into(),
             detail: Some(json!({
                 "agent": agent_npub,
@@ -82,6 +84,7 @@ pub fn ratification_unsigned(
         action: "founding.ratify".into(),
         model: None,
         cost: None,
+        harness: None,
         outcome: "ratified".into(),
         detail: Some(json!({
             "agent": agent_npub,
@@ -167,7 +170,7 @@ mod tests {
         let agent = custody.admit(Keys::generate());
         log.append(&custody, &agent, crate::log::Tier::Self_, &EntryBody {
             action: "run.task".into(), model: None, cost: None,
-            outcome: "ok".into(), detail: None,
+            harness: None, outcome: "ok".into(), detail: None,
         }).unwrap();
         assert_eq!(log.verify().unwrap(), 2);
         std::fs::remove_dir_all(&dir).ok();
