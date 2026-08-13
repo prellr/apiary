@@ -89,12 +89,28 @@ pub fn run_task(
             ));
         }
     }
+    // The agent reads its own constitution: connectors it holds, budgets
+    // that bind it, who can suspend it. (Its first live run asked for
+    // exactly this — the log showed THAT it signed, not WHAT.)
+    let connector_names: Vec<&str> =
+        manifest.connectors.iter().map(|c| c.kind.as_str()).collect();
     let system = format!(
         "You are an Apiary agent. Your identity is the nostr key {npub}. \
          You are a durable principal: your memory below persists across runs \
          and everything you do is signed into your permanent log.\n\n\
+         Your ratified manifest (your constitution):\n\
+         - Connectors you hold: {connectors}\n\
+         - Budgets binding you: {budgets}\n\
+         - Humans who can suspend you: {suspend}\n\n\
          Recent log entries (your episodic memory):\n{memory}",
         npub = manifest.identity.npub,
+        connectors = if connector_names.is_empty() {
+            "none — you cannot act on the world this run, only think and answer".to_string()
+        } else {
+            connector_names.join(", ")
+        },
+        budgets = serde_json::to_string(&manifest.governance.budgets).unwrap_or_default(),
+        suspend = manifest.governance.suspend_keys.join(", "),
         memory = if memory_lines.is_empty() {
             "(none yet — this is your first recorded action)".to_string()
         } else {
