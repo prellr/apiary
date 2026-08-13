@@ -54,6 +54,8 @@ enum Command {
         #[command(subcommand)]
         cmd: LogCmd,
     },
+    /// Normalize a public key: accepts npub or hex, prints both forms.
+    Key { key: String },
     /// Run a one-shot task as an agent.
     Run {
         /// The agent's npub.
@@ -175,6 +177,8 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                 }))
             }
             AgentCmd::Ratify { npub, as_key } => {
+                let npub = &normalize_key(npub)?;
+                let as_key = &normalize_key(as_key)?;
                 let passphrase = require_passphrase(cli)?;
                 let raw = std::fs::read_to_string(ks.agent_dir(npub).join("manifest.yaml"))?;
                 let manifest = Manifest::from_yaml(&raw)?;
@@ -225,6 +229,7 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                 Ok(json!({"ok": true, "npub": m.identity.npub, "valid": true}))
             }
             ManifestCmd::Show { npub } => {
+                let npub = &normalize_key(npub)?;
                 let raw = std::fs::read_to_string(ks.agent_dir(npub).join("manifest.yaml"))?;
                 let m = Manifest::from_yaml(&raw)?;
                 Ok(json!({"ok": true, "manifest": serde_json::to_value(&m)?}))
@@ -232,6 +237,7 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
         },
         Command::Log { cmd } => match cmd {
             LogCmd::Show { npub, tail } => {
+                let npub = &normalize_key(npub)?;
                 let log = EpisodicLog::open(&ks.agent_dir(npub));
                 let entries: Vec<serde_json::Value> = log
                     .tail(*tail)?
@@ -249,11 +255,24 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                 Ok(json!({"ok": true, "npub": npub, "entries": entries}))
             }
             LogCmd::Verify { npub } => {
+                let npub = &normalize_key(npub)?;
                 let count = EpisodicLog::open(&ks.agent_dir(npub)).verify()?;
                 Ok(json!({"ok": true, "npub": npub, "entries": count, "chain": "valid"}))
             }
         },
+        Command::Key { key } => {
+            let pk = apiary_core::identity::parse_npub(key)?;
+            let npub = apiary_core::identity::to_npub(&pk)?;
+            let in_keystore = ks.agent_dir(&npub).join("key.ncryptsec").exists();
+            Ok(json!({
+                "ok": true,
+                "npub": npub,
+                "hex": pk.to_hex(),
+                "in_keystore": in_keystore,
+            }))
+        }
         Command::Run { npub, task, class, data_class } => {
+            let npub = &normalize_key(npub)?;
             let passphrase = require_passphrase(cli)?;
             let agent_dir = ks.agent_dir(npub);
             let raw = std::fs::read_to_string(agent_dir.join("manifest.yaml"))?;
@@ -298,6 +317,7 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
         }
         Command::Credential { cmd } => match cmd {
             CredentialCmd::Seal { npub } => {
+                let npub = &normalize_key(npub)?;
                 let passphrase = require_passphrase(cli)?;
                 let keys = ks.load(npub, passphrase)?;
                 let mut custody = Custody::new();
@@ -307,6 +327,7 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                 Ok(json!({"ok": true, "npub": npub, "nip44": blob.nip44}))
             }
             CredentialCmd::Open { npub } => {
+                let npub = &normalize_key(npub)?;
                 let passphrase = require_passphrase(cli)?;
                 let keys = ks.load(npub, passphrase)?;
                 let mut custody = Custody::new();
@@ -319,6 +340,13 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
             }
         },
     }
+}
+
+/// Accept a public key in any form (npub or hex) and normalize to the
+/// canonical npub, which is how keystore directories are named.
+fn normalize_key(s: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let pk = apiary_core::identity::parse_npub(s)?;
+    Ok(apiary_core::identity::to_npub(&pk)?)
 }
 
 fn require_passphrase(cli: &Cli) -> Result<&str, Box<dyn std::error::Error>> {
