@@ -1,0 +1,17 @@
+[package]
+name = "apiary-runtime"
+description = "Apiary agent runtime: inference providers, routing, spend authority, run loop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+apiary-core = { path = "../apiary-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+
+[dev-dependencies]
+nostr.workspace = true

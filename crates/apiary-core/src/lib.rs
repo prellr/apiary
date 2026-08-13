@@ -4,9 +4,11 @@
 //! per-agent-isolated key material. Every capability is a connector declared
 //! in the manifest; the host enforces floors the model cannot argue with.
 
+pub mod ceremony;
 pub mod custody;
 pub mod identity;
 pub mod keystore;
+pub mod log;
 pub mod manifest;
 
 #[derive(Debug, thiserror::Error)]

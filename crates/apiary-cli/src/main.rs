@@ -3,7 +3,7 @@
 //! HOST surface; agents' own shell access is an opt-in connector (SPEC §6) and
 //! has nothing to do with this binary.
 
-use apiary_core::{custody::Custody, keystore::Keystore, manifest::Manifest};
+use apiary_core::{ceremony, custody::Custody, keystore::Keystore, log::EpisodicLog, manifest::Manifest};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use std::io::Read;
@@ -49,6 +49,37 @@ enum Command {
         #[command(subcommand)]
         cmd: CredentialCmd,
     },
+    /// The signed episodic log.
+    Log {
+        #[command(subcommand)]
+        cmd: LogCmd,
+    },
+    /// Run a one-shot task as an agent.
+    Run {
+        /// The agent's npub.
+        npub: String,
+        /// The task text.
+        #[arg(long)]
+        task: String,
+        /// Task class for routing (e.g. "reasoning").
+        #[arg(long)]
+        class: Option<String>,
+        /// Data class for routing floors (e.g. "sensitive").
+        #[arg(long)]
+        data_class: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LogCmd {
+    /// Show the last N log entries.
+    Show {
+        npub: String,
+        #[arg(long, default_value_t = 20)]
+        tail: usize,
+    },
+    /// Verify every entry's signature and the prev-chain.
+    Verify { npub: String },
 }
 
 #[derive(Subcommand)]
@@ -67,6 +98,17 @@ enum AgentCmd {
     },
     /// List agents in this host's keystore.
     List,
+    /// Ratify an agent's manifest as a human suspend-key holder. The agent
+    /// signs its manifest hash, then the human countersigns — both land as
+    /// public log entries (the founding ceremony, SPEC §7).
+    Ratify {
+        /// The agent's npub.
+        npub: String,
+        /// The ratifying human's npub — must hold a key in this keystore and
+        /// be listed in the agent's governance.suspend_keys.
+        #[arg(long = "as", value_name = "NPUB")]
+        as_key: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -132,6 +174,38 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                     "note": "provisional manifest — founding is the moment of maximum ignorance; ratify and amend"
                 }))
             }
+            AgentCmd::Ratify { npub, as_key } => {
+                let passphrase = require_passphrase(cli)?;
+                let raw = std::fs::read_to_string(ks.agent_dir(npub).join("manifest.yaml"))?;
+                let manifest = Manifest::from_yaml(&raw)?;
+                let ratifier_pk = apiary_core::identity::parse_npub(as_key)?;
+                let listed = manifest
+                    .governance
+                    .suspend_keys
+                    .iter()
+                    .map(|k| apiary_core::identity::parse_npub(k))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if !listed.contains(&ratifier_pk) {
+                    return Err(format!(
+                        "{as_key} is not in this agent's governance.suspend_keys — \
+                         only a named human can ratify"
+                    )
+                    .into());
+                }
+                let mut custody = Custody::new();
+                let agent_handle = custody.admit(ks.load(npub, passphrase)?);
+                let human_handle = custody.admit(ks.load(as_key, passphrase)?);
+                let log = EpisodicLog::open(&ks.agent_dir(npub));
+                let signed = ceremony::sign_manifest(&custody, &agent_handle, &log, &raw)?;
+                let ratified = ceremony::ratify(&custody, &human_handle, &log, npub, &raw)?;
+                Ok(json!({
+                    "ok": true,
+                    "agent": npub,
+                    "ratified_by": as_key,
+                    "manifest_sha256": ceremony::manifest_hash(&raw),
+                    "events": { "signed": signed.id.to_hex(), "ratified": ratified.id.to_hex() },
+                }))
+            }
             AgentCmd::List => {
                 let agents: Vec<serde_json::Value> = ks
                     .list()?
@@ -156,6 +230,72 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                 Ok(json!({"ok": true, "manifest": serde_json::to_value(&m)?}))
             }
         },
+        Command::Log { cmd } => match cmd {
+            LogCmd::Show { npub, tail } => {
+                let log = EpisodicLog::open(&ks.agent_dir(npub));
+                let entries: Vec<serde_json::Value> = log
+                    .tail(*tail)?
+                    .iter()
+                    .map(|e| {
+                        let body = EpisodicLog::parse_body(e).ok();
+                        json!({
+                            "id": e.id.to_hex(),
+                            "at": e.created_at.as_secs(),
+                            "signer": e.pubkey.to_hex(),
+                            "body": body,
+                        })
+                    })
+                    .collect();
+                Ok(json!({"ok": true, "npub": npub, "entries": entries}))
+            }
+            LogCmd::Verify { npub } => {
+                let count = EpisodicLog::open(&ks.agent_dir(npub)).verify()?;
+                Ok(json!({"ok": true, "npub": npub, "entries": count, "chain": "valid"}))
+            }
+        },
+        Command::Run { npub, task, class, data_class } => {
+            let passphrase = require_passphrase(cli)?;
+            let agent_dir = ks.agent_dir(npub);
+            let raw = std::fs::read_to_string(agent_dir.join("manifest.yaml"))?;
+            let manifest = Manifest::from_yaml(&raw)?;
+            // Ratification gate: an unratified constitution doesn't run.
+            let suspend_keys = manifest
+                .governance
+                .suspend_keys
+                .iter()
+                .map(|k| apiary_core::identity::parse_npub(k))
+                .collect::<Result<Vec<_>, _>>()?;
+            let log = EpisodicLog::open(&agent_dir);
+            if !ceremony::is_ratified(&log, &raw, &suspend_keys)? {
+                return Err(
+                    "manifest is not ratified — run `apiary agent ratify` first \
+                     (founding is constitution-then-amendments; nothing runs unratified)"
+                        .into(),
+                );
+            }
+            let mut custody = Custody::new();
+            let handle = custody.admit(ks.load(npub, passphrase)?);
+            let ctx = apiary_runtime::routing::TaskContext {
+                task_class: class.clone(),
+                data_class: data_class.clone(),
+            };
+            let out = apiary_runtime::runner::run_task(
+                &manifest, &agent_dir, &custody, &handle, task, &ctx,
+            )?;
+            Ok(json!({
+                "ok": true,
+                "npub": npub,
+                "slot": out.slot,
+                "model": out.completion.model,
+                "outcome": out.completion.outcome,
+                "tokens": {
+                    "input": out.completion.input_tokens,
+                    "output": out.completion.output_tokens,
+                },
+                "log_event": out.log_event_id,
+                "response": out.completion.text,
+            }))
+        }
         Command::Credential { cmd } => match cmd {
             CredentialCmd::Seal { npub } => {
                 let passphrase = require_passphrase(cli)?;

@@ -12,3 +12,4 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
+sha2 = "0.10"
