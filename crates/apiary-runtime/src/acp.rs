@@ -58,7 +58,7 @@ pub fn run_acp_prompt(
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| crate::Error::Provider(format!("spawn {command}: {e}")))?;
-    let result = drive(&mut child, task, mode, turn_timeout);
+    let result = drive(&mut child, workdir, task, mode, turn_timeout);
     let _ = child.kill();
     let _ = child.wait();
     result
@@ -66,6 +66,7 @@ pub fn run_acp_prompt(
 
 fn drive(
     child: &mut Child,
+    workdir: &std::path::Path,
     task: &str,
     mode: PermissionMode,
     turn_timeout: Duration,
@@ -190,10 +191,18 @@ fn drive(
                 )));
             }
             if id == init_id {
+                // The session's working directory is the AGENT's dir — the
+                // harness works in the agent's world, not the invoking
+                // shell's. (v1 shipped env::current_dir() here; a live run
+                // promptly listed the user's home directory. Evidence-cited
+                // fix.) Absolute path per the ACP spec.
+                let cwd = workdir
+                    .canonicalize()
+                    .unwrap_or_else(|_| workdir.to_path_buf());
                 new_id = Some(send_request(
                     &mut stdin,
                     "session/new",
-                    json!({"cwd": std::env::current_dir().unwrap_or_default(), "mcpServers": []}),
+                    json!({"cwd": cwd, "mcpServers": []}),
                 )?);
             } else if Some(id) == new_id {
                 let sid = msg["result"]["sessionId"]
