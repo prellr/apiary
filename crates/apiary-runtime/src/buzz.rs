@@ -233,4 +233,26 @@ impl<'a> BuzzSession<'a> {
     pub fn channels(&mut self) -> Result<Vec<Event>, crate::Error> {
         self.req(json!({"kinds": [KIND_GROUP_METADATA], "limit": 100}))
     }
+
+    /// Publish the agent's kind-0 profile metadata (name/about/picture) —
+    /// how the agent appears to humans in Buzz and every other nostr client.
+    /// Replaceable: publishing again updates the profile.
+    pub fn set_profile(
+        &mut self,
+        name: &str,
+        about: Option<&str>,
+        picture: Option<&str>,
+    ) -> Result<Event, crate::Error> {
+        let mut meta = json!({ "name": name });
+        if let Some(a) = about {
+            meta["about"] = json!(a);
+        }
+        if let Some(p) = picture {
+            meta["picture"] = json!(p);
+        }
+        let builder = EventBuilder::new(Kind::Metadata, meta.to_string());
+        let event = self.custody.sign(self.agent, builder)?;
+        self.publish(&event)?;
+        Ok(event)
+    }
 }

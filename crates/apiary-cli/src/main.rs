@@ -176,6 +176,19 @@ enum BuzzCmd {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Publish the agent's profile (kind-0: name, about, picture) so it
+    /// appears as a named member instead of a hex pubkey.
+    Profile {
+        npub: String,
+        #[arg(long)]
+        relay: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        about: Option<String>,
+        #[arg(long)]
+        picture: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -478,7 +491,8 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
             let (npub, relay) = match cmd {
                 BuzzCmd::Channels { npub, relay }
                 | BuzzCmd::Post { npub, relay, .. }
-                | BuzzCmd::Read { npub, relay, .. } => (npub, relay),
+                | BuzzCmd::Read { npub, relay, .. }
+                | BuzzCmd::Profile { npub, relay, .. } => (npub, relay),
             };
             let npub = &normalize_key(npub)?;
             let passphrase = require_passphrase(cli)?;
@@ -552,6 +566,38 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                         })
                         .collect();
                     Ok(json!({"ok": true, "relay": relay, "channel": channel, "messages": msgs}))
+                }
+                BuzzCmd::Profile {
+                    name,
+                    about,
+                    picture,
+                    ..
+                } => {
+                    let event = session.set_profile(name, about.as_deref(), picture.as_deref())?;
+                    let log = EpisodicLog::open(&agent_dir);
+                    log.append(
+                        &custody,
+                        &handle,
+                        apiary_core::log::Tier::Public,
+                        &apiary_core::log::EntryBody {
+                            action: "buzz.profile".into(),
+                            model: None,
+                            cost: None,
+                            harness: None,
+                            outcome: "ok".into(),
+                            detail: Some(json!({
+                                "relay": relay,
+                                "name": name,
+                                "event": event.id.to_hex(),
+                            })),
+                        },
+                    )?;
+                    Ok(json!({
+                        "ok": true,
+                        "relay": relay,
+                        "name": name,
+                        "event": event.id.to_hex(),
+                    }))
                 }
             }
         }
