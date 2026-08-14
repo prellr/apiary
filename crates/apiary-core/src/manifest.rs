@@ -136,6 +136,10 @@ pub struct Memory {
     /// Semantic index location — derived, rebuildable.
     #[serde(default = "default_index")]
     pub index: String,
+    /// Relays the log is published to (tier-enforced: public plain,
+    /// self NIP-44-wrapped, local never).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub log_relays: Vec<String>,
 }
 
 fn default_index() -> String {

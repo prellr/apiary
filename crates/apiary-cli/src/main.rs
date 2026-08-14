@@ -98,6 +98,12 @@ enum LogCmd {
     },
     /// Verify every entry's signature and the prev-chain.
     Verify { npub: String },
+    /// Publish the log to the manifest's relays (tier-enforced: public
+    /// plain, self NIP-44-wrapped, local never leaves).
+    Publish { npub: String },
+    /// Fetch this agent's published log from its relays, verify signatures,
+    /// and decrypt its own wrapped entries.
+    Remote { npub: String },
 }
 
 #[derive(Subcommand)]
@@ -325,6 +331,111 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                 let npub = &normalize_key(npub)?;
                 let count = EpisodicLog::open(&ks.agent_dir(npub)).verify()?;
                 Ok(json!({"ok": true, "npub": npub, "entries": count, "chain": "valid"}))
+            }
+            LogCmd::Publish { npub } => {
+                let npub = &normalize_key(npub)?;
+                let passphrase = require_passphrase(cli)?;
+                let agent_dir = ks.agent_dir(npub);
+                let raw = std::fs::read_to_string(agent_dir.join("manifest.yaml"))?;
+                let manifest = Manifest::from_yaml(&raw)?;
+                let mut custody = Custody::new();
+                let handle = custody.admit(ks.load(npub, passphrase)?);
+                let report = apiary_runtime::publish::publish_log(
+                    &agent_dir,
+                    &custody,
+                    &handle,
+                    &manifest.memory.log_relays,
+                )?;
+                Ok(json!({
+                    "ok": true,
+                    "npub": npub,
+                    "published_public": report.published_public,
+                    "published_wrapped": report.published_wrapped,
+                    "skipped_local": report.skipped_local,
+                    "already_published": report.already_published,
+                    "relays": report.relay_results,
+                }))
+            }
+            LogCmd::Remote { npub } => {
+                let npub = &normalize_key(npub)?;
+                let passphrase = require_passphrase(cli)?;
+                let agent_dir = ks.agent_dir(npub);
+                let raw = std::fs::read_to_string(agent_dir.join("manifest.yaml"))?;
+                let manifest = Manifest::from_yaml(&raw)?;
+                let pk = apiary_core::identity::parse_npub(npub)?;
+                let mut custody = Custody::new();
+                let handle = custody.admit(ks.load(npub, passphrase)?);
+                let mut summary = Vec::new();
+                for relay in &manifest.memory.log_relays {
+                    let own = json!({
+                        "authors": [pk.to_hex()],
+                        "kinds": [
+                            apiary_core::log::LOG_ENTRY_KIND,
+                            apiary_runtime::publish::WRAPPED_KIND,
+                        ],
+                    });
+                    // Governance events about this agent (ratifications) are
+                    // authored by humans — discovered via the p tag.
+                    let about = json!({
+                        "kinds": [apiary_core::log::LOG_ENTRY_KIND],
+                        "#p": [pk.to_hex()],
+                    });
+                    let fetched = apiary_runtime::relay::fetch(relay, own).and_then(|mut a| {
+                        let b = apiary_runtime::relay::fetch(relay, about)?;
+                        for e in b {
+                            if !a.iter().any(|x| x.id == e.id) {
+                                a.push(e);
+                            }
+                        }
+                        Ok(a)
+                    });
+                    match fetched {
+                        Ok(events) => {
+                            let mut public = 0usize;
+                            let mut unwrapped = 0usize;
+                            let mut opaque = 0usize;
+                            let mut entries = Vec::new();
+                            for e in &events {
+                                if e.kind == Kind::Custom(apiary_runtime::publish::WRAPPED_KIND) {
+                                    match apiary_runtime::publish::unwrap_self_entry(
+                                        &custody, &handle, e,
+                                    ) {
+                                        Ok(inner) => {
+                                            unwrapped += 1;
+                                            if let Ok(body) = EpisodicLog::parse_body(&inner) {
+                                                entries.push(json!({
+                                                    "tier": "self (decrypted)",
+                                                    "action": body.action,
+                                                    "outcome": body.outcome,
+                                                }));
+                                            }
+                                        }
+                                        Err(_) => opaque += 1,
+                                    }
+                                } else {
+                                    public += 1;
+                                    if let Ok(body) = EpisodicLog::parse_body(e) {
+                                        entries.push(json!({
+                                            "tier": "public",
+                                            "action": body.action,
+                                            "outcome": body.outcome,
+                                        }));
+                                    }
+                                }
+                            }
+                            summary.push(json!({
+                                "relay": relay,
+                                "events": events.len(),
+                                "public": public,
+                                "self_decrypted": unwrapped,
+                                "undecryptable": opaque,
+                                "entries": entries,
+                            }));
+                        }
+                        Err(e) => summary.push(json!({"relay": relay, "error": e.to_string()})),
+                    }
+                }
+                Ok(json!({"ok": true, "npub": npub, "relays": summary}))
             }
         },
         Command::Key { key } => {

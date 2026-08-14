@@ -113,7 +113,7 @@ impl Connector for NostrPublish {
         let mut acks = Vec::new();
         let mut failures = Vec::new();
         for relay in &self.relays {
-            match publish_to_relay(relay, &event) {
+            match crate::relay::publish(relay, &event) {
                 Ok(msg) => acks.push(format!("{relay}: {msg}")),
                 Err(e) => failures.push(format!("{relay}: {e}")),
             }
@@ -131,43 +131,6 @@ impl Connector for NostrPublish {
         })
         .to_string())
     }
-}
-
-/// Minimal sync nostr publish: ["EVENT", …] → wait for ["OK", …].
-fn publish_to_relay(url: &str, event: &Event) -> Result<String, crate::Error> {
-    use tungstenite::Message;
-    let (mut socket, _) =
-        tungstenite::connect(url).map_err(|e| crate::Error::Provider(format!("connect: {e}")))?;
-    let frame = json!(["EVENT", serde_json::from_str::<Value>(&event.as_json())?]);
-    socket
-        .send(Message::Text(frame.to_string().into()))
-        .map_err(|e| crate::Error::Provider(format!("send: {e}")))?;
-    // Read until an OK for our event id (relays may send other frames first).
-    for _ in 0..10 {
-        let msg = socket
-            .read()
-            .map_err(|e| crate::Error::Provider(format!("read: {e}")))?;
-        if let Message::Text(text) = msg {
-            let v: Value = serde_json::from_str(&text)?;
-            if v.get(0).and_then(|t| t.as_str()) == Some("OK")
-                && v.get(1).and_then(|id| id.as_str()) == Some(&event.id.to_hex())
-            {
-                let accepted = v.get(2).and_then(|b| b.as_bool()).unwrap_or(false);
-                let detail = v.get(3).and_then(|m| m.as_str()).unwrap_or("");
-                let _ = socket.close(None);
-                return if accepted {
-                    Ok(if detail.is_empty() {
-                        "accepted".into()
-                    } else {
-                        detail.into()
-                    })
-                } else {
-                    Err(crate::Error::Provider(format!("rejected: {detail}")))
-                };
-            }
-        }
-    }
-    Err(crate::Error::Provider("no OK response".into()))
 }
 
 /// Test connector: echoes its arguments. Lets tests exercise the full

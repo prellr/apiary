@@ -97,6 +97,19 @@ impl EpisodicLog {
         tier: Tier,
         body: &EntryBody,
     ) -> Result<Event, crate::Error> {
+        self.append_with_tags(custody, signer, tier, body, Vec::new())
+    }
+
+    /// Append with extra tags (e.g. a `p` tag making ratifications
+    /// discoverable by the agent they govern).
+    pub fn append_with_tags(
+        &self,
+        custody: &Custody,
+        signer: &AgentHandle,
+        tier: Tier,
+        body: &EntryBody,
+        extra_tags: Vec<Tag>,
+    ) -> Result<Event, crate::Error> {
         let prev = self.tail(1)?.pop();
         let content = serde_json::to_string(body)?;
         let mut builder = EventBuilder::new(Kind::Custom(LOG_ENTRY_KIND), content)
@@ -104,6 +117,9 @@ impl EpisodicLog {
             .tag(Tag::custom("action", vec![body.action.clone()]));
         if let Some(prev_event) = &prev {
             builder = builder.tag(Tag::custom("prev", vec![prev_event.id.to_hex()]));
+        }
+        for t in extra_tags {
+            builder = builder.tag(t);
         }
         let event = custody.sign(signer, builder)?;
         let mut opts = OpenOptions::new();

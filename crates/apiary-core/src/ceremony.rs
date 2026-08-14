@@ -53,7 +53,8 @@ pub fn ratify(
     agent_npub: &str,
     manifest_yaml: &str,
 ) -> Result<Event, crate::Error> {
-    log.append(
+    let agent_pk = crate::identity::parse_npub(agent_npub)?;
+    log.append_with_tags(
         custody,
         human,
         Tier::Public,
@@ -68,6 +69,7 @@ pub fn ratify(
                 "manifest_sha256": manifest_hash(manifest_yaml),
             })),
         },
+        vec![Tag::public_key(agent_pk)],
     )
 }
 
@@ -92,9 +94,11 @@ pub fn ratification_unsigned(
         })),
     };
     let content = serde_json::to_string(&body)?;
+    let agent_pk = crate::identity::parse_npub(agent_npub)?;
     let builder = EventBuilder::new(Kind::Custom(crate::log::LOG_ENTRY_KIND), content)
         .tag(Tag::custom("tier", vec!["public".to_string()]))
-        .tag(Tag::custom("action", vec!["founding.ratify".to_string()]));
+        .tag(Tag::custom("action", vec!["founding.ratify".to_string()]))
+        .tag(Tag::public_key(agent_pk));
     Ok(builder.finalize_unsigned(ratifier))
 }
 

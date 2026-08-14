@@ -9,6 +9,8 @@ pub mod acp;
 pub mod connector;
 pub mod index;
 pub mod inference;
+pub mod publish;
+pub mod relay;
 pub mod routing;
 pub mod runner;
 pub mod spend;
