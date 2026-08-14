@@ -23,11 +23,20 @@ pub type ToolDispatch<'a> =
     &'a mut dyn FnMut(&str, &serde_json::Value) -> Result<String, crate::Error>;
 
 pub trait Provider {
-    fn complete(&self, model: &str, system: &str, prompt: &str) -> Result<Completion, crate::Error>;
+    /// `max_tokens` is the spend-authority clamp: the provider must not be
+    /// asked for more output than the run's reserved budget allows.
+    fn complete(
+        &self,
+        model: &str,
+        system: &str,
+        prompt: &str,
+        max_tokens: u64,
+    ) -> Result<Completion, crate::Error>;
 
-    /// Multi-turn tool loop. Providers without tool support fall back to a
-    /// plain completion (tools silently unavailable is wrong — so the
-    /// default also flags it in the outcome for the log).
+    /// Multi-turn tool loop under a cumulative token budget: each iteration
+    /// is clamped to what remains, and the loop stops (outcome
+    /// "budget-exhausted") rather than overrunning. Providers without tool
+    /// support fall back to a plain completion and flag it.
     fn complete_with_tools(
         &self,
         model: &str,
@@ -35,8 +44,9 @@ pub trait Provider {
         prompt: &str,
         tools: &[crate::connector::ToolDef],
         _dispatch: ToolDispatch,
+        budget_tokens: u64,
     ) -> Result<Completion, crate::Error> {
-        let mut c = self.complete(model, system, prompt)?;
+        let mut c = self.complete(model, system, prompt, budget_tokens)?;
         if !tools.is_empty() {
             c.outcome = format!("{} (provider has no tool support; tools unused)", c.outcome);
         }
@@ -130,10 +140,16 @@ fn extract_text(payload: &serde_json::Value) -> String {
 }
 
 impl Provider for AnthropicProvider {
-    fn complete(&self, model: &str, system: &str, prompt: &str) -> Result<Completion, crate::Error> {
+    fn complete(
+        &self,
+        model: &str,
+        system: &str,
+        prompt: &str,
+        max_tokens: u64,
+    ) -> Result<Completion, crate::Error> {
         let payload = self.request(&json!({
             "model": model,
-            "max_tokens": 16000,
+            "max_tokens": max_tokens.clamp(1, 16000),
             "system": system,
             "messages": [{"role": "user", "content": prompt}],
         }))?;
@@ -161,6 +177,7 @@ impl Provider for AnthropicProvider {
         prompt: &str,
         tools: &[crate::connector::ToolDef],
         dispatch: ToolDispatch,
+        budget_tokens: u64,
     ) -> Result<Completion, crate::Error> {
         const MAX_ITERATIONS: usize = 8;
         let tool_defs: Vec<serde_json::Value> = tools
@@ -178,9 +195,21 @@ impl Provider for AnthropicProvider {
         let mut served_model = model.to_string();
 
         for _ in 0..MAX_ITERATIONS {
+            // Hard ceiling: never request more than the budget's remainder.
+            let spent = in_total + out_total;
+            let remaining = budget_tokens.saturating_sub(spent);
+            if remaining == 0 {
+                return Ok(Completion {
+                    text: String::new(),
+                    model: served_model,
+                    outcome: "budget-exhausted".into(),
+                    input_tokens: in_total,
+                    output_tokens: out_total,
+                });
+            }
             let payload = self.request(&json!({
                 "model": model,
-                "max_tokens": 16000,
+                "max_tokens": remaining.clamp(1, 16000),
                 "system": system,
                 "messages": messages,
                 "tools": tool_defs,
@@ -258,7 +287,13 @@ impl Default for OllamaProvider {
 }
 
 impl Provider for OllamaProvider {
-    fn complete(&self, model: &str, system: &str, prompt: &str) -> Result<Completion, crate::Error> {
+    fn complete(
+        &self,
+        model: &str,
+        system: &str,
+        prompt: &str,
+        max_tokens: u64,
+    ) -> Result<Completion, crate::Error> {
         let client = reqwest::blocking::Client::new();
         let resp = client
             .post(format!("{}/api/generate", self.base_url))
@@ -267,6 +302,7 @@ impl Provider for OllamaProvider {
                 "system": system,
                 "prompt": prompt,
                 "stream": false,
+                "options": {"num_predict": max_tokens.clamp(1, 16000)},
             }))
             .send()
             .map_err(|e| crate::Error::Provider(format!("ollama request: {e}")))?;
@@ -287,7 +323,13 @@ impl Provider for OllamaProvider {
 pub struct MockProvider;
 
 impl Provider for MockProvider {
-    fn complete(&self, model: &str, _system: &str, prompt: &str) -> Result<Completion, crate::Error> {
+    fn complete(
+        &self,
+        model: &str,
+        _system: &str,
+        prompt: &str,
+        _max_tokens: u64,
+    ) -> Result<Completion, crate::Error> {
         Ok(Completion {
             text: format!("[mock:{model}] {prompt}"),
             model: model.to_string(),
@@ -304,8 +346,14 @@ impl Provider for MockProvider {
 pub struct MockToolProvider;
 
 impl Provider for MockToolProvider {
-    fn complete(&self, model: &str, system: &str, prompt: &str) -> Result<Completion, crate::Error> {
-        MockProvider.complete(model, system, prompt)
+    fn complete(
+        &self,
+        model: &str,
+        system: &str,
+        prompt: &str,
+        max_tokens: u64,
+    ) -> Result<Completion, crate::Error> {
+        MockProvider.complete(model, system, prompt, max_tokens)
     }
 
     fn complete_with_tools(
@@ -315,6 +363,7 @@ impl Provider for MockToolProvider {
         prompt: &str,
         tools: &[crate::connector::ToolDef],
         dispatch: ToolDispatch,
+        _budget_tokens: u64,
     ) -> Result<Completion, crate::Error> {
         let mut reports = Vec::new();
         for tool in tools {

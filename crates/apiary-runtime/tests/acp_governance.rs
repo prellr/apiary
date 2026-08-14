@@ -6,7 +6,14 @@ use apiary_core::log::EpisodicLog;
 use apiary_core::manifest::Manifest;
 use nostr::prelude::*;
 
-fn setup(tag: &str) -> (Manifest, std::path::PathBuf, Custody, apiary_core::custody::AgentHandle) {
+fn setup(
+    tag: &str,
+) -> (
+    Manifest,
+    std::path::PathBuf,
+    Custody,
+    apiary_core::custody::AgentHandle,
+) {
     let mut custody = Custody::new();
     let keys = Keys::generate();
     let npub = apiary_core::identity::to_npub(&keys.public_key()).unwrap();
@@ -26,16 +33,33 @@ fn acp_deny_mode_blocks_tool_and_logs_harness() {
     let (manifest, dir, custody, handle) = setup("deny");
     let mock = env!("CARGO_BIN_EXE_mock-acp-agent");
     let out = apiary_runtime::runner::run_acp_task(
-        &manifest, &dir, &custody, &handle, "do something", mock, &[], false,
+        &manifest,
+        &dir,
+        &custody,
+        &handle,
+        "do something",
+        mock,
+        &[],
+        false,
     )
     .unwrap();
 
-    assert!(out.text.contains("mock harness reply: do something"), "{}", out.text);
+    assert!(
+        out.text.contains("mock harness reply: do something"),
+        "{}",
+        out.text
+    );
     assert_eq!(out.stop_reason, "end_turn");
     // Host policy denied the write_file permission…
-    assert_eq!(out.permissions, vec![("write_file".to_string(), "reject_once".to_string())]);
+    assert_eq!(
+        out.permissions,
+        vec![("write_file".to_string(), "reject_once".to_string())]
+    );
     // …and the harness reported the tool as failed, not completed.
-    assert!(out.tool_calls.iter().any(|(t, s)| t == "write_file" && s == "failed"));
+    assert!(out
+        .tool_calls
+        .iter()
+        .any(|(t, s)| t == "write_file" && s == "failed"));
 
     // The signed record attributes the run to the foreign harness.
     let log = EpisodicLog::open(&dir);
@@ -52,10 +76,23 @@ fn acp_allow_mode_grants_tool() {
     let (manifest, dir, custody, handle) = setup("allow");
     let mock = env!("CARGO_BIN_EXE_mock-acp-agent");
     let out = apiary_runtime::runner::run_acp_task(
-        &manifest, &dir, &custody, &handle, "write it", mock, &[], true,
+        &manifest,
+        &dir,
+        &custody,
+        &handle,
+        "write it",
+        mock,
+        &[],
+        true,
     )
     .unwrap();
-    assert_eq!(out.permissions, vec![("write_file".to_string(), "allow_once".to_string())]);
-    assert!(out.tool_calls.iter().any(|(t, s)| t == "write_file" && s == "completed"));
+    assert_eq!(
+        out.permissions,
+        vec![("write_file".to_string(), "allow_once".to_string())]
+    );
+    assert!(out
+        .tool_calls
+        .iter()
+        .any(|(t, s)| t == "write_file" && s == "completed"));
     std::fs::remove_dir_all(&dir).ok();
 }

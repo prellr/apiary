@@ -6,15 +6,18 @@
 mod agui;
 mod nip98;
 
-use apiary_core::{ceremony, custody::Custody, keystore::Keystore, log::EpisodicLog, manifest::Manifest};
+use apiary_core::{
+    ceremony, custody::Custody, keystore::Keystore, log::EpisodicLog, manifest::Manifest,
+};
 use axum::{
-    extract::{Path as AxPath, Query, State},
+    extract::{OriginalUri, Path as AxPath, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse},
     routing::{get, post},
     Json, Router,
 };
 use clap::Parser;
+use nostr::prelude::PublicKey;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,6 +37,10 @@ struct Args {
     /// Auth mode: "open" (localhost dev) or "nip98" (signed requests).
     #[arg(long, default_value = "open")]
     auth: String,
+    /// Canonical external origin clients sign NIP-98 URLs against
+    /// (default: http://<bind>). Must match what clients see exactly.
+    #[arg(long)]
+    origin: Option<String>,
 }
 
 fn default_home() -> PathBuf {
@@ -47,6 +54,8 @@ pub struct AppState {
     pub home: PathBuf,
     pub passphrase: Option<String>,
     pub auth: AuthMode,
+    /// Canonical origin for exact NIP-98 URL matching.
+    pub origin: String,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -60,43 +69,79 @@ type App = Arc<AppState>;
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+    // Fail closed: an unrecognized auth mode must never silently mean open.
     let auth = match args.auth.as_str() {
         "nip98" => AuthMode::Nip98,
-        _ => {
+        "open" => {
             eprintln!("auth=open: every local process can drive this daemon; use --auth nip98 beyond localhost dev");
             AuthMode::Open
+        }
+        other => {
+            eprintln!("error: unknown --auth '{other}' (expected: open | nip98)");
+            std::process::exit(2);
         }
     };
     let state: App = Arc::new(AppState {
         home: args.home.clone(),
         passphrase: args.passphrase.clone(),
         auth,
+        origin: args
+            .origin
+            .clone()
+            .unwrap_or_else(|| format!("http://{}", args.bind)),
     });
     let app = Router::new()
         .route("/", get(cockpit))
+        .route("/app.js", get(cockpit_js))
         .route("/api/agents", get(list_agents))
         .route("/api/agents/found", post(found_agent))
-        .route("/api/agents/{npub}/manifest", get(get_manifest).put(put_manifest))
+        .route(
+            "/api/agents/{npub}/manifest",
+            get(get_manifest).put(put_manifest),
+        )
         .route("/api/agents/{npub}/ratify", post(ratify_agent))
         .route("/api/agents/{npub}/log", get(get_log))
         .route("/api/agents/{npub}/run", post(agui::run_stream))
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind(&args.bind).await.expect("bind");
+    let listener = tokio::net::TcpListener::bind(&args.bind)
+        .await
+        .expect("bind");
     println!("apiary-hostd listening on http://{}", args.bind);
     axum::serve(listener, app).await.expect("serve");
 }
 
-async fn cockpit() -> Html<&'static str> {
-    Html(include_str!("cockpit.html"))
+/// Restrictive CSP: no inline script, no external anything. Rendering uses
+/// textContent throughout (see cockpit.js) — the CSP is the backstop.
+const CSP: &str =
+    "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'";
+
+async fn cockpit() -> impl IntoResponse {
+    (
+        [("content-security-policy", CSP)],
+        Html(include_str!("cockpit.html")),
+    )
 }
 
-pub fn err(status: StatusCode, msg: impl std::fmt::Display) -> (StatusCode, Json<serde_json::Value>) {
+async fn cockpit_js() -> impl IntoResponse {
+    (
+        [
+            ("content-type", "application/javascript; charset=utf-8"),
+            ("content-security-policy", CSP),
+        ],
+        include_str!("cockpit.js"),
+    )
+}
+
+pub fn err(
+    status: StatusCode,
+    msg: impl std::fmt::Display,
+) -> (StatusCode, Json<serde_json::Value>) {
     (status, Json(json!({"ok": false, "error": msg.to_string()})))
 }
 
 fn normalize(npub: &str) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
-    let pk = apiary_core::identity::parse_npub(npub)
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    let pk =
+        apiary_core::identity::parse_npub(npub).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     apiary_core::identity::to_npub(&pk).map_err(|e| err(StatusCode::BAD_REQUEST, e))
 }
 
@@ -114,30 +159,52 @@ pub fn agent_ctx(
     Ok((ks, npub, dir))
 }
 
-pub fn load_manifest(dir: &std::path::Path) -> Result<(String, Manifest), (StatusCode, Json<serde_json::Value>)> {
+pub fn load_manifest(
+    dir: &std::path::Path,
+) -> Result<(String, Manifest), (StatusCode, Json<serde_json::Value>)> {
     let raw = std::fs::read_to_string(dir.join("manifest.yaml"))
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let m = Manifest::from_yaml(&raw).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok((raw, m))
 }
 
-fn ratified(dir: &std::path::Path, raw: &str, manifest: &Manifest) -> bool {
-    let Ok(keys) = manifest
+pub fn suspend_pks(manifest: &Manifest) -> Vec<PublicKey> {
+    manifest
         .governance
         .suspend_keys
         .iter()
-        .map(|k| apiary_core::identity::parse_npub(k))
-        .collect::<Result<Vec<_>, _>>()
-    else {
-        return false;
-    };
-    ceremony::is_ratified(&EpisodicLog::open(dir), raw, &keys).unwrap_or(false)
+        .filter_map(|k| apiary_core::identity::parse_npub(k).ok())
+        .collect()
 }
 
-async fn list_agents(State(state): State<App>, headers: axum::http::HeaderMap) -> impl IntoResponse {
-    if let Err(e) = nip98::check(&state, &headers, "/api/agents", "GET") {
-        return e.into_response();
-    }
+fn ratified(dir: &std::path::Path, npub: &str, raw: &str, manifest: &Manifest) -> bool {
+    let Ok(agent_pk) = apiary_core::identity::parse_npub(npub) else {
+        return false;
+    };
+    ceremony::is_ratified(
+        &EpisodicLog::open(dir),
+        raw,
+        &agent_pk,
+        &suspend_pks(manifest),
+    )
+    .unwrap_or(false)
+}
+
+fn path_and_query(uri: &axum::http::Uri) -> String {
+    uri.path_and_query()
+        .map(|pq| pq.to_string())
+        .unwrap_or_else(|| uri.path().to_string())
+}
+
+async fn list_agents(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let signer = match nip98::check(&state, &headers, "GET", &path_and_query(&uri), None) {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
     let ks = match Keystore::open(&state.home) {
         Ok(k) => k,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -146,15 +213,22 @@ async fn list_agents(State(state): State<App>, headers: axum::http::HeaderMap) -
     for npub in ks.list().unwrap_or_default() {
         let dir = ks.agent_dir(&npub);
         let name = std::fs::read_to_string(dir.join("name")).ok();
-        let (rat, entries) = match load_manifest(&dir) {
-            Ok((raw, m)) => (
-                ratified(&dir, &raw, &m),
-                EpisodicLog::open(&dir).read_all().map(|v| v.len()).unwrap_or(0),
-            ),
-            Err(_) => (false, 0),
+        let Ok((raw, m)) = load_manifest(&dir) else {
+            continue;
         };
+        // In nip98 mode the roster shows only agents the signer governs.
+        if nip98::authorize_governor(&state, signer, &suspend_pks(&m)).is_err() {
+            continue;
+        }
+        let entries = EpisodicLog::open(&dir)
+            .read_all()
+            .map(|v| v.len())
+            .unwrap_or(0);
         agents.push(json!({
-            "npub": npub, "name": name, "ratified": rat, "log_entries": entries,
+            "npub": npub,
+            "name": name,
+            "ratified": ratified(&dir, &npub, &raw, &m),
+            "log_entries": entries,
         }));
     }
     Json(json!({"ok": true, "agents": agents})).into_response()
@@ -163,25 +237,32 @@ async fn list_agents(State(state): State<App>, headers: axum::http::HeaderMap) -
 async fn get_manifest(
     State(state): State<App>,
     AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(e) = nip98::check(&state, &headers, &format!("/api/agents/{npub}/manifest"), "GET") {
-        return e.into_response();
-    }
+    let signer = match nip98::check(&state, &headers, "GET", &path_and_query(&uri), None) {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
     let (_ks, npub, dir) = match agent_ctx(&state, &npub) {
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
     match load_manifest(&dir) {
-        Ok((raw, m)) => Json(json!({
-            "ok": true,
-            "npub": npub,
-            "yaml": raw,
-            "manifest": serde_json::to_value(&m).unwrap_or_default(),
-            "ratified": ratified(&dir, &raw, &m),
-            "manifest_sha256": ceremony::manifest_hash(&raw),
-        }))
-        .into_response(),
+        Ok((raw, m)) => {
+            if let Err(e) = nip98::authorize_governor(&state, signer, &suspend_pks(&m)) {
+                return e.into_response();
+            }
+            Json(json!({
+                "ok": true,
+                "npub": npub,
+                "yaml": raw,
+                "manifest": serde_json::to_value(&m).unwrap_or_default(),
+                "ratified": ratified(&dir, &npub, &raw, &m),
+                "manifest_sha256": ceremony::manifest_hash(&raw),
+            }))
+            .into_response()
+        }
         Err(e) => e.into_response(),
     }
 }
@@ -199,19 +280,30 @@ async fn get_log(
     State(state): State<App>,
     AxPath(npub): AxPath<String>,
     Query(q): Query<LogQuery>,
+    OriginalUri(uri): OriginalUri,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(e) = nip98::check(&state, &headers, &format!("/api/agents/{npub}/log"), "GET") {
-        return e.into_response();
-    }
+    let signer = match nip98::check(&state, &headers, "GET", &path_and_query(&uri), None) {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
     let (_ks, npub, dir) = match agent_ctx(&state, &npub) {
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
+    match load_manifest(&dir) {
+        Ok((_, m)) => {
+            if let Err(e) = nip98::authorize_governor(&state, signer, &suspend_pks(&m)) {
+                return e.into_response();
+            }
+        }
+        Err(e) => return e.into_response(),
+    }
     let log = EpisodicLog::open(&dir);
-    let chain = log.verify().map(|n| json!({"valid": true, "entries": n})).unwrap_or_else(
-        |e| json!({"valid": false, "error": e.to_string()}),
-    );
+    let chain = log
+        .verify()
+        .map(|n| json!({"valid": true, "entries": n}))
+        .unwrap_or_else(|e| json!({"valid": false, "error": e.to_string()}));
     let entries: Vec<serde_json::Value> = log
         .tail(q.tail)
         .unwrap_or_default()
@@ -240,16 +332,39 @@ struct PutManifestBody {
 async fn put_manifest(
     State(state): State<App>,
     AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
     headers: axum::http::HeaderMap,
-    Json(body): Json<PutManifestBody>,
+    raw_body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    if let Err(e) = nip98::check(&state, &headers, &format!("/api/agents/{npub}/manifest"), "PUT") {
-        return e.into_response();
-    }
+    let signer = match nip98::check(
+        &state,
+        &headers,
+        "PUT",
+        &path_and_query(&uri),
+        Some(&raw_body),
+    ) {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let body: PutManifestBody = match serde_json::from_slice(&raw_body) {
+        Ok(b) => b,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
     let (_ks, npub, dir) = match agent_ctx(&state, &npub) {
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
+    // Governorship is checked against the CURRENT constitution — the one
+    // being amended — so a stranger cannot grant themselves authority by
+    // writing a manifest that names them.
+    match load_manifest(&dir) {
+        Ok((_, current)) => {
+            if let Err(e) = nip98::authorize_governor(&state, signer, &suspend_pks(&current)) {
+                return e.into_response();
+            }
+        }
+        Err(e) => return e.into_response(),
+    }
     let manifest = match Manifest::from_yaml(&body.yaml) {
         Ok(m) => m,
         Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
@@ -260,8 +375,11 @@ async fn put_manifest(
         .and_then(|pk| apiary_core::identity::to_npub(&pk).ok())
         .is_some_and(|n| n == npub);
     if !identity_ok {
-        return err(StatusCode::BAD_REQUEST, "manifest identity.npub must match the agent")
-            .into_response();
+        return err(
+            StatusCode::BAD_REQUEST,
+            "manifest identity.npub must match the agent",
+        )
+        .into_response();
     }
     if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &body.yaml) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
@@ -285,12 +403,24 @@ struct RatifyBody {
 async fn ratify_agent(
     State(state): State<App>,
     AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
     headers: axum::http::HeaderMap,
-    Json(body): Json<RatifyBody>,
+    raw_body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    if let Err(e) = nip98::check(&state, &headers, &format!("/api/agents/{npub}/ratify"), "POST") {
-        return e.into_response();
-    }
+    let signer = match nip98::check(
+        &state,
+        &headers,
+        "POST",
+        &path_and_query(&uri),
+        Some(&raw_body),
+    ) {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let body: RatifyBody = match serde_json::from_slice(&raw_body) {
+        Ok(b) => b,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
     let (ks, npub, dir) = match agent_ctx(&state, &npub) {
         Ok(v) => v,
         Err(e) => return e.into_response(),
@@ -303,25 +433,36 @@ async fn ratify_agent(
         Ok(k) => k,
         Err(e) => return e.into_response(),
     };
-    let listed = manifest
-        .governance
-        .suspend_keys
-        .iter()
-        .filter_map(|k| apiary_core::identity::parse_npub(k).ok())
-        .collect::<Vec<_>>();
+    let listed = suspend_pks(&manifest);
     let ratifier_pk = match apiary_core::identity::parse_npub(&as_key) {
         Ok(pk) if listed.contains(&pk) => pk,
         Ok(_) => {
-            return err(StatusCode::FORBIDDEN, "ratifier is not a listed suspend key").into_response()
+            return err(
+                StatusCode::FORBIDDEN,
+                "ratifier is not a listed suspend key",
+            )
+            .into_response()
         }
         Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
     };
-    let _ = ratifier_pk;
+    // A host-held human key signs ONLY for the person who proved possession
+    // of that same key: in nip98 mode the request signer must BE the
+    // ratifier. (Open mode is local trust — same as holding the keystore.)
+    if state.auth == AuthMode::Nip98 && signer != Some(ratifier_pk) {
+        return err(
+            StatusCode::FORBIDDEN,
+            "ratification must be signed by the ratifying key itself (as == request signer)",
+        )
+        .into_response();
+    }
     let pass = match state.passphrase.as_deref() {
         Some(p) => p,
         None => {
-            return err(StatusCode::SERVICE_UNAVAILABLE, "daemon has no passphrase; ratification disabled")
-                .into_response()
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "daemon has no passphrase; ratification disabled",
+            )
+            .into_response()
         }
     };
     let (agent_keys, human_keys) = match (ks.load(&npub, pass), ks.load(&as_key, pass)) {
@@ -367,14 +508,30 @@ struct FoundBody {
 /// runs until ratified.
 async fn found_agent(
     State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
     headers: axum::http::HeaderMap,
-    Json(body): Json<FoundBody>,
+    raw_body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    if let Err(e) = nip98::check(&state, &headers, "/api/agents/found", "POST") {
-        return e.into_response();
-    }
+    let signer = match nip98::check(
+        &state,
+        &headers,
+        "POST",
+        &path_and_query(&uri),
+        Some(&raw_body),
+    ) {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let body: FoundBody = match serde_json::from_slice(&raw_body) {
+        Ok(b) => b,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
     if body.suspend_keys.is_empty() {
-        return err(StatusCode::BAD_REQUEST, "at least one human suspend key is required").into_response();
+        return err(
+            StatusCode::BAD_REQUEST,
+            "at least one human suspend key is required",
+        )
+        .into_response();
     }
     let suspend: Vec<String> = match body
         .suspend_keys
@@ -385,11 +542,25 @@ async fn found_agent(
         Ok(v) => v,
         Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
     };
+    // The founder must govern what they found: in nip98 mode the request
+    // signer must be among the new agent's suspend keys.
+    if state.auth == AuthMode::Nip98 {
+        let listed = suspend
+            .iter()
+            .filter_map(|k| apiary_core::identity::parse_npub(k).ok())
+            .collect::<Vec<_>>();
+        if let Err(e) = nip98::authorize_governor(&state, signer, &listed) {
+            return e.into_response();
+        }
+    }
     let pass = match state.passphrase.as_deref() {
         Some(p) => p,
         None => {
-            return err(StatusCode::SERVICE_UNAVAILABLE, "daemon has no passphrase; founding disabled")
-                .into_response()
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "daemon has no passphrase; founding disabled",
+            )
+            .into_response()
         }
     };
     let ks = match Keystore::open(&state.home) {
@@ -482,12 +653,19 @@ async fn draft_manifest_with_model(
              Purpose of this agent: {purpose}\n\nDraft the manifest YAML."
         );
         let completion = provider
-            .complete("claude-opus-5", system, &prompt)
+            .complete("claude-opus-5", system, &prompt, 8192)
             .map_err(|e| e.to_string())?;
         if completion.outcome != "ok" {
             return Err(format!("draft stopped: {}", completion.outcome));
         }
-        Ok(completion.text.trim().trim_start_matches("```yaml").trim_start_matches("```").trim_end_matches("```").trim().to_string())
+        Ok(completion
+            .text
+            .trim()
+            .trim_start_matches("```yaml")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim()
+            .to_string())
     })
     .await
     .map_err(|e| e.to_string())?

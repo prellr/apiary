@@ -1,24 +1,33 @@
 //! NIP-98 HTTP auth — the nostr×AG-UI seam (SPEC §10): a signed ephemeral
-//! event in the Authorization header binds the request to an npub. No
-//! passwords, no bearer tokens, no account table.
+//! event in the Authorization header binds the request to an npub.
+//!
+//! Spec-exact per NIP-98: the `u` tag must match the request's absolute URL
+//! EXACTLY (query included), the `method` tag must match, and body-bearing
+//! requests must carry a `payload` tag with the SHA-256 of the body — so a
+//! captured header authorizes nothing beyond the one request it signed.
+//!
+//! Authentication is not authorization: `check` yields the signer, and the
+//! caller must bind it to the operation (governorship) — see `authorize`.
 
 use crate::{AppState, AuthMode};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use base64::Engine;
 use nostr::prelude::*;
+use sha2::{Digest, Sha256};
 
 const NIP98_KIND: u16 = 27235;
 const FRESHNESS_SECS: u64 = 60;
 
-/// Enforce the daemon's auth mode for a request. In `open` mode this is a
-/// no-op (localhost dev); in `nip98` mode the Authorization header must
-/// carry a valid, fresh, signed kind-27235 event whose u/method tags match.
+/// Authenticate a request. `path_and_query` is the exact request target
+/// (e.g. "/api/agents/npub1…/log?tail=50"); `body` is the raw body for
+/// mutating requests (None for bodyless GETs).
 pub fn check(
     state: &AppState,
     headers: &HeaderMap,
-    path: &str,
     method: &str,
+    path_and_query: &str,
+    body: Option<&[u8]>,
 ) -> Result<Option<PublicKey>, (StatusCode, Json<serde_json::Value>)> {
     if state.auth == AuthMode::Open {
         return Ok(None);
@@ -47,8 +56,7 @@ pub fn check(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let at = event.created_at.as_secs();
-    if now.abs_diff(at) > FRESHNESS_SECS {
+    if now.abs_diff(event.created_at.as_secs()) > FRESHNESS_SECS {
         return Err(fail("stale event (replay window exceeded)"));
     }
 
@@ -58,16 +66,47 @@ pub fn check(
             (s.first().map(String::as_str) == Some(name)).then(|| s.get(1).cloned())?
         })
     };
-    // The u tag must END with our path — clients sign the full URL, and the
-    // daemon may sit behind localhost or a hostname it can't see.
-    match tag("u") {
-        Some(u) if u.split('?').next().unwrap_or("").ends_with(path) => {}
-        _ => return Err(fail("u tag does not match request path")),
+
+    // Exact absolute-URL match against the daemon's canonical origin.
+    let expected = format!("{}{}", state.origin, path_and_query);
+    if tag("u").as_deref() != Some(expected.as_str()) {
+        return Err(fail(&format!("u tag must be exactly {expected}")));
     }
     if tag("method").as_deref() != Some(method) {
         return Err(fail("method tag mismatch"));
     }
+    // Body binding: mutating requests must hash their payload.
+    if let Some(body) = body {
+        let want = format!("{:x}", Sha256::digest(body));
+        if tag("payload").as_deref() != Some(want.as_str()) {
+            return Err(fail("payload tag missing or does not match body sha256"));
+        }
+    }
     Ok(Some(event.pubkey))
+}
+
+/// Bind authentication to authorization: in nip98 mode the signer must be a
+/// GOVERNOR of the agent (a listed suspend key). In open mode (localhost
+/// dev trust, loudly warned at startup) there is no signer to bind.
+pub fn authorize_governor(
+    state: &AppState,
+    signer: Option<PublicKey>,
+    suspend_keys: &[PublicKey],
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if state.auth == AuthMode::Open {
+        return Ok(());
+    }
+    match signer {
+        Some(pk) if suspend_keys.contains(&pk) => Ok(()),
+        Some(_) => Err(crate::err(
+            StatusCode::FORBIDDEN,
+            "signer is not a governor (suspend key) of this agent",
+        )),
+        None => Err(crate::err(
+            StatusCode::UNAUTHORIZED,
+            "authentication required",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -76,18 +115,36 @@ mod tests {
     use std::path::PathBuf;
 
     fn state(auth: AuthMode) -> AppState {
-        AppState { home: PathBuf::from("/tmp"), passphrase: None, auth }
+        AppState {
+            home: PathBuf::from("/tmp"),
+            passphrase: None,
+            auth,
+            origin: "http://127.0.0.1:7777".into(),
+        }
     }
 
-    fn signed_header(keys: &Keys, url: &str, method: &str, age_offset: i64) -> String {
+    fn signed_header(
+        keys: &Keys,
+        url: &str,
+        method: &str,
+        body: Option<&[u8]>,
+        age_offset: i64,
+    ) -> String {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64
             + age_offset;
-        let event = EventBuilder::new(Kind::Custom(NIP98_KIND), "")
+        let mut builder = EventBuilder::new(Kind::Custom(NIP98_KIND), "")
             .tag(Tag::custom("u", vec![url.to_string()]))
-            .tag(Tag::custom("method", vec![method.to_string()]))
+            .tag(Tag::custom("method", vec![method.to_string()]));
+        if let Some(b) = body {
+            builder = builder.tag(Tag::custom(
+                "payload",
+                vec![format!("{:x}", Sha256::digest(b))],
+            ));
+        }
+        let event = builder
             .custom_created_at(Timestamp::from_secs(now as u64))
             .finalize(keys)
             .unwrap();
@@ -97,39 +154,95 @@ mod tests {
         )
     }
 
-    #[test]
-    fn open_mode_passes_without_header() {
-        assert!(check(&state(AuthMode::Open), &HeaderMap::new(), "/api/agents", "GET").is_ok());
+    fn headers_with(h: String) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        m.insert("authorization", h.parse().unwrap());
+        m
     }
 
     #[test]
-    fn nip98_verifies_and_rejects() {
+    fn open_mode_passes_without_header() {
+        assert!(check(
+            &state(AuthMode::Open),
+            &HeaderMap::new(),
+            "GET",
+            "/api/agents",
+            None
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn exact_url_and_method_required() {
         let s = state(AuthMode::Nip98);
         let keys = Keys::generate();
-
-        // No header → rejected.
-        assert!(check(&s, &HeaderMap::new(), "/api/agents", "GET").is_err());
-
-        // Valid header → accepted, pubkey returned.
-        let mut h = HeaderMap::new();
-        h.insert(
-            "authorization",
-            signed_header(&keys, "http://localhost:7777/api/agents", "GET", 0).parse().unwrap(),
+        let h = headers_with(signed_header(
+            &keys,
+            "http://127.0.0.1:7777/api/agents",
+            "GET",
+            None,
+            0,
+        ));
+        assert_eq!(
+            check(&s, &h, "GET", "/api/agents", None).unwrap(),
+            Some(keys.public_key())
         );
-        let who = check(&s, &h, "/api/agents", "GET").unwrap();
-        assert_eq!(who, Some(keys.public_key()));
+        // Suffix-only match is NOT enough (prefix must be the exact origin).
+        let h2 = headers_with(signed_header(
+            &keys,
+            "http://evil.example/api/agents",
+            "GET",
+            None,
+            0,
+        ));
+        assert!(check(&s, &h2, "GET", "/api/agents", None).is_err());
+        // Query must be included in the signed URL.
+        assert!(check(&s, &h, "GET", "/api/agents?x=1", None).is_err());
+        // Method mismatch.
+        assert!(check(&s, &h, "POST", "/api/agents", None).is_err());
+        // Stale.
+        let h3 = headers_with(signed_header(
+            &keys,
+            "http://127.0.0.1:7777/api/agents",
+            "GET",
+            None,
+            -300,
+        ));
+        assert!(check(&s, &h3, "GET", "/api/agents", None).is_err());
+    }
 
-        // Wrong path → rejected.
-        assert!(check(&s, &h, "/api/other", "GET").is_err());
-        // Wrong method → rejected.
-        assert!(check(&s, &h, "/api/agents", "POST").is_err());
+    #[test]
+    fn body_bearing_requests_require_payload_hash() {
+        let s = state(AuthMode::Nip98);
+        let keys = Keys::generate();
+        let body = br#"{"task":"x"}"#;
+        let url = "http://127.0.0.1:7777/api/agents/npub1x/run";
+        // Correct payload hash → accepted.
+        let h = headers_with(signed_header(&keys, url, "POST", Some(body), 0));
+        assert!(check(&s, &h, "POST", "/api/agents/npub1x/run", Some(body)).is_ok());
+        // Substituted body → rejected (captured header authorizes nothing else).
+        assert!(check(
+            &s,
+            &h,
+            "POST",
+            "/api/agents/npub1x/run",
+            Some(br#"{"task":"evil"}"#)
+        )
+        .is_err());
+        // Missing payload tag → rejected.
+        let h2 = headers_with(signed_header(&keys, url, "POST", None, 0));
+        assert!(check(&s, &h2, "POST", "/api/agents/npub1x/run", Some(body)).is_err());
+    }
 
-        // Stale → rejected.
-        let mut h2 = HeaderMap::new();
-        h2.insert(
-            "authorization",
-            signed_header(&keys, "http://localhost:7777/api/agents", "GET", -300).parse().unwrap(),
-        );
-        assert!(check(&s, &h2, "/api/agents", "GET").is_err());
+    #[test]
+    fn governor_binding() {
+        let s = state(AuthMode::Nip98);
+        let gov = Keys::generate().public_key();
+        let stranger = Keys::generate().public_key();
+        assert!(authorize_governor(&s, Some(gov), &[gov]).is_ok());
+        assert!(authorize_governor(&s, Some(stranger), &[gov]).is_err());
+        assert!(authorize_governor(&s, None, &[gov]).is_err());
+        // Open mode: local trust, no binding.
+        assert!(authorize_governor(&state(AuthMode::Open), None, &[gov]).is_ok());
     }
 }

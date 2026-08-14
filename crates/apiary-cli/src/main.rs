@@ -3,9 +3,11 @@
 //! HOST surface; agents' own shell access is an opt-in connector (SPEC §6) and
 //! has nothing to do with this binary.
 
-use apiary_core::{ceremony, custody::Custody, keystore::Keystore, log::EpisodicLog, manifest::Manifest};
-use nostr::prelude::*;
+use apiary_core::{
+    ceremony, custody::Custody, keystore::Keystore, log::EpisodicLog, manifest::Manifest,
+};
 use clap::{Parser, Subcommand};
+use nostr::prelude::*;
 use serde_json::json;
 use std::io::Read;
 use std::path::PathBuf;
@@ -160,7 +162,8 @@ fn main() {
         Err(e) => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&json!({"ok": false, "error": e.to_string()})).unwrap()
+                serde_json::to_string_pretty(&json!({"ok": false, "error": e.to_string()}))
+                    .unwrap()
             );
             std::process::exit(1);
         }
@@ -197,7 +200,12 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                     "note": "provisional manifest — founding is the moment of maximum ignorance; ratify and amend"
                 }))
             }
-            AgentCmd::Ratify { npub, as_key, export, import } => {
+            AgentCmd::Ratify {
+                npub,
+                as_key,
+                export,
+                import,
+            } => {
                 let npub = &normalize_key(npub)?;
                 let raw = std::fs::read_to_string(ks.agent_dir(npub).join("manifest.yaml"))?;
                 let manifest = Manifest::from_yaml(&raw)?;
@@ -210,13 +218,20 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                 let log = EpisodicLog::open(&ks.agent_dir(npub));
 
                 if *import {
-                    // Externally-signed event on stdin; verify + append.
+                    // Externally-signed human event on stdin. A complete
+                    // founding needs BOTH signatures, so the agent signs its
+                    // manifest here too (keystore key, passphrase required).
                     let event = Event::from_json(read_stdin()?.trim())
                         .map_err(|e| format!("could not parse event JSON: {e}"))?;
+                    let passphrase = require_passphrase(cli)?;
+                    let mut custody = Custody::new();
+                    let agent_handle = custody.admit(ks.load(npub, passphrase)?);
+                    let signed = ceremony::sign_manifest(&custody, &agent_handle, &log, &raw)?;
                     ceremony::import_ratification(&log, &event, &raw, &listed)?;
                     return Ok(json!({
                         "ok": true,
                         "agent": npub,
+                        "agent_signed": signed.id.to_hex(),
                         "imported": event.id.to_hex(),
                         "ratified_by": event.pubkey.to_hex(),
                         "manifest_sha256": ceremony::manifest_hash(&raw),
@@ -238,8 +253,7 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
 
                 if *export {
                     // Emit the unsigned event; the human signs it elsewhere.
-                    let unsigned =
-                        ceremony::ratification_unsigned(ratifier_pk, npub, &raw)?;
+                    let unsigned = ceremony::ratification_unsigned(ratifier_pk, npub, &raw)?;
                     return Ok(json!({
                         "ok": true,
                         "agent": npub,
@@ -324,7 +338,16 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                 "in_keystore": in_keystore,
             }))
         }
-        Command::Run { npub, task, class, data_class, harness, acp_cmd, acp_args, acp_allow } => {
+        Command::Run {
+            npub,
+            task,
+            class,
+            data_class,
+            harness,
+            acp_cmd,
+            acp_args,
+            acp_allow,
+        } => {
             let npub = &normalize_key(npub)?;
             let passphrase = require_passphrase(cli)?;
             let agent_dir = ks.agent_dir(npub);
@@ -338,7 +361,8 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                 .map(|k| apiary_core::identity::parse_npub(k))
                 .collect::<Result<Vec<_>, _>>()?;
             let log = EpisodicLog::open(&agent_dir);
-            if !ceremony::is_ratified(&log, &raw, &suspend_keys)? {
+            let agent_pk = apiary_core::identity::parse_npub(npub)?;
+            if !ceremony::is_ratified(&log, &raw, &agent_pk, &suspend_keys)? {
                 return Err(
                     "manifest is not ratified — run `apiary agent ratify` first \
                      (founding is constitution-then-amendments; nothing runs unratified)"

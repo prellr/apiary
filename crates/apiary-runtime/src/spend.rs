@@ -3,30 +3,59 @@
 //! call. The model is never asked to be frugal; a hijacked agent is bounded
 //! by construction.
 //!
-//! Phase 1 implements the token side: `governance.budgets.tokens_per_day`.
-//! Counters live in the agent dir (`spend.json`), keyed by UTC date.
+//! The cap is a HARD ceiling, not a turnstile: capacity is RESERVED under an
+//! exclusive file lock before inference (concurrent runs cannot all pass),
+//! the reservation bounds what the provider may generate (max_tokens is
+//! clamped to it), and actual usage settles the reservation afterward.
+//! Crashed runs leak nothing: reservations expire.
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+/// A run may reserve at most this much at once — bounds a single run's
+/// worst case even under a huge daily cap.
+pub const MAX_RESERVATION: u64 = 64_000;
+/// Reservations from crashed runs expire after this many seconds.
+const RESERVATION_TTL_SECS: u64 = 600;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct DaySpend {
     pub date: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub reservations: Vec<ReservationRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReservationRecord {
+    pub id: u64,
+    pub amount: u64,
+    pub at: u64,
+}
+
+/// A claim on today's remaining capacity. Settle it with actual usage (or
+/// zero on failure); unsettled reservations expire after the TTL.
+pub struct Reservation {
+    pub id: u64,
+    pub amount: u64,
 }
 
 pub struct SpendLedger {
     path: PathBuf,
+    lock_path: PathBuf,
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn utc_date_today() -> String {
-    // Days since epoch → civil date (no chrono dependency for one field).
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let days = secs / 86_400;
+    let days = now_secs() / 86_400;
     // Howard Hinnant's civil_from_days algorithm.
     let z = days as i64 + 719_468;
     let era = z.div_euclid(146_097);
@@ -45,68 +74,184 @@ impl SpendLedger {
     pub fn open(agent_dir: &Path) -> Self {
         Self {
             path: agent_dir.join("spend.json"),
+            lock_path: agent_dir.join("spend.lock"),
         }
+    }
+
+    /// Run `f` with the ledger loaded under an exclusive lock; persist what
+    /// it returns. This is the ONLY way state changes — check-then-act
+    /// races are structurally impossible.
+    fn with_locked<T>(
+        &self,
+        f: impl FnOnce(&mut DaySpend) -> Result<T, crate::Error>,
+    ) -> Result<T, crate::Error> {
+        let mut lock_opts = std::fs::OpenOptions::new();
+        lock_opts.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            lock_opts.mode(0o600);
+        }
+        let lock = lock_opts.open(&self.lock_path)?;
+        lock.lock_exclusive()
+            .map_err(|e| crate::Error::Budget(format!("ledger lock: {e}")))?;
+        let today = utc_date_today();
+        let mut state: DaySpend = if self.path.exists() {
+            let stored: DaySpend = serde_json::from_str(&std::fs::read_to_string(&self.path)?)?;
+            if stored.date == today {
+                stored
+            } else {
+                DaySpend {
+                    date: today,
+                    ..Default::default()
+                }
+            }
+        } else {
+            DaySpend {
+                date: today,
+                ..Default::default()
+            }
+        };
+        // Expire stale reservations from crashed runs.
+        let cutoff = now_secs().saturating_sub(RESERVATION_TTL_SECS);
+        state.reservations.retain(|r| r.at > cutoff);
+        let out = f(&mut state);
+        if out.is_ok() {
+            std::fs::write(&self.path, serde_json::to_string_pretty(&state)?)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+        let _ = fs2::FileExt::unlock(&lock);
+        out
     }
 
     pub fn today(&self) -> Result<DaySpend, crate::Error> {
-        let today = utc_date_today();
-        if !self.path.exists() {
-            return Ok(DaySpend { date: today, ..Default::default() });
-        }
-        let stored: DaySpend = serde_json::from_str(&std::fs::read_to_string(&self.path)?)?;
-        if stored.date == today {
-            Ok(stored)
-        } else {
-            Ok(DaySpend { date: today, ..Default::default() })
-        }
+        self.with_locked(|s| {
+            Ok(DaySpend {
+                date: s.date.clone(),
+                input_tokens: s.input_tokens,
+                output_tokens: s.output_tokens,
+                reservations: s.reservations.clone(),
+            })
+        })
     }
 
-    /// Enforce the floor: error when today's total has reached the cap.
-    /// Call BEFORE inference; the request that would cross is refused.
-    pub fn check(&self, tokens_per_day: Option<u64>) -> Result<(), crate::Error> {
-        let Some(cap) = tokens_per_day else { return Ok(()) };
-        let today = self.today()?;
-        let used = today.input_tokens + today.output_tokens;
-        if used >= cap {
-            return Err(crate::Error::Budget(format!(
-                "daily token budget reached ({used}/{cap}); a human raises the floor, not the agent"
-            )));
-        }
-        Ok(())
+    /// Atomically reserve remaining capacity for one run. With no cap the
+    /// reservation is MAX_RESERVATION (bounded, not infinite). Refuses when
+    /// nothing remains after counting used + already-reserved.
+    pub fn reserve(&self, cap: Option<u64>) -> Result<Reservation, crate::Error> {
+        self.with_locked(|s| {
+            let used = s.input_tokens + s.output_tokens;
+            let reserved: u64 = s.reservations.iter().map(|r| r.amount).sum();
+            let remaining = match cap {
+                Some(c) => c.saturating_sub(used + reserved),
+                None => MAX_RESERVATION,
+            };
+            if remaining == 0 {
+                return Err(crate::Error::Budget(format!(
+                    "daily token budget exhausted ({} used + {} reserved / {:?} cap); \
+                     a human raises the floor, not the agent",
+                    used, reserved, cap
+                )));
+            }
+            let amount = remaining.min(MAX_RESERVATION);
+            let id = now_secs() ^ (amount << 20) ^ s.reservations.len() as u64;
+            s.reservations.push(ReservationRecord {
+                id,
+                amount,
+                at: now_secs(),
+            });
+            Ok(Reservation { id, amount })
+        })
     }
 
-    pub fn record(&self, input_tokens: u64, output_tokens: u64) -> Result<DaySpend, crate::Error> {
-        let mut today = self.today()?;
-        today.input_tokens += input_tokens;
-        today.output_tokens += output_tokens;
-        std::fs::write(&self.path, serde_json::to_string_pretty(&today)?)?;
-        Ok(today)
+    /// Settle a reservation with actual usage (zero on failure is fine).
+    pub fn settle(
+        &self,
+        reservation: Reservation,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<DaySpend, crate::Error> {
+        self.with_locked(move |s| {
+            s.reservations.retain(|r| r.id != reservation.id);
+            s.input_tokens += input_tokens;
+            s.output_tokens += output_tokens;
+            Ok(DaySpend {
+                date: s.date.clone(),
+                input_tokens: s.input_tokens,
+                output_tokens: s.output_tokens,
+                reservations: s.reservations.clone(),
+            })
+        })
     }
 }
 
-/// Read the tokens/day cap from the manifest's governance budgets.
-/// Accepts `tokens_per_day` or the SPEC's `tokens/day` spelling.
-pub fn tokens_per_day(budgets: &std::collections::BTreeMap<String, serde_json::Value>) -> Option<u64> {
-    budgets
+/// Read and VALIDATE the tokens/day cap: a malformed value is an error, not
+/// silently "no cap" (fail closed on governance config).
+pub fn tokens_per_day(
+    budgets: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<Option<u64>, crate::Error> {
+    match budgets
         .get("tokens_per_day")
         .or_else(|| budgets.get("tokens/day"))
-        .and_then(|v| v.as_u64())
+    {
+        None => Ok(None),
+        Some(v) => v.as_u64().map(Some).ok_or_else(|| {
+            crate::Error::Budget(format!(
+                "governance.budgets tokens_per_day must be a non-negative integer, got {v}"
+            ))
+        }),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn budget_enforced() {
-        let dir = std::env::temp_dir().join(format!("apiary-spend-{}", std::process::id()));
+    fn ledger(tag: &str) -> (SpendLedger, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("apiary-spend-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let ledger = SpendLedger::open(&dir);
-        ledger.check(Some(100)).unwrap();
-        ledger.record(60, 50).unwrap(); // 110 total
-        assert!(ledger.check(Some(100)).is_err());
-        assert!(ledger.check(None).is_ok()); // no cap, no floor
+        (SpendLedger::open(&dir), dir)
+    }
+
+    #[test]
+    fn reservation_is_a_hard_ceiling() {
+        let (l, dir) = ledger("ceiling");
+        // Cap 100: first reservation claims all of it…
+        let r1 = l.reserve(Some(100)).unwrap();
+        assert_eq!(r1.amount, 100);
+        // …so a concurrent second run is refused BEFORE any inference.
+        assert!(l.reserve(Some(100)).is_err());
+        // Settle with actual usage below the reservation; remainder frees up.
+        l.settle(r1, 30, 30).unwrap();
+        let r2 = l.reserve(Some(100)).unwrap();
+        assert_eq!(r2.amount, 40);
+        l.settle(r2, 40, 0).unwrap();
+        assert!(l.reserve(Some(100)).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_cap_is_bounded_not_infinite() {
+        let (l, dir) = ledger("nocap");
+        let r = l.reserve(None).unwrap();
+        assert_eq!(r.amount, MAX_RESERVATION);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn malformed_budget_fails_closed() {
+        let mut b = std::collections::BTreeMap::new();
+        b.insert("tokens_per_day".to_string(), serde_json::json!("lots"));
+        assert!(tokens_per_day(&b).is_err());
+        b.insert("tokens_per_day".to_string(), serde_json::json!(-5));
+        assert!(tokens_per_day(&b).is_err());
+        b.insert("tokens_per_day".to_string(), serde_json::json!(1000));
+        assert_eq!(tokens_per_day(&b).unwrap(), Some(1000));
     }
 
     #[test]

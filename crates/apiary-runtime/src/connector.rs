@@ -136,8 +136,8 @@ impl Connector for NostrPublish {
 /// Minimal sync nostr publish: ["EVENT", …] → wait for ["OK", …].
 fn publish_to_relay(url: &str, event: &Event) -> Result<String, crate::Error> {
     use tungstenite::Message;
-    let (mut socket, _) = tungstenite::connect(url)
-        .map_err(|e| crate::Error::Provider(format!("connect: {e}")))?;
+    let (mut socket, _) =
+        tungstenite::connect(url).map_err(|e| crate::Error::Provider(format!("connect: {e}")))?;
     let frame = json!(["EVENT", serde_json::from_str::<Value>(&event.as_json())?]);
     socket
         .send(Message::Text(frame.to_string().into()))
@@ -156,7 +156,11 @@ fn publish_to_relay(url: &str, event: &Event) -> Result<String, crate::Error> {
                 let detail = v.get(3).and_then(|m| m.as_str()).unwrap_or("");
                 let _ = socket.close(None);
                 return if accepted {
-                    Ok(if detail.is_empty() { "accepted".into() } else { detail.into() })
+                    Ok(if detail.is_empty() {
+                        "accepted".into()
+                    } else {
+                        detail.into()
+                    })
                 } else {
                     Err(crate::Error::Provider(format!("rejected: {detail}")))
                 };
@@ -190,6 +194,9 @@ impl Connector for MockEcho {
         _agent: &AgentHandle,
         args: &Value,
     ) -> Result<String, crate::Error> {
-        Ok(format!("echo: {}", args.get("text").and_then(|t| t.as_str()).unwrap_or("")))
+        Ok(format!(
+            "echo: {}",
+            args.get("text").and_then(|t| t.as_str()).unwrap_or("")
+        ))
     }
 }

@@ -8,12 +8,12 @@
 //!
 //! Embedders bind from the manifest's `embed` inference slot:
 //! - `ollama`: real embeddings from a local model (nothing leaves the host)
-//! - `hash`:   deterministic character-trigram hashing — a degenerate,
-//!             model-free embedder. Honest about what it is: lexical
-//!             similarity, not semantics. Default for tests and hosts
-//!             without a model; swap the slot provider to upgrade.
+//! - `hash`: deterministic character-trigram hashing — a degenerate,
+//!   model-free embedder. Honest about what it is: lexical similarity, not
+//!   semantics. Default for tests and hosts without a model; swap the slot
+//!   provider to upgrade.
 
-use apiary_core::log::{EpisodicLog, EntryBody};
+use apiary_core::log::{EntryBody, EpisodicLog};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -95,7 +95,10 @@ pub fn bind_embedder(manifest: &apiary_core::manifest::Manifest) -> Option<Box<d
     match slot.provider.as_str() {
         "ollama" => Some(Box::new(OllamaEmbedder {
             base_url: "http://localhost:11434".into(),
-            model: slot.model.clone().unwrap_or_else(|| "nomic-embed-text".into()),
+            model: slot
+                .model
+                .clone()
+                .unwrap_or_else(|| "nomic-embed-text".into()),
         })),
         "hash" | "mock" => Some(Box::new(HashEmbedder)),
         _ => None,
@@ -154,7 +157,11 @@ impl SemanticIndex {
 
     /// Embed any log entries not yet in the index. A changed embedder id
     /// discards and rebuilds — derived state is disposable by design.
-    pub fn update(&self, log: &EpisodicLog, embedder: &dyn Embedder) -> Result<usize, crate::Error> {
+    pub fn update(
+        &self,
+        log: &EpisodicLog,
+        embedder: &dyn Embedder,
+    ) -> Result<usize, crate::Error> {
         let mut rows = self.rows()?;
         if rows.iter().any(|r| r.embedder != embedder.id()) {
             rows.clear();
@@ -162,16 +169,22 @@ impl SemanticIndex {
         }
         let known: BTreeSet<String> = rows.iter().map(|r| r.event_id.clone()).collect();
         let mut added = 0;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&self.path)?;
         for event in log.read_all()? {
             let id = event.id.to_hex();
             if known.contains(&id) {
                 continue;
             }
-            let Ok(body) = EpisodicLog::parse_body(&event) else { continue };
+            let Ok(body) = EpisodicLog::parse_body(&event) else {
+                continue;
+            };
             let text = entry_text(&body);
             let row = IndexRow {
                 event_id: id,
@@ -200,16 +213,19 @@ impl SemanticIndex {
             .into_iter()
             .filter(|r| r.embedder == embedder.id() && !exclude.contains(&r.event_id))
             .map(|r| {
-                let score = r
-                    .vector
-                    .iter()
-                    .zip(&q)
-                    .map(|(a, b)| a * b)
-                    .sum::<f32>();
-                Hit { event_id: r.event_id, text: r.text, score }
+                let score = r.vector.iter().zip(&q).map(|(a, b)| a * b).sum::<f32>();
+                Hit {
+                    event_id: r.event_id,
+                    text: r.text,
+                    score,
+                }
             })
             .collect();
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         hits.truncate(k);
         hits.retain(|h| h.score > 0.0);
         Ok(hits)
@@ -248,15 +264,24 @@ mod tests {
             outcome: "ok".into(),
             detail: Some(serde_json::json!({ "task": task })),
         };
-        log.append(&custody, &h, Tier::Self_, &mk("publish a note about bees")).unwrap();
-        log.append(&custody, &h, Tier::Self_, &mk("rotate the database credentials")).unwrap();
+        log.append(&custody, &h, Tier::Self_, &mk("publish a note about bees"))
+            .unwrap();
+        log.append(
+            &custody,
+            &h,
+            Tier::Self_,
+            &mk("rotate the database credentials"),
+        )
+        .unwrap();
 
         let idx = SemanticIndex::open(&dir);
         let e = HashEmbedder;
         assert_eq!(idx.update(&log, &e).unwrap(), 2);
         assert_eq!(idx.update(&log, &e).unwrap(), 0); // incremental: nothing new
 
-        let hits = idx.query(&e, "tell me about bees and honey", 1, &BTreeSet::new()).unwrap();
+        let hits = idx
+            .query(&e, "tell me about bees and honey", 1, &BTreeSet::new())
+            .unwrap();
         assert!(hits[0].text.contains("bees"), "{}", hits[0].text);
         std::fs::remove_dir_all(&dir).ok();
     }

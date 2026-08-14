@@ -46,13 +46,19 @@ pub fn run_acp_prompt(
     mode: PermissionMode,
     turn_timeout: Duration,
 ) -> Result<AcpOutcome, crate::Error> {
-    let mut child = Command::new(command)
-        .args(args)
-        .current_dir(workdir)
-        // The harness is its own process tree — it must not inherit session
-        // markers from whatever spawned Apiary (e.g. a Claude Code session's
-        // CLAUDECODE guard, which blocks nested launches).
-        .env_remove("CLAUDECODE")
+    // The harness gets a MINIMAL environment, not ours: no APIARY_PASSPHRASE,
+    // no provider credentials, no session markers. Capability flows through
+    // permission-gated tools, never through inherited env. (Filesystem and
+    // network isolation still require an OS sandbox — documented limit.)
+    const ENV_ALLOWLIST: &[&str] = &["PATH", "HOME", "USER", "SHELL", "LANG", "TMPDIR", "TERM"];
+    let mut cmd = Command::new(command);
+    cmd.args(args).current_dir(workdir).env_clear();
+    for key in ENV_ALLOWLIST {
+        if let Ok(v) = std::env::var(key) {
+            cmd.env(key, v);
+        }
+    }
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -127,7 +133,8 @@ fn drive(
 
         // Agent → client REQUEST (has id + method): permission requests get
         // host policy; anything else is politely unsupported.
-        if let (Some(id), Some(method)) = (msg.get("id"), msg.get("method").and_then(|m| m.as_str()))
+        if let (Some(id), Some(method)) =
+            (msg.get("id"), msg.get("method").and_then(|m| m.as_str()))
         {
             match method {
                 "session/request_permission" => {
@@ -135,20 +142,39 @@ fn drive(
                         .as_str()
                         .unwrap_or("unnamed tool")
                         .to_string();
-                    let options = msg["params"]["options"].as_array().cloned().unwrap_or_default();
-                    let want = match mode {
-                        PermissionMode::Allow => "allow_once",
-                        PermissionMode::Deny => "reject_once",
+                    let options = msg["params"]["options"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    // Strict selection: an option is only acceptable if its
+                    // kind matches the mode's intent. Deny mode NEVER falls
+                    // back to an allow option — a malformed option list gets
+                    // a JSON-RPC error, which the harness must treat as
+                    // not-granted.
+                    let acceptable = |kind: &str| match mode {
+                        PermissionMode::Allow => kind.starts_with("allow"),
+                        PermissionMode::Deny => {
+                            kind.starts_with("reject") || kind.starts_with("deny")
+                        }
                     };
-                    let option_id = options
-                        .iter()
-                        .find(|o| o["kind"] == want)
-                        .or(options.first())
-                        .and_then(|o| o["optionId"].as_str())
-                        .unwrap_or("reject")
-                        .to_string();
-                    out.permissions.push((title, want.to_string()));
-                    let resp = json!({"jsonrpc": "2.0", "id": id, "result": {"outcome": {"outcome": "selected", "optionId": option_id}}});
+                    let choice = options.iter().find_map(|o| {
+                        let kind = o["kind"].as_str()?;
+                        if !acceptable(kind) {
+                            return None;
+                        }
+                        Some((o["optionId"].as_str()?.to_string(), kind.to_string()))
+                    });
+                    let resp = match choice {
+                        Some((option_id, kind)) => {
+                            out.permissions.push((title, kind));
+                            json!({"jsonrpc": "2.0", "id": id, "result": {"outcome": {"outcome": "selected", "optionId": option_id}}})
+                        }
+                        None => {
+                            out.permissions
+                                .push((title, "refused (no acceptable option)".into()));
+                            json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32600, "message": "no permission option acceptable to host policy"}})
+                        }
+                    };
                     writeln!(stdin, "{resp}")
                         .map_err(|e| crate::Error::Provider(format!("acp write: {e}")))?;
                 }

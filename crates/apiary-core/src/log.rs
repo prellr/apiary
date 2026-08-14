@@ -106,10 +106,14 @@ impl EpisodicLog {
             builder = builder.tag(Tag::custom("prev", vec![prev_event.id.to_hex()]));
         }
         let event = custody.sign(signer, builder)?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600); // self-tier records are private to the user
+        }
+        let mut file = opts.open(&self.path)?;
         writeln!(file, "{}", event.as_json())?;
         Ok(event)
     }
@@ -125,10 +129,14 @@ impl EpisodicLog {
         event
             .verify()
             .map_err(|e| crate::Error::Manifest(format!("foreign event: bad signature: {e}")))?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&self.path)?;
         writeln!(file, "{}", event.as_json())?;
         Ok(())
     }
@@ -221,9 +229,12 @@ mod tests {
         let mut custody = Custody::new();
         let h = custody.admit(Keys::generate());
         let log = EpisodicLog::open(&dir);
-        log.append(&custody, &h, Tier::Public, &body("founding.manifest")).unwrap();
-        log.append(&custody, &h, Tier::Self_, &body("run.task")).unwrap();
-        log.append(&custody, &h, Tier::Local, &body("run.task")).unwrap();
+        log.append(&custody, &h, Tier::Public, &body("founding.manifest"))
+            .unwrap();
+        log.append(&custody, &h, Tier::Self_, &body("run.task"))
+            .unwrap();
+        log.append(&custody, &h, Tier::Local, &body("run.task"))
+            .unwrap();
         assert_eq!(log.verify().unwrap(), 3);
         fs::remove_dir_all(&dir).ok();
     }

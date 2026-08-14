@@ -66,10 +66,19 @@ impl Custody {
 
     /// Seal a credential to this agent (NIP-44, self-conversation). The blob
     /// is portable and useless without the agent's key — SPEC §5.
-    pub fn seal(&self, handle: &AgentHandle, plaintext: &str) -> Result<EncryptedBlob, crate::Error> {
+    pub fn seal(
+        &self,
+        handle: &AgentHandle,
+        plaintext: &str,
+    ) -> Result<EncryptedBlob, crate::Error> {
         let kr = self.keyring(handle)?;
-        let ct = nip44::encrypt(kr.keys.secret_key(), &kr.keys.public_key(), plaintext, Version::V2)
-            .map_err(|e| crate::Error::Custody(format!("nip44 encrypt: {e}")))?;
+        let ct = nip44::encrypt(
+            kr.keys.secret_key(),
+            &kr.keys.public_key(),
+            plaintext,
+            Version::V2,
+        )
+        .map_err(|e| crate::Error::Custody(format!("nip44 encrypt: {e}")))?;
         Ok(EncryptedBlob { nip44: ct })
     }
 

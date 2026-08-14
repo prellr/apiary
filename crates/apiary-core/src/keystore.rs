@@ -22,6 +22,13 @@ impl Keystore {
     pub fn open(state_dir: &Path) -> Result<Self, crate::Error> {
         let root = state_dir.join("agents");
         fs::create_dir_all(&root)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // State dirs are private to the user: 0700 all the way down.
+            let _ = fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700));
+            let _ = fs::set_permissions(&root, fs::Permissions::from_mode(0o700));
+        }
         Ok(Self { root })
     }
 
@@ -34,6 +41,11 @@ impl Keystore {
         let npub = crate::identity::to_npub(&keys.public_key())?;
         let dir = self.agent_dir(&npub);
         fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+        }
         let enc = EncryptedSecretKey::new(keys.secret_key(), passphrase, 16, KeySecurity::Medium)
             .map_err(|e| crate::Error::Keystore(format!("nip49 encrypt: {e}")))?;
         let ncryptsec = enc
@@ -56,9 +68,9 @@ impl Keystore {
             .map_err(|e| crate::Error::Keystore(format!("read {}: {e}", path.display())))?;
         let enc = EncryptedSecretKey::from_bech32(ncryptsec.trim())
             .map_err(|e| crate::Error::Keystore(format!("parse ncryptsec: {e}")))?;
-        let sk = enc
-            .decrypt(passphrase)
-            .map_err(|e| crate::Error::Keystore(format!("nip49 decrypt (wrong passphrase?): {e}")))?;
+        let sk = enc.decrypt(passphrase).map_err(|e| {
+            crate::Error::Keystore(format!("nip49 decrypt (wrong passphrase?): {e}"))
+        })?;
         Ok(Keys::new(sk))
     }
 

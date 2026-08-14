@@ -28,10 +28,25 @@ pub struct RunOutcome {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RunEvent {
-    Started { slot: String, model: String },
-    ToolCallStarted { name: String, args: serde_json::Value },
-    ToolCallFinished { name: String, ok: bool, detail: String },
-    Finished { outcome: String, text: String, input_tokens: u64, output_tokens: u64 },
+    Started {
+        slot: String,
+        model: String,
+    },
+    ToolCallStarted {
+        name: String,
+        args: serde_json::Value,
+    },
+    ToolCallFinished {
+        name: String,
+        ok: bool,
+        detail: String,
+    },
+    Finished {
+        outcome: String,
+        text: String,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
 }
 
 pub type Observer<'a> = &'a (dyn Fn(RunEvent) + Send + Sync);
@@ -68,25 +83,29 @@ pub fn run_task_observed(
     let log = EpisodicLog::open(agent_dir);
     let ledger = SpendLedger::open(agent_dir);
 
-    // 1. Spend floor — refuse before any inference, and log the refusal:
-    //    a budget denial is part of the track record too.
-    let cap = tokens_per_day(&manifest.governance.budgets);
-    if let Err(e) = ledger.check(cap) {
-        log.append(
-            custody,
-            agent,
-            Tier::Self_,
-            &EntryBody {
-                action: "run.task".into(),
-                model: None,
-                cost: None,
-                harness: None,
-                outcome: "budget-refused".into(),
-                detail: Some(json!({ "task": task })),
-            },
-        )?;
-        return Err(e);
-    }
+    // 1. Spend floor — atomically RESERVE capacity before any inference
+    //    (concurrent runs cannot all pass; the reservation clamps the
+    //    provider). Refusals are part of the track record too.
+    let cap = tokens_per_day(&manifest.governance.budgets)?;
+    let reservation = match ledger.reserve(cap) {
+        Ok(r) => r,
+        Err(e) => {
+            log.append(
+                custody,
+                agent,
+                Tier::Self_,
+                &EntryBody {
+                    action: "run.task".into(),
+                    model: None,
+                    cost: None,
+                    harness: None,
+                    outcome: "budget-refused".into(),
+                    detail: Some(json!({ "task": task })),
+                },
+            )?;
+            return Err(e);
+        }
+    };
 
     // 2. Route — floors clamp, host decides, model is never consulted.
     let slot_name = crate::routing::resolve(manifest, ctx)?;
@@ -104,7 +123,10 @@ pub fn run_task_observed(
     };
     let provider = bind(&slot.provider, credential)?;
 
-    emit(RunEvent::Started { slot: slot_name.clone(), model: model.clone() });
+    emit(RunEvent::Started {
+        slot: slot_name.clone(),
+        model: model.clone(),
+    });
 
     // 4. Hydrate the working set: constitution + recency tail + semantic
     //    retrieval, all framed with provenance (memory is DATA, never
@@ -115,47 +137,68 @@ pub fn run_task_observed(
     //    capabilities exist) and infer. Every dispatch is logged BEFORE the
     //    result returns to the model — the track record sees each action.
     let connectors = crate::connector::bind_connectors(manifest)?;
-    let completion = if connectors.is_empty() {
-        provider.complete(&model, &system, task)?
-    } else {
-        let tool_defs: Vec<crate::connector::ToolDef> =
-            connectors.iter().map(|c| c.def()).collect();
-        let mut dispatch = |name: &str, args: &serde_json::Value| {
-            emit(RunEvent::ToolCallStarted { name: name.into(), args: args.clone() });
-            let connector = connectors
-                .iter()
-                .find(|c| c.def().name == name)
-                .ok_or_else(|| {
-                    crate::Error::Provider(format!("model requested unknown tool '{name}'"))
-                })?;
-            let result = connector.execute(custody, agent, args);
-            emit(RunEvent::ToolCallFinished {
-                name: name.into(),
-                ok: result.is_ok(),
-                detail: match &result {
-                    Ok(r) => r.chars().take(200).collect(),
-                    Err(e) => e.to_string(),
-                },
-            });
-            log.append(
-                custody,
-                agent,
-                Tier::Self_,
-                &EntryBody {
-                    action: "tool.call".into(),
-                    model: Some(model.clone()),
-                    cost: None,
-                    harness: Some("native".into()),
-                    outcome: match &result {
-                        Ok(_) => "ok".into(),
-                        Err(e) => format!("error: {e}"),
+    let run = || -> Result<crate::inference::Completion, crate::Error> {
+        Ok(if connectors.is_empty() {
+            provider.complete(&model, &system, task, reservation.amount)?
+        } else {
+            let tool_defs: Vec<crate::connector::ToolDef> =
+                connectors.iter().map(|c| c.def()).collect();
+            let mut dispatch = |name: &str, args: &serde_json::Value| {
+                emit(RunEvent::ToolCallStarted {
+                    name: name.into(),
+                    args: args.clone(),
+                });
+                let connector = connectors
+                    .iter()
+                    .find(|c| c.def().name == name)
+                    .ok_or_else(|| {
+                        crate::Error::Provider(format!("model requested unknown tool '{name}'"))
+                    })?;
+                let result = connector.execute(custody, agent, args);
+                emit(RunEvent::ToolCallFinished {
+                    name: name.into(),
+                    ok: result.is_ok(),
+                    detail: match &result {
+                        Ok(r) => r.chars().take(200).collect(),
+                        Err(e) => e.to_string(),
                     },
-                    detail: Some(json!({ "tool": name, "args": args })),
-                },
-            )?;
-            result
-        };
-        provider.complete_with_tools(&model, &system, task, &tool_defs, &mut dispatch)?
+                });
+                log.append(
+                    custody,
+                    agent,
+                    Tier::Self_,
+                    &EntryBody {
+                        action: "tool.call".into(),
+                        model: Some(model.clone()),
+                        cost: None,
+                        harness: Some("native".into()),
+                        outcome: match &result {
+                            Ok(_) => "ok".into(),
+                            Err(e) => format!("error: {e}"),
+                        },
+                        detail: Some(json!({ "tool": name, "args": args })),
+                    },
+                )?;
+                result
+            };
+            provider.complete_with_tools(
+                &model,
+                &system,
+                task,
+                &tool_defs,
+                &mut dispatch,
+                reservation.amount,
+            )?
+        })
+    };
+    let completion = match run() {
+        Ok(c) => c,
+        Err(e) => {
+            // Failed runs settle their reservation with zero usage so the
+            // capacity is not leaked until the TTL.
+            let _ = ledger.settle(reservation, 0, 0);
+            return Err(e);
+        }
     };
 
     // 6. Record: signed log entry with acting model, cost, outcome — then
@@ -180,7 +223,11 @@ pub fn run_task_observed(
             })),
         },
     )?;
-    ledger.record(completion.input_tokens, completion.output_tokens)?;
+    ledger.settle(
+        reservation,
+        completion.input_tokens,
+        completion.output_tokens,
+    )?;
 
     emit(RunEvent::Finished {
         outcome: completion.outcome.clone(),
@@ -242,8 +289,11 @@ pub(crate) fn build_working_set(
         }
     }
 
-    let connector_names: Vec<&str> =
-        manifest.connectors.iter().map(|c| c.kind.as_str()).collect();
+    let connector_names: Vec<&str> = manifest
+        .connectors
+        .iter()
+        .map(|c| c.kind.as_str())
+        .collect();
     Ok(format!(
         "You are an Apiary agent. Your identity is the nostr key {npub}. \
          You are a durable principal: your memory below persists across runs \
@@ -313,17 +363,29 @@ pub fn run_acp_task(
     // on the wire, so spend inside the session is unmetered — recorded as
     // such rather than pretended away. (Metering lands with provider-side
     // accounting in the daemon.)
-    let cap = tokens_per_day(&manifest.governance.budgets);
-    if let Err(e) = ledger.check(cap) {
-        log.append(custody, agent, Tier::Self_, &EntryBody {
-            action: "run.task".into(),
-            model: None,
-            cost: None,
-            harness: Some(harness),
-            outcome: "budget-refused".into(),
-            detail: Some(json!({ "task": task })),
-        })?;
-        return Err(e);
+    let cap = tokens_per_day(&manifest.governance.budgets)?;
+    match ledger.reserve(cap) {
+        // ACP usage is unmetered on the wire; the reservation only proves
+        // the budget is not exhausted, then frees immediately.
+        Ok(r) => {
+            ledger.settle(r, 0, 0)?;
+        }
+        Err(e) => {
+            log.append(
+                custody,
+                agent,
+                Tier::Self_,
+                &EntryBody {
+                    action: "run.task".into(),
+                    model: None,
+                    cost: None,
+                    harness: Some(harness),
+                    outcome: "budget-refused".into(),
+                    detail: Some(json!({ "task": task })),
+                },
+            )?;
+            return Err(e);
+        }
     }
 
     let mode = if allow_permissions {
@@ -340,21 +402,26 @@ pub fn run_acp_task(
         std::time::Duration::from_secs(300),
     )?;
 
-    let event = log.append(custody, agent, Tier::Self_, &EntryBody {
-        action: "run.task".into(),
-        model: None, // the foreign harness picks its own model
-        cost: None,
-        harness: Some(harness),
-        outcome: result.stop_reason.clone(),
-        detail: Some(json!({
-            "task": task,
-            "response_chars": result.text.len(),
-            "tool_calls": result.tool_calls,
-            "permission_decisions": result.permissions,
-            "permission_mode": if allow_permissions { "allow" } else { "deny" },
-            "tokens_unmetered": true,
-        })),
-    })?;
+    let event = log.append(
+        custody,
+        agent,
+        Tier::Self_,
+        &EntryBody {
+            action: "run.task".into(),
+            model: None, // the foreign harness picks its own model
+            cost: None,
+            harness: Some(harness),
+            outcome: result.stop_reason.clone(),
+            detail: Some(json!({
+                "task": task,
+                "response_chars": result.text.len(),
+                "tool_calls": result.tool_calls,
+                "permission_decisions": result.permissions,
+                "permission_mode": if allow_permissions { "allow" } else { "deny" },
+                "tokens_unmetered": true,
+            })),
+        },
+    )?;
 
     Ok(AcpRunOutcome {
         text: result.text,
@@ -438,13 +505,15 @@ governance:
     #[test]
     fn retrieval_surfaces_what_recency_missed() {
         let (mut manifest, dir, custody, handle) = setup();
-        manifest.inference.push(apiary_core::manifest::InferenceSlot {
-            name: "embed".into(),
-            provider: "hash".into(),
-            model: None,
-            credential: None,
-            requires: Default::default(),
-        });
+        manifest
+            .inference
+            .push(apiary_core::manifest::InferenceSlot {
+                name: "embed".into(),
+                provider: "hash".into(),
+                model: None,
+                credential: None,
+                requires: Default::default(),
+            });
         let log = EpisodicLog::open(&dir);
         let mk = |task: &str| EntryBody {
             action: "run.task".into(),
@@ -456,14 +525,35 @@ governance:
         };
         // One distinctive old memory, then enough filler to push it out of
         // the recency tail entirely.
-        log.append(&custody, &handle, Tier::Self_, &mk("published the beekeeping honey report")).unwrap();
+        log.append(
+            &custody,
+            &handle,
+            Tier::Self_,
+            &mk("published the beekeeping honey report"),
+        )
+        .unwrap();
         for i in 0..MEMORY_TAIL {
-            log.append(&custody, &handle, Tier::Self_, &mk(&format!("routine chore {i}"))).unwrap();
+            log.append(
+                &custody,
+                &handle,
+                Tier::Self_,
+                &mk(&format!("routine chore {i}")),
+            )
+            .unwrap();
         }
-        let system = build_working_set(&manifest, &dir, &log, "what do you know about beekeeping honey?").unwrap();
+        let system = build_working_set(
+            &manifest,
+            &dir,
+            &log,
+            "what do you know about beekeeping honey?",
+        )
+        .unwrap();
         // Not in the tail…
         let recent_section = system.split("# Relevant older memories").next().unwrap();
-        assert!(!recent_section.contains("beekeeping"), "should have aged out of the tail");
+        assert!(
+            !recent_section.contains("beekeeping"),
+            "should have aged out of the tail"
+        );
         // …but retrieval brought it back, and the provenance rule is present.
         assert!(system.contains("beekeeping honey report"), "{system}");
         assert!(system.contains("Provenance rule"));
@@ -479,10 +569,21 @@ governance:
             credential: None,
             caps: Default::default(),
         }];
-        let out = run_task(&manifest, &dir, &custody, &handle, "ping", &TaskContext::default())
-            .unwrap();
+        let out = run_task(
+            &manifest,
+            &dir,
+            &custody,
+            &handle,
+            "ping",
+            &TaskContext::default(),
+        )
+        .unwrap();
         // The mock-tool provider dispatched mock_echo with the prompt.
-        assert!(out.completion.text.contains("mock_echo -> echo: ping"), "{}", out.completion.text);
+        assert!(
+            out.completion.text.contains("mock_echo -> echo: ping"),
+            "{}",
+            out.completion.text
+        );
         // The log holds the tool.call entry AND the run.task entry, chained.
         let log = EpisodicLog::open(&dir);
         let entries = log.tail(10).unwrap();

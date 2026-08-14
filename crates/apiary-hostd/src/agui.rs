@@ -13,8 +13,10 @@ use apiary_runtime::runner::{run_task_observed, RunEvent};
 use axum::{
     extract::{Path as AxPath, State},
     http::StatusCode,
-    response::{sse::{Event as SseEvent, KeepAlive, Sse}, IntoResponse},
-    Json,
+    response::{
+        sse::{Event as SseEvent, KeepAlive, Sse},
+        IntoResponse,
+    },
 };
 use serde_json::json;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -37,12 +39,22 @@ fn agui(name: &str, mut fields: serde_json::Value) -> SseEvent {
 pub async fn run_stream(
     State(state): State<App>,
     AxPath(npub): AxPath<String>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     headers: axum::http::HeaderMap,
-    Json(body): Json<RunBody>,
+    raw_body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    if let Err(e) = nip98::check(&state, &headers, &format!("/api/agents/{npub}/run"), "POST") {
-        return e.into_response();
-    }
+    let pq = uri
+        .path_and_query()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| uri.path().to_string());
+    let signer = match nip98::check(&state, &headers, "POST", &pq, Some(&raw_body)) {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let body: RunBody = match serde_json::from_slice(&raw_body) {
+        Ok(b) => b,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
     let (ks, npub, dir) = match agent_ctx(&state, &npub) {
         Ok(v) => v,
         Err(e) => return e.into_response(),
@@ -51,14 +63,17 @@ pub async fn run_stream(
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
-    // Ratification gate — same constitution rule as the CLI.
-    let suspend_keys: Vec<_> = manifest
-        .governance
-        .suspend_keys
-        .iter()
-        .filter_map(|k| apiary_core::identity::parse_npub(k).ok())
-        .collect();
-    match ceremony::is_ratified(&EpisodicLog::open(&dir), &raw, &suspend_keys) {
+    let suspend_keys = crate::suspend_pks(&manifest);
+    // Only a governor may make the agent act.
+    if let Err(e) = nip98::authorize_governor(&state, signer, &suspend_keys) {
+        return e.into_response();
+    }
+    // Ratification gate — verified signatures, both parties, current hash.
+    let agent_pk = match apiary_core::identity::parse_npub(&npub) {
+        Ok(pk) => pk,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    match ceremony::is_ratified(&EpisodicLog::open(&dir), &raw, &agent_pk, &suspend_keys) {
         Ok(true) => {}
         _ => {
             return err(
@@ -73,13 +88,22 @@ pub async fn run_stream(
         Err(e) => return err(StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
     };
 
-    let run_id = format!("run-{:x}", std::process::id() as u64 ^ std::ptr::addr_of!(state) as u64);
+    let run_id = format!(
+        "run-{:x}",
+        std::process::id() as u64 ^ std::ptr::addr_of!(state) as u64
+    );
     let thread_id = npub.clone();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SseEvent>();
 
-    let _ = tx.send(agui("RUN_STARTED", json!({"threadId": thread_id, "runId": run_id})));
+    let _ = tx.send(agui(
+        "RUN_STARTED",
+        json!({"threadId": thread_id, "runId": run_id}),
+    ));
 
-    let ctx = TaskContext { task_class: body.class.clone(), data_class: body.data_class.clone() };
+    let ctx = TaskContext {
+        task_class: body.class.clone(),
+        data_class: body.data_class.clone(),
+    };
     let task = body.task.clone();
     let run_id2 = run_id.clone();
     let thread_id2 = thread_id.clone();
@@ -111,22 +135,40 @@ pub async fn run_stream(
             };
         };
         let result = run_task_observed(
-            &manifest, &dir, &custody, &handle, &task, &ctx, Some(&observer),
+            &manifest,
+            &dir,
+            &custody,
+            &handle,
+            &task,
+            &ctx,
+            Some(&observer),
         );
         match result {
             Ok(out) => {
-                let _ = tx2.send(agui("TEXT_MESSAGE_START", json!({"messageId": msg_id, "role": "assistant"})));
-                let _ = tx2.send(agui("TEXT_MESSAGE_CONTENT", json!({"messageId": msg_id, "delta": out.completion.text})));
+                let _ = tx2.send(agui(
+                    "TEXT_MESSAGE_START",
+                    json!({"messageId": msg_id, "role": "assistant"}),
+                ));
+                let _ = tx2.send(agui(
+                    "TEXT_MESSAGE_CONTENT",
+                    json!({"messageId": msg_id, "delta": out.completion.text}),
+                ));
                 let _ = tx2.send(agui("TEXT_MESSAGE_END", json!({"messageId": msg_id})));
-                let _ = tx2.send(agui("CUSTOM", json!({"name": "apiary.checkpoint", "value": {
-                    "log_event": out.log_event_id,
-                    "slot": out.slot,
-                    "model": out.completion.model,
-                    "outcome": out.completion.outcome,
-                    "input_tokens": out.completion.input_tokens,
-                    "output_tokens": out.completion.output_tokens,
-                }})));
-                let _ = tx2.send(agui("RUN_FINISHED", json!({"threadId": thread_id2, "runId": run_id2})));
+                let _ = tx2.send(agui(
+                    "CUSTOM",
+                    json!({"name": "apiary.checkpoint", "value": {
+                        "log_event": out.log_event_id,
+                        "slot": out.slot,
+                        "model": out.completion.model,
+                        "outcome": out.completion.outcome,
+                        "input_tokens": out.completion.input_tokens,
+                        "output_tokens": out.completion.output_tokens,
+                    }}),
+                ));
+                let _ = tx2.send(agui(
+                    "RUN_FINISHED",
+                    json!({"threadId": thread_id2, "runId": run_id2}),
+                ));
             }
             Err(e) => {
                 let _ = tx2.send(agui("RUN_ERROR", json!({"message": e.to_string()})));
@@ -135,5 +177,7 @@ pub async fn run_stream(
     });
 
     let stream = UnboundedReceiverStream::new(rx).map(Ok::<_, std::convert::Infallible>);
-    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }

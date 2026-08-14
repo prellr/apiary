@@ -92,12 +92,9 @@ pub fn ratification_unsigned(
         })),
     };
     let content = serde_json::to_string(&body)?;
-    let builder = EventBuilder::new(
-        Kind::Custom(crate::log::LOG_ENTRY_KIND),
-        content,
-    )
-    .tag(Tag::custom("tier", vec!["public".to_string()]))
-    .tag(Tag::custom("action", vec!["founding.ratify".to_string()]));
+    let builder = EventBuilder::new(Kind::Custom(crate::log::LOG_ENTRY_KIND), content)
+        .tag(Tag::custom("tier", vec!["public".to_string()]))
+        .tag(Tag::custom("action", vec!["founding.ratify".to_string()]));
     Ok(builder.finalize_unsigned(ratifier))
 }
 
@@ -138,6 +135,61 @@ pub fn import_ratification(
     log.append_foreign(event)
 }
 
+/// True when the log holds a COMPLETE, VERIFIED founding for this exact
+/// manifest: an agent-signed `founding.manifest` AND a suspend-key-signed
+/// `founding.ratify` naming this agent, both with valid signatures, the
+/// right kind, and the current manifest hash. Nothing here trusts a log
+/// entry's claims without checking its cryptography — a same-host process
+/// can write to the log file, but it cannot forge either signature.
+pub fn is_ratified(
+    log: &EpisodicLog,
+    manifest_yaml: &str,
+    agent: &PublicKey,
+    suspend_keys: &[PublicKey],
+) -> Result<bool, crate::Error> {
+    let want = manifest_hash(manifest_yaml);
+    let agent_npub = crate::identity::to_npub(agent)?;
+    let hash_matches = |body: &EntryBody| {
+        body.detail
+            .as_ref()
+            .and_then(|d| d.get("manifest_sha256"))
+            .and_then(|v| v.as_str())
+            == Some(want.as_str())
+    };
+    let mut agent_signed = false;
+    let mut human_ratified = false;
+    for event in log.read_all()? {
+        // Cryptographic checks first: signature and kind. Unverifiable
+        // entries are ignored, never trusted.
+        if event.kind != Kind::Custom(crate::log::LOG_ENTRY_KIND) || event.verify().is_err() {
+            continue;
+        }
+        let Ok(body) = EpisodicLog::parse_body(&event) else {
+            continue;
+        };
+        match body.action.as_str() {
+            "founding.manifest" => {
+                if event.pubkey == *agent && hash_matches(&body) {
+                    agent_signed = true;
+                }
+            }
+            "founding.ratify" => {
+                let names_agent = body
+                    .detail
+                    .as_ref()
+                    .and_then(|d| d.get("agent"))
+                    .and_then(|v| v.as_str())
+                    == Some(agent_npub.as_str());
+                if suspend_keys.contains(&event.pubkey) && names_agent && hash_matches(&body) {
+                    human_ratified = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(agent_signed && human_ratified)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,55 +205,61 @@ mod tests {
         let human = Keys::generate();
         let manifest_yaml = "manifest_version: 1\n";
 
+        // The agent signs its manifest through custody; the human signs
+        // externally. BOTH are required for is_ratified.
+        let mut custody = Custody::new();
+        let agent_keys = Keys::generate();
+        let agent_pk = agent_keys.public_key();
+        let agent = custody.admit(agent_keys);
+        let agent_npub = crate::identity::to_npub(&agent_pk).unwrap();
+        sign_manifest(&custody, &agent, &log, manifest_yaml).unwrap();
+        // Human signature alone (not yet imported) → not ratified.
+        assert!(!is_ratified(&log, manifest_yaml, &agent_pk, &[human.public_key()]).unwrap());
+
         // Export unsigned → sign externally → import.
-        let unsigned = ratification_unsigned(human.public_key(), "npub1agent", manifest_yaml).unwrap();
+        let unsigned =
+            ratification_unsigned(human.public_key(), &agent_npub, manifest_yaml).unwrap();
         let signed = human.sign_event(unsigned).unwrap();
         import_ratification(&log, &signed, manifest_yaml, &[human.public_key()]).unwrap();
-        assert!(is_ratified(&log, manifest_yaml, &[human.public_key()]).unwrap());
+        assert!(is_ratified(&log, manifest_yaml, &agent_pk, &[human.public_key()]).unwrap());
 
-        // Wrong hash and wrong signer are both rejected.
-        assert!(import_ratification(&log, &signed, "different: manifest\n", &[human.public_key()]).is_err());
+        // Wrong hash, wrong signer, wrong agent: all rejected.
+        assert!(import_ratification(
+            &log,
+            &signed,
+            "different: manifest\n",
+            &[human.public_key()]
+        )
+        .is_err());
         let stranger = Keys::generate();
-        assert!(import_ratification(&log, &signed, manifest_yaml, &[stranger.public_key()]).is_err());
+        assert!(
+            import_ratification(&log, &signed, manifest_yaml, &[stranger.public_key()]).is_err()
+        );
+        assert!(!is_ratified(
+            &log,
+            manifest_yaml,
+            &stranger.public_key(),
+            &[human.public_key()]
+        )
+        .unwrap());
 
         // Chain still verifies with the foreign anchor, also after a
         // custody-signed entry follows it.
-        let mut custody = Custody::new();
-        let agent = custody.admit(Keys::generate());
-        log.append(&custody, &agent, crate::log::Tier::Self_, &EntryBody {
-            action: "run.task".into(), model: None, cost: None,
-            harness: None, outcome: "ok".into(), detail: None,
-        }).unwrap();
-        assert_eq!(log.verify().unwrap(), 2);
+        log.append(
+            &custody,
+            &agent,
+            crate::log::Tier::Self_,
+            &EntryBody {
+                action: "run.task".into(),
+                model: None,
+                cost: None,
+                harness: None,
+                outcome: "ok".into(),
+                detail: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(log.verify().unwrap(), 3);
         std::fs::remove_dir_all(&dir).ok();
     }
-}
-
-/// True when the log contains a ratification whose hash matches this
-/// manifest, signed by one of the given suspend keys.
-pub fn is_ratified(
-    log: &EpisodicLog,
-    manifest_yaml: &str,
-    suspend_keys: &[PublicKey],
-) -> Result<bool, crate::Error> {
-    let want = manifest_hash(manifest_yaml);
-    for event in log.read_all()? {
-        if !suspend_keys.contains(&event.pubkey) {
-            continue;
-        }
-        let body = EpisodicLog::parse_body(&event)?;
-        if body.action != "founding.ratify" {
-            continue;
-        }
-        if body
-            .detail
-            .as_ref()
-            .and_then(|d| d.get("manifest_sha256"))
-            .and_then(|v| v.as_str())
-            == Some(want.as_str())
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }

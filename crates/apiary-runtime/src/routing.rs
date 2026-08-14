@@ -114,7 +114,14 @@ governance:
     fn rule_then_default() {
         let m = manifest();
         assert_eq!(
-            resolve(&m, &TaskContext { task_class: Some("reasoning".into()), data_class: None }).unwrap(),
+            resolve(
+                &m,
+                &TaskContext {
+                    task_class: Some("reasoning".into()),
+                    data_class: None
+                }
+            )
+            .unwrap(),
             "workhorse"
         );
         assert_eq!(resolve(&m, &TaskContext::default()).unwrap(), "fast");
