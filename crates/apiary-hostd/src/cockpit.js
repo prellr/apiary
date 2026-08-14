@@ -248,7 +248,21 @@ async function renderOverview(c) {
   const l = await j(api('/listener'));
   const lisSec = section('Buzz listener',
     'When running, the agent answers @mentions in its Buzz workspace through the governed run path. Manage it in the Buzz tab.');
-  lisSec.append(kv('status', l.running ? `running — relay ${l.relay}, trigger ${l.trigger}` : 'not running'));
+  let lstat;
+  if (l.running) {
+    lstat = `running — relay ${l.relay}, trigger ${l.trigger}`;
+  } else if (!l.declared_relay) {
+    lstat = 'not running — no presence.buzz declared in the manifest, so there is nothing to supervise. Add it (see the Manifest field guide), re-ratify, and the supervisor takes over.';
+  } else if (!roster.active) {
+    lstat = `not running — presence.buzz declares ${l.declared_relay}, but the agent is inactive. Activate it above.`;
+  } else if (!hostStatus.unlocked) {
+    lstat = 'waiting — keystore is locked; the supervisor starts the listener once unlocked.';
+  } else if (!d.ratified) {
+    lstat = 'waiting — manifest is not ratified; nothing runs unratified.';
+  } else {
+    lstat = `starting — presence.buzz declares ${l.declared_relay}; the supervisor starts it within ~10s (retries every 30s on failure).`;
+  }
+  lisSec.append(kv('status', lstat));
   c.append(lisSec);
 }
 

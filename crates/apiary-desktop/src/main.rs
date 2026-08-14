@@ -60,6 +60,9 @@ fn main() {
             .expect("tokio runtime");
         rt.block_on(async move {
             let listener = tokio::net::TcpListener::from_std(std_listener).expect("adopt listener");
+            // Presence supervisor: active agents with declared presence.buzz
+            // get their listener started, restarted, and stopped by the host.
+            apiary_hostd::ops::spawn_supervisor(state.clone());
             axum::serve(listener, build_router(state))
                 .await
                 .expect("serve");
