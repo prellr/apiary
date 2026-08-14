@@ -38,12 +38,31 @@
   .ev.err  { border-color:var(--bad); color:var(--bad); }
   .ev.meta { border-color:var(--line); color:var(--dim); font-size:11px; }
   .empty { color:var(--dim); padding:30px; text-align:center; }
+  .btn { background:var(--panel); color:var(--amber); border:1px solid var(--amber); border-radius:6px; padding:7px 14px; font:inherit; cursor:pointer; }
+  .btn.solid { background:var(--amber); color:#14120e; font-weight:700; border:none; }
+  .btn:disabled { opacity:.4; }
+  #med { width:100%; min-height:320px; background:var(--panel); border:1px solid var(--line); border-radius:6px; color:var(--text); padding:12px; font:12px/1.5 inherit; resize:vertical; }
+  .row { display:flex; gap:8px; align-items:center; margin:10px 0; flex-wrap:wrap; }
+  .row select, .row input { background:var(--panel); border:1px solid var(--line); border-radius:6px; color:var(--text); padding:7px 10px; font:inherit; }
+  #foundform { border:1px solid var(--line); border-radius:6px; padding:14px; margin:8px; background:var(--panel); }
+  #foundform input, #foundform textarea { width:100%; margin:4px 0 10px; background:var(--bg); border:1px solid var(--line); border-radius:6px; color:var(--text); padding:8px; font:inherit; }
 </style>
 </head>
 <body>
 <header><h1>APIARY</h1><span>portable agents · self-owned keys · signed history</span></header>
 <main>
-  <div id="roster"><div class="empty">loading…</div></div>
+  <div style="display:flex;flex-direction:column;width:290px;border-right:1px solid var(--line)">
+    <div style="padding:8px"><button class="btn" style="width:100%" onclick="toggleFound()">+ found a new agent</button></div>
+    <div id="foundform" style="display:none">
+      <input id="f-name" placeholder="name (e.g. scribe)">
+      <textarea id="f-purpose" rows="3" placeholder="purpose — what is this agent for?"></textarea>
+      <input id="f-suspend" placeholder="human suspend key (npub or hex)">
+      <div class="row"><label><input type="checkbox" id="f-draft" style="width:auto"> draft with model</label>
+      <button class="btn solid" onclick="foundAgent()">FOUND</button></div>
+      <div id="f-status" class="empty" style="padding:4px;display:none"></div>
+    </div>
+    <div id="roster" style="flex:1;overflow-y:auto;padding:8px;width:auto;border:none"><div class="empty">loading…</div></div>
+  </div>
   <div id="panel">
     <nav>
       <button data-tab="run" class="sel">Run</button>
@@ -85,8 +104,29 @@ async function render() {
   if (!sel) { c.innerHTML = '<div class="empty">select an agent</div>'; return; }
   if (tab === 'manifest') {
     const d = await j(`/api/agents/${sel}/manifest`);
-    c.innerHTML = `<div class="entry"><b>sha256</b> <span class="meta">${d.manifest_sha256}</span> — ${d.ratified ? 'ratified' : '<span style="color:var(--bad)">NOT ratified (amendment pending)</span>'}</div><pre></pre>`;
-    c.querySelector('pre').textContent = d.yaml;
+    const holders = agents.filter(a => JSON.stringify(d.manifest.governance.suspend_keys || []).includes(a.npub));
+    c.innerHTML = `<div class="entry"><b>sha256</b> <span class="meta">${d.manifest_sha256}</span> — ${d.ratified ? '<span style="color:var(--ok)">ratified</span>' : '<span style="color:var(--bad)">NOT ratified — amend freely, then ratify</span>'}</div>
+      <textarea id="med" spellcheck="false"></textarea>
+      <div class="row">
+        <button class="btn" id="msave">SAVE AMENDMENT</button>
+        <span class="meta">ratify as:</span>
+        <select id="mwho">${holders.map(h => `<option value="${h.npub}">${h.name || h.npub.slice(0, 16)}</option>`).join('') || '<option value="">no keystore-held suspend key</option>'}</select>
+        <button class="btn solid" id="mrat">RATIFY</button>
+        <span id="mstatus" class="meta"></span>
+      </div>`;
+    document.getElementById('med').value = d.yaml;
+    document.getElementById('msave').onclick = async () => {
+      const r = await j(`/api/agents/${sel}/manifest`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ yaml: document.getElementById('med').value }) });
+      document.getElementById('mstatus').textContent = r.ok ? `saved · ${r.manifest_sha256.slice(0, 12)}… · re-ratify to run` : `rejected: ${r.error}`;
+      loadRoster();
+    };
+    document.getElementById('mrat').onclick = async () => {
+      const who = document.getElementById('mwho').value;
+      if (!who) return;
+      const r = await j(`/api/agents/${sel}/ratify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ as: who }) });
+      document.getElementById('mstatus').textContent = r.ok ? `ratified ✓ both signatures in the log` : `refused: ${r.error}`;
+      loadRoster(); if (r.ok) render();
+    };
   } else if (tab === 'log') {
     const d = await j(`/api/agents/${sel}/log?tail=100`);
     const chain = d.chain.valid ? `chain valid · ${d.chain.entries} entries` : `<span style="color:var(--bad)">CHAIN BROKEN: ${d.chain.error}</span>`;
@@ -151,6 +191,31 @@ async function runTask() {
     }
   } catch (err) { ev('err', String(err)); }
   go.disabled = false;
+}
+
+function toggleFound() {
+  const f = document.getElementById('foundform');
+  f.style.display = f.style.display === 'none' ? 'block' : 'none';
+}
+
+async function foundAgent() {
+  const st = document.getElementById('f-status');
+  st.style.display = 'block';
+  st.textContent = 'founding…';
+  const r = await j('/api/agents/found', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      name: document.getElementById('f-name').value.trim(),
+      purpose: document.getElementById('f-purpose').value.trim(),
+      suspend_keys: [document.getElementById('f-suspend').value.trim()],
+      draft_with: document.getElementById('f-draft').checked ? 'anthropic' : null,
+    }),
+  });
+  if (!r.ok) { st.textContent = 'refused: ' + r.error; return; }
+  st.textContent = `founded ${r.npub.slice(0, 16)}… drafted by ${r.drafted_by} — review the manifest, then ratify`;
+  sel = r.npub; tab = 'manifest';
+  document.querySelectorAll('nav button').forEach(x => x.classList.toggle('sel', x.dataset.tab === 'manifest'));
+  await loadRoster(); render();
 }
 
 loadRoster();

@@ -89,6 +89,7 @@ State lives in `~/.apiary` (`APIARY_HOME` to override). Never commit it.
 crates/apiary-core      manifest, identity, custody, keystore, log, ceremony — the substrate
 crates/apiary-runtime   inference providers, routing, spend authority, run loop
 crates/apiary-cli       `apiary` — the host's JSON front door
+crates/apiary-hostd     daemon: REST + AG-UI SSE + NIP-98 auth + cockpit at /
 docs/SPEC.md            the design: architecture, governance, failure modes, phases
 ```
 
