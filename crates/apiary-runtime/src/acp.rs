@@ -49,6 +49,10 @@ pub fn run_acp_prompt(
     let mut child = Command::new(command)
         .args(args)
         .current_dir(workdir)
+        // The harness is its own process tree — it must not inherit session
+        // markers from whatever spawned Apiary (e.g. a Claude Code session's
+        // CLAUDECODE guard, which blocks nested launches).
+        .env_remove("CLAUDECODE")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
