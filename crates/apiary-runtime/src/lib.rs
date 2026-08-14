@@ -6,6 +6,7 @@
 //! are enforced here in Rust — the model is never asked to be frugal.
 
 pub mod acp;
+pub mod buzz;
 pub mod connector;
 pub mod index;
 pub mod inference;

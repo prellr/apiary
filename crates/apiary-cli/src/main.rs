@@ -59,6 +59,12 @@ enum Command {
     },
     /// Normalize a public key: accepts npub or hex, prints both forms.
     Key { key: String },
+    /// Buzz workspace membership: the agent authenticates to a Buzz relay
+    /// with its own key (NIP-42) and participates as a first-class member.
+    Buzz {
+        #[command(subcommand)]
+        cmd: BuzzCmd,
+    },
     /// Run a one-shot task as an agent.
     Run {
         /// The agent's npub.
@@ -139,6 +145,36 @@ enum AgentCmd {
         /// Import an externally-signed ratification event (JSON on stdin).
         #[arg(long)]
         import: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BuzzCmd {
+    /// List the workspace's channels.
+    Channels {
+        npub: String,
+        #[arg(long)]
+        relay: String,
+    },
+    /// Post a stream message to a channel as the agent.
+    Post {
+        npub: String,
+        #[arg(long)]
+        relay: String,
+        #[arg(long)]
+        channel: String,
+        #[arg(long)]
+        message: String,
+    },
+    /// Read a channel's recent messages.
+    Read {
+        npub: String,
+        #[arg(long)]
+        relay: String,
+        #[arg(long)]
+        channel: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
 }
 
@@ -438,6 +474,87 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                 Ok(json!({"ok": true, "npub": npub, "relays": summary}))
             }
         },
+        Command::Buzz { cmd } => {
+            let (npub, relay) = match cmd {
+                BuzzCmd::Channels { npub, relay }
+                | BuzzCmd::Post { npub, relay, .. }
+                | BuzzCmd::Read { npub, relay, .. } => (npub, relay),
+            };
+            let npub = &normalize_key(npub)?;
+            let passphrase = require_passphrase(cli)?;
+            let agent_dir = ks.agent_dir(npub);
+            let mut custody = Custody::new();
+            let handle = custody.admit(ks.load(npub, passphrase)?);
+            let mut session = apiary_runtime::buzz::BuzzSession::connect(relay, &custody, &handle)?;
+            match cmd {
+                BuzzCmd::Channels { .. } => {
+                    let channels: Vec<serde_json::Value> = session
+                        .channels()?
+                        .iter()
+                        .map(|e| {
+                            let get = |name: &str| {
+                                e.tags.iter().find_map(|t| {
+                                    let s = t.as_slice();
+                                    (s.first().map(String::as_str) == Some(name))
+                                        .then(|| s.get(1).cloned())?
+                                })
+                            };
+                            json!({
+                                "id": get("d"),
+                                "name": get("name"),
+                                "visibility": get("visibility"),
+                            })
+                        })
+                        .collect();
+                    Ok(json!({"ok": true, "relay": relay, "channels": channels}))
+                }
+                BuzzCmd::Post {
+                    channel, message, ..
+                } => {
+                    let event = session.post(channel, message, &[])?;
+                    // Membership acts are part of the record.
+                    let log = EpisodicLog::open(&agent_dir);
+                    log.append(
+                        &custody,
+                        &handle,
+                        apiary_core::log::Tier::Self_,
+                        &apiary_core::log::EntryBody {
+                            action: "buzz.post".into(),
+                            model: None,
+                            cost: None,
+                            harness: None,
+                            outcome: "ok".into(),
+                            detail: Some(json!({
+                                "relay": relay,
+                                "channel": channel,
+                                "event": event.id.to_hex(),
+                                "chars": message.len(),
+                            })),
+                        },
+                    )?;
+                    Ok(json!({
+                        "ok": true,
+                        "relay": relay,
+                        "channel": channel,
+                        "event": event.id.to_hex(),
+                    }))
+                }
+                BuzzCmd::Read { channel, limit, .. } => {
+                    let msgs: Vec<serde_json::Value> = session
+                        .read_channel(channel, *limit)?
+                        .iter()
+                        .map(|e| {
+                            json!({
+                                "at": e.created_at.as_secs(),
+                                "author": e.pubkey.to_hex(),
+                                "content": e.content,
+                            })
+                        })
+                        .collect();
+                    Ok(json!({"ok": true, "relay": relay, "channel": channel, "messages": msgs}))
+                }
+            }
+        }
         Command::Key { key } => {
             let pk = apiary_core::identity::parse_npub(key)?;
             let npub = apiary_core::identity::to_npub(&pk)?;
