@@ -13,6 +13,7 @@ use axum::{
 };
 use nostr::prelude::*;
 use serde_json::json;
+use sha2::Digest;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1507,31 +1508,40 @@ pub async fn connector_grant(
             }
         }
     };
-    // Upsert by kind: one manifest entry per connector kind.
+    let _ = raw; // superseded by the amended manifest
+    match write_grant(&dir, &mut manifest, entry, credential) {
+        Ok(sha) => Json(json!({
+            "ok": true,
+            "npub": npub,
+            "granted": entry.name,
+            "kind": entry.kind,
+            "manifest_sha256": sha,
+            "ratified": false,
+            "note": "grant written to the manifest — a capability change is an amendment; re-ratify before the agent runs again",
+        }))
+        .into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Upsert a library entry into a manifest (one entry per kind) and persist.
+fn write_grant(
+    dir: &std::path::Path,
+    manifest: &mut apiary_core::manifest::Manifest,
+    entry: &LibraryEntry,
+    credential: Option<apiary_core::manifest::EncryptedBlob>,
+) -> Result<String, Resp> {
     manifest.connectors.retain(|c| c.kind != entry.kind);
     manifest.connectors.push(apiary_core::manifest::Connector {
         kind: entry.kind.clone(),
         credential,
         caps: entry.caps.clone(),
     });
-    let yaml = match serde_yaml::to_string(&manifest) {
-        Ok(y) => y,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    };
-    if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-    }
-    let _ = raw; // superseded
-    Json(json!({
-        "ok": true,
-        "npub": npub,
-        "granted": entry.name,
-        "kind": entry.kind,
-        "manifest_sha256": ceremony::manifest_hash(&yaml),
-        "ratified": false,
-        "note": "grant written to the manifest — a capability change is an amendment; re-ratify before the agent runs again",
-    }))
-    .into_response()
+    let yaml =
+        serde_yaml::to_string(manifest).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    std::fs::write(dir.join("manifest.yaml"), &yaml)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(ceremony::manifest_hash(&yaml))
 }
 
 pub async fn connector_revoke(
@@ -1570,4 +1580,444 @@ pub async fn connector_revoke(
         "note": "revocation is an amendment too — re-ratify. Until then the agent cannot run at all.",
     }))
     .into_response()
+}
+
+// ---------------------------------------------------------------- rename
+
+#[derive(serde::Deserialize)]
+pub struct RenameBody {
+    name: String,
+}
+
+/// Rename the host-local label. The identity is the keypair — the name is
+/// for humans. The Buzz display name (kind-0 profile) is separate and
+/// published from the Buzz tab; the mention trigger defaults to the new
+/// name the next time the listener starts.
+pub async fn rename_agent(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, _m) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    let body: RenameBody = match serde_json::from_slice(&raw_body) {
+        Ok(b) => b,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let name = body.name.trim();
+    if name.is_empty() || name.len() > 60 {
+        return err(StatusCode::BAD_REQUEST, "name must be 1–60 characters").into_response();
+    }
+    if let Err(e) = std::fs::write(dir.join("name"), name) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "name": name,
+        "note": "label renamed — the Buzz display name (kind-0 profile) and a running listener's trigger update separately",
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------------- oauth
+
+/// An OAuth grant in flight: everything recorded BEFORE the browser
+/// redirect that the callback must verify against (PKCE verifier, expected
+/// issuer per RFC 9207, and which agent/library entry this authorizes).
+pub struct PendingOauth {
+    pub npub: String,
+    pub entry: LibraryEntry,
+    pub verifier: String,
+    pub issuer: String,
+    pub iss_advertised: bool,
+    pub token_endpoint: String,
+    pub client_id: String,
+    pub resource: String,
+    pub created_at: u64,
+}
+
+fn rand_hex() -> String {
+    apiary_core::identity::generate()
+        .secret_key()
+        .to_secret_hex()
+}
+
+fn http_get_json(client: &reqwest::blocking::Client, url: &str) -> Option<serde_json::Value> {
+    client
+        .get(url)
+        .header("accept", "application/json")
+        .send()
+        .ok()
+        .filter(|r| r.status().is_success())
+        .and_then(|r| r.json().ok())
+}
+
+/// RFC 9728 protected-resource metadata → RFC 8414 / OIDC discovery.
+fn discover(resource_url: &str) -> Result<(String, bool, String, String, Vec<String>), String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let parsed = reqwest::Url::parse(resource_url).map_err(|e| format!("caps.url: {e}"))?;
+    let origin = format!(
+        "{}://{}{}",
+        parsed.scheme(),
+        parsed.host_str().unwrap_or_default(),
+        parsed.port().map(|p| format!(":{p}")).unwrap_or_default()
+    );
+    let path = parsed.path().trim_end_matches('/');
+    // Path-aware well-known first (RFC 9728 §3.1), then root.
+    let prm = http_get_json(
+        &client,
+        &format!("{origin}/.well-known/oauth-protected-resource{path}"),
+    )
+    .or_else(|| {
+        http_get_json(
+            &client,
+            &format!("{origin}/.well-known/oauth-protected-resource"),
+        )
+    })
+    .ok_or("server publishes no OAuth protected-resource metadata (RFC 9728)")?;
+    let auth_server = prm["authorization_servers"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .ok_or("protected-resource metadata lists no authorization_servers")?
+        .trim_end_matches('/')
+        .to_string();
+    let scopes: Vec<String> = prm["scopes_supported"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let as_parsed = reqwest::Url::parse(&auth_server).map_err(|e| e.to_string())?;
+    let as_origin = format!(
+        "{}://{}{}",
+        as_parsed.scheme(),
+        as_parsed.host_str().unwrap_or_default(),
+        as_parsed
+            .port()
+            .map(|p| format!(":{p}"))
+            .unwrap_or_default()
+    );
+    let as_path = as_parsed.path().trim_end_matches('/');
+    let meta = http_get_json(
+        &client,
+        &format!("{as_origin}/.well-known/oauth-authorization-server{as_path}"),
+    )
+    .or_else(|| {
+        http_get_json(
+            &client,
+            &format!("{as_origin}/.well-known/oauth-authorization-server"),
+        )
+    })
+    .or_else(|| {
+        http_get_json(
+            &client,
+            &format!("{auth_server}/.well-known/openid-configuration"),
+        )
+    })
+    .ok_or("authorization server publishes no metadata (RFC 8414 / OIDC discovery)")?;
+    let issuer = meta["issuer"].as_str().unwrap_or(&auth_server).to_string();
+    let iss_advertised = meta["authorization_response_iss_parameter_supported"]
+        .as_bool()
+        .unwrap_or(false);
+    let authorization_endpoint = meta["authorization_endpoint"]
+        .as_str()
+        .ok_or("AS metadata has no authorization_endpoint")?
+        .to_string();
+    let token_endpoint = meta["token_endpoint"]
+        .as_str()
+        .ok_or("AS metadata has no token_endpoint")?
+        .to_string();
+    Ok((
+        issuer,
+        iss_advertised,
+        authorization_endpoint,
+        token_endpoint,
+        scopes,
+    ))
+}
+
+#[derive(serde::Deserialize)]
+pub struct OauthStartBody {
+    /// Library entry name (kind must be mcp, caps.url + caps.oauth_client_id).
+    name: String,
+}
+
+pub async fn oauth_start(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (_ks, npub, _dir, _raw, _m) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    let body: OauthStartBody = match serde_json::from_slice(&raw_body) {
+        Ok(b) => b,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    if state.passphrase_clone().is_none() {
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unlock the keystore first — the tokens must be sealed to the agent at grant time",
+        )
+        .into_response();
+    }
+    let lib = match load_library(&state) {
+        Ok(l) => l,
+        Err(e) => return e.into_response(),
+    };
+    let Some(entry) = lib.connectors.iter().find(|c| c.name == body.name).cloned() else {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("no library entry '{}'", body.name),
+        )
+        .into_response();
+    };
+    let cap = |k: &str| entry.caps.get(k).and_then(|v| v.as_str()).map(String::from);
+    let Some(resource_url) = cap("url") else {
+        return err(StatusCode::BAD_REQUEST, "entry has no caps.url").into_response();
+    };
+    let Some(client_id) = cap("oauth_client_id") else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "entry has no caps.oauth_client_id — a pre-registered client id or a hosted \
+             Client ID Metadata Document URL (DCR is deprecated in MCP 2026-07-28)",
+        )
+        .into_response();
+    };
+    let scope_override = cap("oauth_scopes");
+    let resource_url2 = resource_url.clone();
+    let discovered = tokio::task::spawn_blocking(move || discover(&resource_url2)).await;
+    let (issuer, iss_advertised, authorization_endpoint, token_endpoint, scopes_supported) =
+        match discovered {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return err(StatusCode::BAD_GATEWAY, e).into_response(),
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        };
+    let verifier = format!("{}{}", rand_hex(), rand_hex());
+    let challenge = {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(sha2::Sha256::digest(verifier.as_bytes()))
+    };
+    let oauth_state = rand_hex();
+    let redirect_uri = format!("{}/oauth/callback", state.origin);
+    let scope = scope_override.unwrap_or_else(|| scopes_supported.join(" "));
+    let mut params = vec![
+        ("response_type", "code".to_string()),
+        ("client_id", client_id.clone()),
+        ("redirect_uri", redirect_uri.clone()),
+        ("state", oauth_state.clone()),
+        ("code_challenge", challenge),
+        ("code_challenge_method", "S256".to_string()),
+        ("resource", resource_url.clone()),
+    ];
+    if !scope.is_empty() {
+        params.push(("scope", scope));
+    }
+    let auth_url = match reqwest::Url::parse_with_params(&authorization_endpoint, &params) {
+        Ok(u) => u.to_string(),
+        Err(e) => {
+            return err(
+                StatusCode::BAD_GATEWAY,
+                format!("authorization_endpoint: {e}"),
+            )
+            .into_response()
+        }
+    };
+    state
+        .pending_oauth
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            oauth_state.clone(),
+            PendingOauth {
+                npub,
+                entry,
+                verifier,
+                issuer,
+                iss_advertised,
+                token_endpoint,
+                client_id,
+                resource: resource_url,
+                created_at: now_secs(),
+            },
+        );
+    Json(json!({
+        "ok": true,
+        "auth_url": auth_url,
+        "state": oauth_state,
+        "note": "authorize in the browser; the callback grants the connector with tokens sealed to the agent",
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct CallbackQuery {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    iss: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
+}
+
+fn callback_page(title: &str, detail: &str) -> axum::response::Html<String> {
+    // Static text only — title/detail are our own strings, never echoes of
+    // request input.
+    axum::response::Html(format!(
+        "<!doctype html><meta charset=utf-8><title>Apiary</title>\
+         <body style=\"background:#14120e;color:#e8e0cf;font:16px ui-monospace,monospace;\
+         display:flex;align-items:center;justify-content:center;height:100vh\">\
+         <div style=\"max-width:60ch\"><h2 style=\"color:#e8b04b\">{title}</h2><p>{detail}</p></div>"
+    ))
+}
+
+/// The browser lands here after consent. Public route (no host token — the
+/// browser doesn't have it); the `state` parameter is the correlation and
+/// the PKCE verifier never left this process.
+pub async fn oauth_callback(
+    State(state): State<App>,
+    Query(q): Query<CallbackQuery>,
+) -> impl IntoResponse {
+    let Some(st) = q.state.clone() else {
+        return callback_page("Missing state", "This callback carries no state parameter.");
+    };
+    let Some(pending) = state
+        .pending_oauth
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&st)
+    else {
+        return callback_page(
+            "Unknown or expired grant",
+            "No OAuth grant is waiting for this state. Start again from the Connectors tab.",
+        );
+    };
+    if q.error.is_some() {
+        // RFC 9207: on iss mismatch we must not even display the error.
+        let iss_ok = match &q.iss {
+            Some(i) => *i == pending.issuer,
+            None => !pending.iss_advertised,
+        };
+        return if iss_ok {
+            callback_page(
+                "Authorization refused",
+                &format!(
+                    "{} — {}",
+                    q.error.as_deref().unwrap_or("error"),
+                    q.error_description.as_deref().unwrap_or("no description")
+                ),
+            )
+        } else {
+            callback_page(
+                "Authorization response rejected",
+                "Issuer mismatch (RFC 9207).",
+            )
+        };
+    }
+    // RFC 9207 validation matrix before the code touches any token endpoint.
+    match (&q.iss, pending.iss_advertised) {
+        (Some(i), _) if *i != pending.issuer => {
+            return callback_page(
+                "Authorization response rejected",
+                "The iss parameter does not match the discovered issuer (RFC 9207).",
+            )
+        }
+        (None, true) => {
+            return callback_page(
+                "Authorization response rejected",
+                "The authorization server advertises iss support but sent none (RFC 9207).",
+            )
+        }
+        _ => {}
+    }
+    let Some(code) = q.code else {
+        return callback_page(
+            "Missing code",
+            "The authorization response carries no code.",
+        );
+    };
+    let Some(pass) = state.passphrase_clone() else {
+        return callback_page("Keystore locked", "Unlock Apiary and grant again.");
+    };
+    let redirect_uri = format!("{}/oauth/callback", state.origin);
+    let home = state.home.clone();
+    let outcome = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let form = vec![
+            ("grant_type", "authorization_code".to_string()),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("client_id", pending.client_id.clone()),
+            ("code_verifier", pending.verifier.clone()),
+            ("resource", pending.resource.clone()),
+        ];
+        let resp = reqwest::blocking::Client::new()
+            .post(&pending.token_endpoint)
+            .form(&form)
+            .send()
+            .map_err(|e| format!("token endpoint: {e}"))?;
+        let tokens: serde_json::Value = resp.json().map_err(|e| format!("token body: {e}"))?;
+        let access = tokens["access_token"]
+            .as_str()
+            .ok_or_else(|| format!("token endpoint refused: {tokens}"))?;
+        let credential = json!({
+            "type": "oauth",
+            "access_token": access,
+            "refresh_token": tokens.get("refresh_token").and_then(|v| v.as_str()),
+            "token_endpoint": pending.token_endpoint,
+            "client_id": pending.client_id,
+            "issuer": pending.issuer,
+            "resource": pending.resource,
+            "obtained_at": now_secs(),
+            "expires_in": tokens.get("expires_in").and_then(|v| v.as_u64()),
+        })
+        .to_string();
+        // Seal to the agent, write the grant.
+        let ks = Keystore::open(&home).map_err(|e| e.to_string())?;
+        let keys = ks.load(&pending.npub, &pass).map_err(|e| e.to_string())?;
+        let mut custody = Custody::new();
+        let handle = custody.admit(keys);
+        let blob = custody
+            .seal(&handle, &credential)
+            .map_err(|e| e.to_string())?;
+        let dir = ks.agent_dir(&pending.npub);
+        let raw = std::fs::read_to_string(dir.join("manifest.yaml")).map_err(|e| e.to_string())?;
+        let mut manifest =
+            apiary_core::manifest::Manifest::from_yaml(&raw).map_err(|e| e.to_string())?;
+        write_grant(&dir, &mut manifest, &pending.entry, Some(blob))
+            .map_err(|(_, j)| j.0.to_string())?;
+        Ok(pending.entry.name.clone())
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    match outcome {
+        Ok(name) => callback_page(
+            "Connector granted",
+            &format!(
+                "'{name}' is authorized and its tokens are sealed to the agent. \
+                 Return to Apiary and re-ratify the manifest — nothing runs unratified."
+            ),
+        ),
+        Err(e) => callback_page("Grant failed", &e),
+    }
 }

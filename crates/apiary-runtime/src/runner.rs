@@ -136,7 +136,7 @@ pub fn run_task_observed(
     // 5. Bind connectors (default-deny: an empty manifest list means no
     //    capabilities exist) and infer. Every dispatch is logged BEFORE the
     //    result returns to the model — the track record sees each action.
-    let connectors = crate::connector::bind_connectors(manifest)?;
+    let connectors = crate::connector::bind_connectors(manifest, custody, agent)?;
     let run = || -> Result<crate::inference::Completion, crate::Error> {
         Ok(if connectors.is_empty() {
             provider.complete(&model, &system, task, reservation.amount)?

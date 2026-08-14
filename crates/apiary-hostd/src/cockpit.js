@@ -165,6 +165,7 @@ async function renderOverview(c) {
   const m = d.manifest || {};
   const gov = m.governance || {};
 
+  const roster = agents.find(a => a.npub === sel) || {};
   const idSec = section('Identity',
     'The agent IS this keypair. The npub is public and portable — Buzz membership, log signatures, and published memory all bind to it. The private half never leaves the NIP-49 keystore on this host.');
   idSec.append(kv('npub', sel));
@@ -172,9 +173,22 @@ async function renderOverview(c) {
   if (keyRow.ok) idSec.append(kv('hex', keyRow.hex));
   idSec.append(kv('ratified', d.ratified ? 'yes — constitution in force' : 'NO — nothing runs unratified'));
   idSec.append(kv('manifest sha256', d.manifest_sha256));
+  const rnRow = el('div', 'row');
+  const rnIn = el('input'); rnIn.placeholder = 'new label'; rnIn.value = roster.name || '';
+  const rnGo = el('button', 'btn', 'RENAME');
+  const rnSt = el('span', 'meta', '');
+  rnRow.append(rnIn, rnGo, rnSt);
+  idSec.append(rnRow, help('The label is host-local and for humans — the identity is the keypair. The Buzz display name (kind-0 profile) is published separately from the Buzz tab; a running listener keeps its old @trigger until restarted.'));
+  rnGo.onclick = async () => {
+    const r = await j(api('/name'), {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: rnIn.value.trim() }),
+    });
+    rnSt.textContent = r.ok ? 'renamed ✓' : 'refused: ' + r.error;
+    loadRoster();
+  };
   c.append(idSec);
 
-  const roster = agents.find(a => a.npub === sel) || {};
   const actSec = section('Activation',
     'Host-local operator switch — deliberately not part of the constitution. While ACTIVE, this host supervises the agent’s declared standing presence: if the manifest declares presence.buzz, the mention listener runs, restarts if it dies, and stops on deactivation. Inactive agents hold no standing presence; one-shot runs stay available either way.');
   actSec.append(kv('state', roster.active ? 'ACTIVE' : 'inactive'));
@@ -664,6 +678,7 @@ async function renderBuzz(c) {
 
 async function renderConnectors(c) {
   c.append(help('Two layers. The HOST LIBRARY holds named connector configurations (kind + caps, no secrets) — configure once, assign to any agent. A GRANT copies one into this agent’s manifest, sealing any credential to this agent’s key alone. Grants are constitutional: each one changes the manifest hash and needs re-ratification, and each travels with the agent — portability includes capabilities and their sealed credentials. A destination host only needs to bind the kind; a declared kind it cannot bind fails loudly at run start.'));
+  c.append(help('The mcp kind speaks the Model Context Protocol (2026-07-28, with automatic fallback to initialize-era servers). stdio example caps: {"transport":"stdio","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/data"],"allowed_tools":["read_text_file","list_directory"]}. Remote example: {"transport":"http","url":"https://mcp.example.com/mcp","allowed_tools":["search"],"oauth_client_id":"…"} — grant via OAuth below, or paste a bearer token as the secret. allowed_tools is required: the server offers whatever it likes, the manifest decides what the agent may touch.'));
 
   const lib = await j('/api/connectors');
   if (!lib.ok) { c.append(el('div', 'ev err', 'error: ' + lib.error)); return; }
@@ -704,6 +719,30 @@ async function renderConnectors(c) {
   c.append(gSec);
   gGo.onclick = async () => {
     if (!gSel.value) return;
+    const entry = (lib.library || []).find(e => e.name === gSel.value);
+    const wantsOauth = entry && entry.caps && entry.caps.oauth_client_id && !gCred.value;
+    if (wantsOauth) {
+      gStatus.textContent = 'starting OAuth…';
+      const r = await j(api('/connectors/oauth'), {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: gSel.value }),
+      });
+      if (!r.ok) { gStatus.textContent = 'failed: ' + r.error; return; }
+      gStatus.replaceChildren();
+      const a = el('a', null, 'AUTHORIZE IN BROWSER →');
+      a.href = r.auth_url; a.target = '_blank'; a.style.color = 'var(--amber)';
+      gStatus.append(a, el('span', 'meta', ' waiting for the callback…'));
+      const before = grants.length;
+      const poll = setInterval(async () => {
+        const d2 = await j(api('/manifest'));
+        if (d2.ok && (d2.manifest.connectors || []).length > before) {
+          clearInterval(poll);
+          gStatus.textContent = 'granted via OAuth — re-ratify in the Manifest tab';
+          loadRoster(); render();
+        }
+      }, 3000);
+      return;
+    }
     gStatus.textContent = 'granting…';
     const r = await j(api('/connectors'), {
       method: 'POST', headers: { 'content-type': 'application/json' },

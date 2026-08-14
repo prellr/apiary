@@ -41,6 +41,8 @@ pub struct AppState {
     pub token: Option<String>,
     /// Managed Buzz mention listeners, one per agent.
     pub listeners: std::sync::Mutex<std::collections::HashMap<String, ops::ListenerHandle>>,
+    /// In-flight OAuth grants, keyed by the `state` parameter.
+    pub pending_oauth: std::sync::Mutex<std::collections::HashMap<String, ops::PendingOauth>>,
 }
 
 impl AppState {
@@ -99,6 +101,12 @@ pub fn build_router(state: App) -> Router {
         .route("/api/agents/{npub}/buzz/join", post(ops::buzz_join))
         .route("/api/agents/{npub}/active", post(ops::set_active))
         .route("/api/agents/{npub}/connectors", post(ops::connector_grant))
+        .route(
+            "/api/agents/{npub}/connectors/oauth",
+            post(ops::oauth_start),
+        )
+        .route("/oauth/callback", get(ops::oauth_callback))
+        .route("/api/agents/{npub}/name", post(ops::rename_agent))
         .route(
             "/api/agents/{npub}/connectors/{kind}",
             axum::routing::delete(ops::connector_revoke),

@@ -51,6 +51,7 @@ fn main() {
         origin: format!("http://127.0.0.1:{port}"),
         token: Some(token.clone()),
         listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
+        pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     std::thread::spawn(move || {

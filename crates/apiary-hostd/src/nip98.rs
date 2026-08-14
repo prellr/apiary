@@ -150,6 +150,7 @@ mod tests {
             origin: "http://127.0.0.1:7777".into(),
             token: None,
             listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
+            pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 

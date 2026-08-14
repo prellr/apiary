@@ -60,6 +60,7 @@ async fn main() {
             .unwrap_or_else(|| format!("http://{}", args.bind)),
         token: None,
         listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
+        pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
     apiary_hostd::ops::spawn_supervisor(state.clone());
     let app = build_router(state);

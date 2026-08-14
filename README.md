@@ -106,6 +106,17 @@ The window covers the whole surface, each section with inline explanations:
 - **Manifest** — YAML editor with a field guide, save-amendment →
   auto-suspend → ratify cycle, and external ratification (export the
   unsigned event, sign with your own tooling, import)
+- **MCP** — the `mcp` connector kind speaks the Model Context Protocol
+  (revision 2026-07-28: stateless, per-request `_meta`, `server/discover`
+  era probing) with automatic fallback to `initialize`-era servers — so
+  both the current spec and today's npm ecosystem work. stdio servers run
+  as scrubbed-environment subprocesses; Streamable HTTP servers get
+  `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` mirror headers,
+  `x-mcp-header` parameter mirroring, bearer tokens, or the full OAuth
+  flow (RFC 9728 discovery → RFC 8414 metadata → PKCE → RFC 9207 iss
+  validation → tokens sealed to the agent). `caps.allowed_tools` is a
+  required allowlist: the server offers whatever it likes, the manifest
+  decides what the agent may touch.
 - **Connectors** — two layers: a host **connector library** of named
   configurations (kind + caps, no secrets, `connectors.yaml`), and
   per-agent **grants** that copy an entry into the agent's manifest with
