@@ -28,8 +28,11 @@ Read the full design: [docs/SPEC.md](docs/SPEC.md).
 - [x] Routing: floors clamp → rules → default, resolved by the host before inference
 - [x] Spend authority: `governance.budgets.tokens_per_day` enforced in Rust before every call; refusals are logged
 - [x] `apiary run`: one-shot loop — budget check → route → decrypt → hydrate memory from log tail → infer → signed log entry + spend record
-- [ ] Semantic index (embed slot) — needs an embedding provider
+- [x] Semantic index: `embed` inference slot (Ollama local, or deterministic hash fallback), incremental over the log, top-k retrieval merged into the working set alongside the recency tail
+- [x] Provenance framing: memory and tool results labeled DATA in the working set; instructions come only from the constitution and the task (hard enforcement stays host-side in floors/caps)
+- [x] Foreign harnesses via ACP: `run --harness acp --acp-cmd <bin>` — permission requests decided host-side (default deny), harness attribution in the log (proven live with claude-code-acp)
 - [ ] NIP-46 remote-signer custody (replaces dev keystore as key source)
+- [ ] OS sandbox for ACP subprocesses (harness-ungated reads currently follow the harness's own policy)
 - [ ] Tauri cockpit + AG-UI run screen — Phase 2
 
 ## Quick start

@@ -7,6 +7,7 @@
 
 pub mod acp;
 pub mod connector;
+pub mod index;
 pub mod inference;
 pub mod routing;
 pub mod runner;
