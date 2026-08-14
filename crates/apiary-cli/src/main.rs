@@ -719,7 +719,14 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                                 // No p-tag on replies: a p-tag is a mention trigger, so a
                                 // tagged reply between two listening agents would ping-pong
                                 // forever. The reply lands in-channel right after the mention.
-                                match session.post(&channel, &reply, &[]) {
+                                // Causal floor: never timestamp the reply at or before the
+                                // mention, or a slow host clock sorts it above the question.
+                                match session.post_after(
+                                    &channel,
+                                    &reply,
+                                    &[],
+                                    Some(mention.created_at),
+                                ) {
                                     Ok(e) => eprintln!("replied: {}", e.id.to_hex()),
                                     Err(e) => eprintln!("reply failed: {e}"),
                                 }

@@ -254,8 +254,27 @@ impl<'a> BuzzSession<'a> {
         content: &str,
         mention_hex: &[String],
     ) -> Result<Event, crate::Error> {
+        self.post_after(channel_uuid, content, mention_hex, None)
+    }
+
+    /// Post with a causal floor: the event's created_at is never at or before
+    /// `after`. Clients sort by created_at, so a reply stamped by a clock a
+    /// few seconds behind the mention's author would render ABOVE the message
+    /// it answers.
+    pub fn post_after(
+        &mut self,
+        channel_uuid: &str,
+        content: &str,
+        mention_hex: &[String],
+        after: Option<Timestamp>,
+    ) -> Result<Event, crate::Error> {
         let mut builder = EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE), content)
             .tag(Tag::custom("h", vec![channel_uuid.to_string()]));
+        if let Some(after) = after {
+            let now = Timestamp::now();
+            let floor = Timestamp::from_secs(after.as_secs() + 1);
+            builder = builder.custom_created_at(if now > floor { now } else { floor });
+        }
         for m in mention_hex {
             if let Ok(pk) = PublicKey::parse(m) {
                 builder = builder.tag(Tag::public_key(pk));
