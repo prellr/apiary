@@ -1,0 +1,20 @@
+[package]
+name = "apiary-desktop"
+description = "Apiary desktop app: the hostd router in-process, the cockpit in a native window"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "apiary-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+apiary-core = { path = "../apiary-core" }
+apiary-hostd = { path = "../apiary-hostd" }
+axum = "0.8"
+tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

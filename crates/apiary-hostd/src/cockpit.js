@@ -4,9 +4,23 @@
 // no inline script, no external sources.)
 'use strict';
 
-let sel = null, tab = 'run', agents = [];
+let sel = null, tab = 'overview', agents = [], hostStatus = {};
+let listenerPoll = null;
 
-async function j(url, opts) { const r = await fetch(url, opts); return r.json(); }
+// Desktop mode hands the per-launch token in the boot URL; every API call
+// echoes it back in a header. Without a token this is a no-op.
+const TOKEN = new URLSearchParams(location.search).get('token');
+function hdrs(extra) {
+  const h = Object.assign({}, extra);
+  if (TOKEN) h['x-apiary-token'] = TOKEN;
+  return h;
+}
+async function j(url, opts) {
+  opts = opts || {};
+  opts.headers = hdrs(opts.headers);
+  const r = await fetch(url, opts);
+  return r.json();
+}
 
 // el('div', 'cls', 'text') — safe node construction.
 function el(tag, cls, text) {
@@ -15,6 +29,73 @@ function el(tag, cls, text) {
   if (text !== undefined) n.textContent = text;
   return n;
 }
+function help(text) { return el('div', 'help', text); }
+function kv(k, v) {
+  const row = el('div', 'kv');
+  row.append(el('span', 'k', k), el('span', 'v', v === undefined || v === null ? '—' : String(v)));
+  return row;
+}
+function section(title, helpText) {
+  const s = el('div', 'section');
+  s.append(el('h3', null, title));
+  if (helpText) s.append(help(helpText));
+  return s;
+}
+function api(path) { return `/api/agents/${encodeURIComponent(sel)}${path}`; }
+
+// ------------------------------------------------------------ host status
+
+async function loadStatus() {
+  try { hostStatus = await j('/api/status'); } catch { hostStatus = {}; }
+  const set = (id, text, cls) => {
+    const n = document.getElementById(id);
+    n.textContent = text;
+    if (cls !== undefined) n.className = cls;
+  };
+  set('c-ver', 'v' + (hostStatus.version || '?'));
+  document.getElementById('c-home').title = 'state directory: ' + (hostStatus.home || '?');
+  set('c-auth', 'auth ' + (hostStatus.auth || '?') + (hostStatus.token_gated ? ' +token' : ''));
+  set('c-model', hostStatus.anthropic_key_present ? 'model key ✓' : 'model key —',
+      'chip ' + (hostStatus.anthropic_key_present ? 'ok' : ''));
+  document.getElementById('c-model').title = hostStatus.anthropic_key_present
+    ? 'ANTHROPIC_API_KEY present in the host environment'
+    : 'no ANTHROPIC_API_KEY in the host environment — anthropic-routed runs and model drafting will refuse';
+  set('c-lock', hostStatus.unlocked ? 'unlocked' : 'LOCKED — click to unlock',
+      'chip click ' + (hostStatus.unlocked ? 'ok' : 'bad'));
+}
+
+document.getElementById('c-lock').onclick = () => {
+  const b = document.getElementById('unlockbar');
+  b.style.display = b.style.display === 'flex' ? 'none' : 'flex';
+};
+document.getElementById('c-keytool').onclick = () => {
+  const b = document.getElementById('keybar');
+  b.style.display = b.style.display === 'flex' ? 'none' : 'flex';
+};
+document.getElementById('u-go').onclick = async () => {
+  const st = document.getElementById('u-status');
+  st.textContent = 'unlocking… (NIP-49 scrypt is deliberately slow)';
+  const r = await j('/api/unlock', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ passphrase: document.getElementById('u-pass').value }),
+  });
+  st.textContent = r.ok
+    ? (r.verified_against_key ? 'unlocked ✓ (verified against a stored key)' : 'unlocked ✓ (empty keystore — nothing to verify against)')
+    : 'refused: ' + r.error;
+  if (r.ok) document.getElementById('u-pass').value = '';
+  loadStatus();
+};
+document.getElementById('u-lock').onclick = async () => {
+  await j('/api/lock', { method: 'POST' });
+  document.getElementById('u-status').textContent = 'locked — passphrase forgotten';
+  loadStatus();
+};
+document.getElementById('k-go').onclick = async () => {
+  const r = await j('/api/key?key=' + encodeURIComponent(document.getElementById('k-in').value.trim()));
+  document.getElementById('k-out').textContent = r.ok ? `${r.npub} · ${r.hex}` : 'invalid: ' + r.error;
+};
+
+// ------------------------------------------------------------ roster
 
 async function loadRoster() {
   const d = await j('/api/agents');
@@ -22,10 +103,12 @@ async function loadRoster() {
   const root = document.getElementById('roster');
   root.replaceChildren();
   if (!agents.length) root.append(el('div', 'empty', 'no agents in this keystore'));
+  const running = new Set((hostStatus.listeners || []).filter(l => l.running).map(l => l.npub));
   for (const a of agents) {
     const card = el('div', 'agent' + (sel === a.npub ? ' sel' : ''));
     const nm = el('div', 'nm', a.name || '(unnamed)');
     nm.append(el('span', 'badge ' + (a.ratified ? 'rat' : 'unrat'), a.ratified ? 'ratified' : 'unratified'));
+    if (running.has(a.npub)) nm.append(el('span', 'badge live', 'listening'));
     card.append(nm, el('div', 'np', a.npub), el('div', 'np', a.log_entries + ' log entries'));
     card.onclick = () => { sel = a.npub; render(); loadRoster(); };
     root.append(card);
@@ -46,92 +129,130 @@ function entryLine(bold, rest, metaLines) {
   return div;
 }
 
+// ------------------------------------------------------------ tabs
+
 async function render() {
+  if (listenerPoll) { clearInterval(listenerPoll); listenerPoll = null; }
   const c = document.getElementById('content');
   c.replaceChildren();
   if (!sel) { c.append(el('div', 'empty', 'select an agent')); return; }
+  if (tab === 'overview') return renderOverview(c);
+  if (tab === 'run') return renderRun(c);
+  if (tab === 'log') return renderLog(c);
+  if (tab === 'manifest') return renderManifest(c);
+  if (tab === 'buzz') return renderBuzz(c);
+  if (tab === 'creds') return renderCreds(c);
+}
 
-  if (tab === 'manifest') {
-    const d = await j(`/api/agents/${encodeURIComponent(sel)}/manifest`);
-    if (!d.ok) { c.append(el('div', 'ev err', 'error: ' + d.error)); return; }
-    const status = d.ratified ? 'ratified' : 'NOT ratified — amend freely, then ratify';
-    const head = entryLine('sha256', d.manifest_sha256 + ' — ' + status);
-    const ed = el('textarea'); ed.id = 'med'; ed.spellcheck = false; ed.value = d.yaml;
-    const row = el('div', 'row');
-    const save = el('button', 'btn', 'SAVE AMENDMENT');
-    const who = el('select');
-    const holders = agents.filter(a => (d.manifest.governance.suspend_keys || []).some(k => k.includes(a.npub) || a.npub.includes(k)));
-    if (holders.length) {
-      for (const h of holders) {
-        const o = el('option', null, h.name || h.npub.slice(0, 16));
-        o.value = h.npub; who.append(o);
-      }
-    } else {
-      who.append(el('option', null, 'no keystore-held suspend key'));
+// ------------------------------------------------------------ overview
+
+async function renderOverview(c) {
+  const d = await j(api('/manifest'));
+  if (!d.ok) { c.append(el('div', 'ev err', 'error: ' + d.error)); return; }
+  const m = d.manifest || {};
+  const gov = m.governance || {};
+
+  const idSec = section('Identity',
+    'The agent IS this keypair. The npub is public and portable — Buzz membership, log signatures, and published memory all bind to it. The private half never leaves the NIP-49 keystore on this host.');
+  idSec.append(kv('npub', sel));
+  const keyRow = await j('/api/key?key=' + encodeURIComponent(sel));
+  if (keyRow.ok) idSec.append(kv('hex', keyRow.hex));
+  idSec.append(kv('ratified', d.ratified ? 'yes — constitution in force' : 'NO — nothing runs unratified'));
+  idSec.append(kv('manifest sha256', d.manifest_sha256));
+  c.append(idSec);
+
+  const govSec = section('Governance',
+    'Suspend keys are the human governors: only they ratify, and any of them can suspend. Ratification = the agent signs its manifest hash AND a suspend-key holder countersigns; both land in the public log. Editing the manifest changes the hash, which suspends the agent until re-ratified.');
+  for (const k of (gov.suspend_keys || [])) govSec.append(kv('suspend key', k));
+  const budget = (gov.budgets || {}).tokens_per_day;
+  govSec.append(kv('tokens_per_day', budget !== undefined ? budget + ' (hard ceiling)' : 'none set — runs reserve a bounded default'));
+  const spend = await j(api('/spend'));
+  if (spend.ok) {
+    govSec.append(kv('spent today (' + spend.date + ')', `${spend.used} used · ${spend.reserved} reserved` + (spend.remaining !== null && spend.remaining !== undefined ? ` · ${spend.remaining} remaining` : '')));
+    if (spend.budget_tokens_per_day) {
+      const bar = el('div', 'bar'); const fill = el('div');
+      const frac = Math.min(1, (spend.used + spend.reserved) / spend.budget_tokens_per_day);
+      fill.style.width = (frac * 100).toFixed(1) + '%';
+      if (frac > 0.85) fill.className = 'hot';
+      bar.append(fill); govSec.append(bar);
+      govSec.append(help('The budget is enforced by atomic reservations taken before each model call — a run that would exceed it is refused, not trimmed.'));
     }
-    const rat = el('button', 'btn solid', 'RATIFY');
-    const status2 = el('span', 'meta', '');
-    row.append(save, el('span', 'meta', 'ratify as:'), who, rat, status2);
-    c.append(head, ed, row);
-    save.onclick = async () => {
-      const r = await j(`/api/agents/${encodeURIComponent(sel)}/manifest`, {
-        method: 'PUT', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ yaml: ed.value }),
-      });
-      status2.textContent = r.ok ? `saved · ${r.manifest_sha256.slice(0, 12)}… · re-ratify to run` : `rejected: ${r.error}`;
-      loadRoster();
-    };
-    rat.onclick = async () => {
-      if (!who.value || !who.value.startsWith('npub')) return;
-      status2.textContent = 'ratifying…';
-      const r = await j(`/api/agents/${encodeURIComponent(sel)}/ratify`, {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ as: who.value }),
-      });
-      status2.textContent = r.ok ? 'ratified ✓ both signatures in the log' : `refused: ${r.error}`;
-      loadRoster(); if (r.ok) render();
-    };
-  } else if (tab === 'log') {
-    const d = await j(`/api/agents/${encodeURIComponent(sel)}/log?tail=100`);
-    if (!d.ok) { c.append(el('div', 'ev err', 'error: ' + d.error)); return; }
-    const chain = d.chain.valid ? `chain valid · ${d.chain.entries} entries` : `CHAIN BROKEN: ${d.chain.error}`;
-    c.append(entryLine('signed log', chain));
-    for (const e of (d.entries || []).slice().reverse()) {
-      const b = e.body || {};
-      const meta = [
-        new Date(e.at * 1000).toLocaleString()
-          + (b.model ? ' · ' + b.model : '')
-          + (b.harness ? ' · ' + b.harness : '')
-          + (b.cost ? ` · ${b.cost.input_tokens}in/${b.cost.output_tokens}out` : ''),
-        e.id,
-      ];
-      c.append(entryLine(b.action || '?', '→ ' + (b.outcome || '?'), meta));
-    }
-  } else {
-    const box = el('div'); box.id = 'runbox';
-    const ta = el('textarea'); ta.id = 'task'; ta.placeholder = 'task for this agent…';
-    const go = el('button', null, 'RUN'); go.id = 'go';
-    box.append(ta, go);
-    const events = el('div'); events.id = 'events';
-    c.append(box, events);
-    go.onclick = () => runTask(ta, go, events);
   }
+  c.append(govSec);
+
+  const infSec = section('Inference pool & routing',
+    'Models are slots, not identity — "inference in, connections out". The routing table picks a slot per task class; human-set floors clamp what routing may choose (stricter than the floor is allowed, looser never).');
+  for (const slot of (m.inference || [])) infSec.append(kv(slot.name, `${slot.provider} / ${slot.model}`));
+  if (!(m.inference || []).length) infSec.append(kv('pool', 'empty — this agent cannot run'));
+  const routing = m.routing || {};
+  if (routing.default) infSec.append(kv('routing.default', routing.default));
+  for (const r of (routing.rules || [])) infSec.append(kv('rule', JSON.stringify(r)));
+  for (const f of (routing.floors || [])) infSec.append(kv('floor', JSON.stringify(f)));
+  c.append(infSec);
+
+  const conSec = section('Connectors',
+    'Everything the agent can touch is a connector, declared here and default-deny at runtime. Credentials are NIP-44-sealed to the agent’s own key (see the Credentials tab) — a manifest dump is not a credential dump.');
+  for (const con of (m.connectors || [])) conSec.append(kv(con.name || con.type || '?', JSON.stringify(con.caps || {})));
+  if (!(m.connectors || []).length) conSec.append(kv('connectors', 'none — the agent can think and speak, not act'));
+  c.append(conSec);
+
+  const mem = m.memory || {};
+  const memSec = section('Memory',
+    'Three tiers by sensitivity: public log entries publish to relays as-is; self-tier entries publish encrypted to the agent’s own key (portable but stranger-proof); local never leaves this machine. The semantic index embeds the log for retrieval into the working set.');
+  memSec.append(kv('log tier default', mem.log));
+  memSec.append(kv('index', mem.index));
+  for (const r of (mem.log_relays || [])) memSec.append(kv('log relay', r));
+  if (!(mem.log_relays || []).length) memSec.append(kv('log relays', 'none — publishing disabled until added to the manifest'));
+  c.append(memSec);
+
+  const lease = m.lease || {};
+  const leaseSec = section('Lease',
+    'Which host may run this agent. Heartbeats on a relay claim the lease; takeover policy "contested-human" means a second host cannot silently steal a live agent — a human decides.');
+  leaseSec.append(kv('mechanism', lease.mechanism));
+  leaseSec.append(kv('takeover', lease.takeover));
+  leaseSec.append(kv('heartbeat / expiry', (lease.heartbeat_secs || '—') + 's / ' + (lease.expiry_secs || '—') + 's'));
+  c.append(leaseSec);
+
+  const l = await j(api('/listener'));
+  const lisSec = section('Buzz listener',
+    'When running, the agent answers @mentions in its Buzz workspace through the governed run path. Manage it in the Buzz tab.');
+  lisSec.append(kv('status', l.running ? `running — relay ${l.relay}, trigger ${l.trigger}` : 'not running'));
+  c.append(lisSec);
+}
+
+// ------------------------------------------------------------ run
+
+function renderRun(c) {
+  c.append(help('One governed task. The stream below is AG-UI presence (steps, tool calls, text); the signed log is truth — every model call lands as a signed checkpoint entry. Budget reservations are taken before the call and settled after.'));
+  const box = el('div'); box.id = 'runbox';
+  const ta = el('textarea'); ta.id = 'task'; ta.placeholder = 'task for this agent…';
+  const go = el('button', null, 'RUN'); go.id = 'go';
+  box.append(ta, go);
+  const row = el('div', 'row');
+  const cls = el('input'); cls.placeholder = 'class (optional, e.g. reasoning)';
+  const dcls = el('input'); dcls.placeholder = 'data class (optional, e.g. sensitive)';
+  row.append(cls, dcls);
+  c.append(box, row,
+    help('class picks a routing rule from the manifest (which model slot handles this kind of task). data class engages routing floors — e.g. a "sensitive" floor can pin such tasks to a local model regardless of what routing would prefer.'));
+  const events = el('div'); events.id = 'events';
+  c.append(events);
+  go.onclick = () => runTask(ta, go, events, cls.value.trim() || null, dcls.value.trim() || null);
 }
 
 function ev(events, cls, text) {
   events.prepend(el('div', 'ev ' + cls, text));
 }
 
-async function runTask(ta, go, events) {
+async function runTask(ta, go, events, cls, dcls) {
   const task = ta.value.trim();
   if (!task) return;
   go.disabled = true;
   events.replaceChildren();
   try {
-    const resp = await fetch(`/api/agents/${encodeURIComponent(sel)}/run`, {
+    const resp = await fetch(api('/run'), {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ task }),
+      headers: hdrs({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ task, class: cls, data_class: dcls }),
     });
     if (!resp.ok) {
       let msg = String(resp.status);
@@ -175,6 +296,351 @@ async function runTask(ta, go, events) {
   go.disabled = false;
 }
 
+// ------------------------------------------------------------ log
+
+async function renderLog(c) {
+  const d = await j(api('/log?tail=100'));
+  if (!d.ok) { c.append(el('div', 'ev err', 'error: ' + d.error)); return; }
+  const chain = d.chain.valid ? `chain valid · ${d.chain.entries} entries` : `CHAIN BROKEN: ${d.chain.error}`;
+  c.append(entryLine('signed log', chain));
+  c.append(help('Every entry is a signed nostr event chained to the previous one — the agent’s tamper-evident memory and audit trail in one. "chain valid" means every signature verifies and no entry was removed or reordered.'));
+
+  const row = el('div', 'row');
+  const pub = el('button', 'btn', 'PUBLISH TO RELAYS');
+  const rem = el('button', 'btn', 'FETCH REMOTE COPY');
+  const st = el('span', 'meta', '');
+  row.append(pub, rem, st);
+  c.append(row, help('Publish pushes the log to the manifest’s memory.log_relays, tier-enforced: public entries go as-is, self-tier entries go NIP-44-encrypted to the agent’s own key (anyone can store them, only the agent can read them), local-tier entries never leave. Fetch pulls the published copy back, verifies signatures, and decrypts the agent’s own wrapped entries — proof the memory is truly portable.'));
+
+  const out = el('div');
+  c.append(out);
+  pub.onclick = async () => {
+    st.textContent = 'publishing…';
+    const r = await j(api('/log/publish'), { method: 'POST' });
+    st.textContent = r.ok
+      ? `published: ${r.published_public} public, ${r.published_wrapped} wrapped · ${r.skipped_local} local kept back · ${r.already_published} already up`
+      : 'failed: ' + r.error;
+  };
+  rem.onclick = async () => {
+    st.textContent = 'fetching…';
+    out.replaceChildren();
+    const r = await j(api('/log/remote'));
+    st.textContent = r.ok ? 'fetched' : 'failed: ' + r.error;
+    if (!r.ok) return;
+    for (const relay of (r.relays || [])) {
+      out.append(entryLine(relay.relay, relay.ok ? `${(relay.events || []).length} events` : 'unreachable: ' + relay.error));
+      for (const e of (relay.events || []).slice(0, 30)) {
+        const b = e.body || {};
+        out.append(entryLine(b.action || (e.wrapped ? '(wrapped)' : '?'), '→ ' + (b.outcome || ''), [
+          new Date(e.at * 1000).toLocaleString() + (e.wrapped ? ' · self-tier (decrypted locally)' : ' · public'),
+          e.id,
+        ]));
+      }
+    }
+  };
+
+  for (const e of (d.entries || []).slice().reverse()) {
+    const b = e.body || {};
+    const meta = [
+      new Date(e.at * 1000).toLocaleString()
+        + (b.model ? ' · ' + b.model : '')
+        + (b.harness ? ' · ' + b.harness : '')
+        + (b.cost ? ` · ${b.cost.input_tokens}in/${b.cost.output_tokens}out` : ''),
+      e.id,
+    ];
+    c.append(entryLine(b.action || '?', '→ ' + (b.outcome || '?'), meta));
+  }
+}
+
+// ------------------------------------------------------------ manifest
+
+async function renderManifest(c) {
+  const d = await j(api('/manifest'));
+  if (!d.ok) { c.append(el('div', 'ev err', 'error: ' + d.error)); return; }
+  const status = d.ratified ? 'ratified' : 'NOT ratified — amend freely, then ratify';
+  c.append(entryLine('sha256', d.manifest_sha256 + ' — ' + status));
+  c.append(help('The manifest is the agent’s constitution: identity, model pool, routing, connectors, memory, governance, lease. Saving an amendment changes the hash, which automatically suspends the agent until a suspend-key holder re-ratifies — amendments are cheap, unratified amendments are inert.'));
+
+  const guide = el('details');
+  guide.append(el('summary', null, 'field guide — what every setting does'));
+  const g = el('div');
+  const rows = [
+    ['identity.npub', 'the agent’s public key — immutable; the host refuses an amendment that changes it'],
+    ['inference[]', 'the model pool: named slots {name, provider, model}. Providers: anthropic (API key from host env), ollama (local), mock (tests). An "embed" slot powers the semantic index.'],
+    ['routing.default', 'slot used when no rule matches'],
+    ['routing.rules[]', 'per-task-class slot choices, e.g. {class: reasoning, use: workhorse}'],
+    ['routing.floors[]', 'human-owned clamps, e.g. {data_class: sensitive, require_provider: ollama} — routing may be stricter than a floor, never looser'],
+    ['connectors[]', 'what the agent may touch, default-deny. Each entry: {name, caps, credential?}. Credentials are NIP-44-sealed blobs (Credentials tab).'],
+    ['memory.log', 'default tier for new log entries: public | self | local'],
+    ['memory.index', 'semantic index location (local)'],
+    ['memory.log_relays[]', 'nostr relays the log publishes to (tier-enforced)'],
+    ['governance.suspend_keys[]', 'human governor npubs — ratifiers; at least one required'],
+    ['governance.budgets.tokens_per_day', 'hard daily token ceiling, enforced by atomic reservations'],
+    ['lease', 'which host runs the agent: relay-event heartbeats, takeover policy (contested-human = a person resolves disputes), timings'],
+  ];
+  for (const [k, v] of rows) g.append(kv(k, v));
+  guide.append(g);
+  c.append(guide);
+
+  const ed = el('textarea'); ed.id = 'med'; ed.spellcheck = false; ed.value = d.yaml;
+  const row = el('div', 'row');
+  const save = el('button', 'btn', 'SAVE AMENDMENT');
+  const who = el('select');
+  const holders = agents.filter(a => (d.manifest.governance.suspend_keys || []).some(k => k.includes(a.npub) || a.npub.includes(k)));
+  if (holders.length) {
+    for (const h of holders) {
+      const o = el('option', null, h.name || h.npub.slice(0, 16));
+      o.value = h.npub; who.append(o);
+    }
+  } else {
+    who.append(el('option', null, 'no keystore-held suspend key'));
+  }
+  const rat = el('button', 'btn solid', 'RATIFY');
+  const status2 = el('span', 'meta', '');
+  row.append(save, el('span', 'meta', 'ratify as:'), who, rat, status2);
+  c.append(ed, row);
+  c.append(help('Ratify signs twice: the agent signs its manifest hash, then the selected human key countersigns. Both events land in the public log — the founding ceremony, repeated for every amendment.'));
+  save.onclick = async () => {
+    const r = await j(api('/manifest'), {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ yaml: ed.value }),
+    });
+    status2.textContent = r.ok ? `saved · ${r.manifest_sha256.slice(0, 12)}… · re-ratify to run` : `rejected: ${r.error}`;
+    loadRoster();
+  };
+  rat.onclick = async () => {
+    if (!who.value || !who.value.startsWith('npub')) return;
+    status2.textContent = 'ratifying… (two NIP-49 key loads; slow by design)';
+    const r = await j(api('/ratify'), {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ as: who.value }),
+    });
+    status2.textContent = r.ok ? 'ratified ✓ both signatures in the log' : `refused: ${r.error}`;
+    loadRoster(); if (r.ok) render();
+  };
+
+  const ext = el('details');
+  ext.append(el('summary', null, 'external ratification — sign with a key that never enters Apiary'));
+  const extBody = el('div');
+  extBody.append(help('For governors who keep their master nostr key outside this host: export the unsigned ratification event, sign it with your own tooling (nak, a NIP-07 extension, a signer app), and import the signed event. The keystore never sees the key.'));
+  const exRow = el('div', 'row');
+  const exKey = el('input', 'grow'); exKey.placeholder = 'external governor key (npub or hex, must be a listed suspend key)';
+  const exGo = el('button', 'btn', 'EXPORT UNSIGNED EVENT');
+  exRow.append(exKey, exGo);
+  const exOut = el('pre'); exOut.style.display = 'none';
+  const imRow = el('div', 'row');
+  const imIn = el('textarea'); imIn.rows = 4; imIn.placeholder = 'paste the signed event JSON here';
+  const imGo = el('button', 'btn', 'IMPORT SIGNED EVENT');
+  const exSt = el('span', 'meta', '');
+  imRow.append(imGo, exSt);
+  extBody.append(exRow, exOut, imIn, imRow);
+  ext.append(extBody);
+  c.append(ext);
+  exGo.onclick = async () => {
+    const r = await j(api('/ratify/export'), {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ as: exKey.value.trim() }),
+    });
+    exOut.style.display = 'block';
+    exOut.textContent = r.ok ? JSON.stringify(r.unsigned_event, null, 2) : 'refused: ' + r.error;
+  };
+  imGo.onclick = async () => {
+    let evj;
+    try { evj = JSON.parse(imIn.value); } catch { exSt.textContent = 'not valid JSON'; return; }
+    exSt.textContent = 'importing…';
+    const r = await j(api('/ratify/import'), {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ event: evj }),
+    });
+    exSt.textContent = r.ok ? 'imported ✓ ratified by ' + r.ratified_by.slice(0, 12) + '…' : 'refused: ' + r.error;
+    loadRoster(); if (r.ok) render();
+  };
+}
+
+// ------------------------------------------------------------ buzz
+
+function relayInput() {
+  const inp = el('input', 'grow');
+  inp.placeholder = 'wss://your-buzz-relay';
+  inp.value = localStorage.getItem('apiary.relay') || '';
+  inp.onchange = () => localStorage.setItem('apiary.relay', inp.value.trim());
+  return inp;
+}
+
+async function renderBuzz(c) {
+  c.append(help('Buzz is a nostr-native agent workspace — and structurally just a relay, so the agent joins with its own key (NIP-42 auth), not a bot token. Everything here acts AS the selected agent and logs to its signed history.'));
+
+  const relaySec = section('Workspace relay', 'The Buzz relay URL. Membership is admitted relay-side (buzz-admin); until admitted, operations will be refused politely.');
+  const relay = relayInput();
+  relaySec.append(relay);
+  c.append(relaySec);
+  const rv = () => relay.value.trim();
+
+  const profSec = section('Profile',
+    'Publishes a kind-0 profile so the workspace shows a name instead of a hex key. Also lands in the public log.');
+  const pName = el('input'); pName.placeholder = 'display name';
+  const pAbout = el('input', 'grow'); pAbout.placeholder = 'about (optional)';
+  const pGo = el('button', 'btn', 'PUBLISH PROFILE');
+  const pSt = el('span', 'meta', '');
+  const pRow = el('div', 'row'); pRow.append(pName, pAbout, pGo, pSt);
+  profSec.append(pRow);
+  c.append(profSec);
+  pGo.onclick = async () => {
+    pSt.textContent = 'publishing…';
+    const r = await j(api('/buzz/profile'), {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ relay: rv(), name: pName.value.trim(), about: pAbout.value.trim() || null }),
+    });
+    pSt.textContent = r.ok ? 'published ✓' : 'failed: ' + r.error;
+  };
+
+  const chanSec = section('Channels', 'Click a channel to read it; use the box to post as this agent.');
+  const chList = el('div');
+  const chSt = el('span', 'meta', '');
+  const chGo = el('button', 'btn', 'LIST CHANNELS');
+  const chRow = el('div', 'row'); chRow.append(chGo, chSt);
+  const joinIn = el('input', 'grow'); joinIn.placeholder = 'channel id to join (NIP-29 join request)';
+  const joinGo = el('button', 'btn', 'REQUEST JOIN');
+  const joinRow = el('div', 'row'); joinRow.append(joinIn, joinGo);
+  const msgs = el('div');
+  const postIn = el('input', 'grow'); postIn.placeholder = 'message…';
+  const postGo = el('button', 'btn solid', 'POST');
+  const postRow = el('div', 'row'); postRow.append(postIn, postGo);
+  postRow.style.display = 'none';
+  let curChan = null;
+  chanSec.append(chRow, chList, joinRow, msgs, postRow);
+  c.append(chanSec);
+
+  const readChan = async (id, name) => {
+    curChan = id;
+    msgs.replaceChildren(el('div', 'meta', 'reading #' + (name || id) + '…'));
+    const r = await j(api('/buzz/read') + `?relay=${encodeURIComponent(rv())}&channel=${encodeURIComponent(id)}&limit=30`);
+    msgs.replaceChildren();
+    postRow.style.display = 'flex';
+    if (!r.ok) { msgs.append(el('div', 'ev err', r.error)); return; }
+    const keyRow = await j('/api/key?key=' + encodeURIComponent(sel));
+    for (const msg of (r.messages || [])) {
+      const line = el('div', 'msg' + (keyRow.ok && msg.author === keyRow.hex ? ' mine' : ''));
+      line.append(el('span', 'who', msg.author.slice(0, 8) + '… '), document.createTextNode(msg.content));
+      line.append(el('div', 'meta', new Date(msg.at * 1000).toLocaleString()));
+      msgs.append(line);
+    }
+  };
+  chGo.onclick = async () => {
+    chSt.textContent = 'authenticating + listing…';
+    const r = await j(api('/buzz/channels') + '?relay=' + encodeURIComponent(rv()));
+    chSt.textContent = r.ok ? (r.channels.length + ' channels') : 'failed: ' + r.error;
+    chList.replaceChildren();
+    for (const ch of (r.channels || [])) {
+      const n = el('div', 'chan', '#' + (ch.name || '(unnamed)') + ' · ' + ch.id);
+      n.onclick = () => readChan(ch.id, ch.name);
+      chList.append(n);
+    }
+  };
+  joinGo.onclick = async () => {
+    chSt.textContent = 'requesting…';
+    const r = await j(api('/buzz/join'), {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ relay: rv(), channel: joinIn.value.trim() }),
+    });
+    chSt.textContent = r.ok ? r.note : 'failed: ' + r.error;
+  };
+  postGo.onclick = async () => {
+    if (!curChan || !postIn.value.trim()) return;
+    const r = await j(api('/buzz/post'), {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ relay: rv(), channel: curChan, message: postIn.value }),
+    });
+    if (r.ok) { postIn.value = ''; readChan(curChan); }
+    else msgs.append(el('div', 'ev err', 'post failed: ' + r.error));
+  };
+
+  const lisSec = section('Mention listener',
+    'The agent as a teammate: watches every channel and answers @mentions through the governed run path — ratification required, channel text framed as untrusted DATA, budget-capped, every mention logged. Replies carry no p-tag so two listening agents can never trigger each other into a loop. Runs inside this host process; stopping the host stops it.');
+  const trigIn = el('input'); trigIn.placeholder = 'trigger (default @name)';
+  const startBtn = el('button', 'btn solid', 'START');
+  const stopBtn = el('button', 'btn danger', 'STOP');
+  const lSt = el('span', 'meta', '');
+  const lRow = el('div', 'row'); lRow.append(trigIn, startBtn, stopBtn, lSt);
+  const lLines = el('pre'); lLines.style.display = 'none';
+  lisSec.append(lRow, lLines);
+  c.append(lisSec);
+
+  const pollListener = async () => {
+    const r = await j(api('/listener'));
+    if (!r.ok) return;
+    if (r.running) {
+      lSt.textContent = `running on ${r.relay} · trigger ${r.trigger}`;
+      lLines.style.display = 'block';
+      lLines.textContent = (r.lines || []).join('\n') || '(no activity yet)';
+    } else {
+      lSt.textContent = 'not running';
+      if (r.lines && r.lines.length) { lLines.style.display = 'block'; lLines.textContent = r.lines.join('\n'); }
+    }
+    startBtn.disabled = !!r.running;
+    stopBtn.disabled = !r.running;
+  };
+  pollListener();
+  listenerPoll = setInterval(pollListener, 3000);
+  startBtn.onclick = async () => {
+    lSt.textContent = 'starting…';
+    const r = await j(api('/listener'), {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ relay: rv(), trigger: trigIn.value.trim() || null }),
+    });
+    if (!r.ok) lSt.textContent = 'refused: ' + r.error;
+    pollListener(); loadStatus(); loadRoster();
+  };
+  stopBtn.onclick = async () => {
+    const r = await j(api('/listener'), { method: 'DELETE' });
+    lSt.textContent = r.ok ? 'stop signalled (≤15s)' : 'failed: ' + r.error;
+    pollListener(); loadStatus(); loadRoster();
+  };
+}
+
+// ------------------------------------------------------------ credentials
+
+function renderCreds(c) {
+  c.append(help('Credential custody: secrets are sealed with NIP-44 to the agent’s own key, so the manifest can carry connector credentials without carrying plaintext. The plaintext exists only transiently, per-credential, at the instant of use — exposure at the instant of use is a pre-existing property of any credential, not new risk.'));
+
+  const sealSec = section('Seal a secret', 'Paste a secret (API key, token); get back a NIP-44 blob to put in a manifest connector’s credential field. The blob is useless to anyone but this agent.');
+  const sIn = el('textarea'); sIn.rows = 3; sIn.placeholder = 'plaintext secret…';
+  const sGo = el('button', 'btn', 'SEAL');
+  const sSt = el('span', 'meta', '');
+  const sRow = el('div', 'row'); sRow.append(sGo, sSt);
+  const sOut = el('pre'); sOut.style.display = 'none'; sOut.style.userSelect = 'all';
+  sealSec.append(sIn, sRow, sOut);
+  c.append(sealSec);
+  sGo.onclick = async () => {
+    sSt.textContent = 'sealing…';
+    const r = await j(api('/credential/seal'), {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ plaintext: sIn.value }),
+    });
+    if (r.ok) { sIn.value = ''; sSt.textContent = 'sealed ✓ (plaintext cleared)'; sOut.style.display = 'block'; sOut.textContent = r.nip44; }
+    else sSt.textContent = 'failed: ' + r.error;
+  };
+
+  const openSec = section('Open a sealed blob (debug)', 'Decrypts a blob with the agent’s key and SHOWS THE PLAINTEXT on screen. Debug tool only — prefer letting connectors decrypt at the instant of use.');
+  const oIn = el('textarea'); oIn.rows = 3; oIn.placeholder = 'nip44 blob…';
+  const oGo = el('button', 'btn danger', 'OPEN (REVEALS PLAINTEXT)');
+  const oSt = el('span', 'meta', '');
+  const oRow = el('div', 'row'); oRow.append(oGo, oSt);
+  const oOut = el('pre'); oOut.style.display = 'none';
+  openSec.append(oIn, oRow, oOut);
+  c.append(openSec);
+  oGo.onclick = async () => {
+    const r = await j(api('/credential/open'), {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ nip44: oIn.value }),
+    });
+    oSt.textContent = r.ok ? 'decrypted' : 'failed: ' + r.error;
+    if (r.ok) { oOut.style.display = 'block'; oOut.textContent = r.plaintext; }
+  };
+}
+
+// ------------------------------------------------------------ founding
+
 document.getElementById('foundtoggle').onclick = () => {
   const f = document.getElementById('foundform');
   f.style.display = f.style.display === 'block' ? 'none' : 'block';
@@ -200,4 +666,5 @@ document.getElementById('foundgo').onclick = async () => {
   await loadRoster(); render();
 };
 
-loadRoster();
+loadStatus().then(loadRoster);
+setInterval(loadStatus, 15000);

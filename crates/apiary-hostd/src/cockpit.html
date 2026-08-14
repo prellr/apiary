@@ -5,14 +5,22 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Apiary Cockpit</title>
 <style>
-  :root { --bg:#14120e; --panel:#1e1a14; --line:#38301f; --amber:#e8b04b; --text:#e8e0cf; --dim:#8f8570; --ok:#8fc07a; --bad:#d07a6a; }
+  :root { --bg:#14120e; --panel:#1e1a14; --line:#38301f; --amber:#e8b04b; --text:#e8e0cf; --dim:#8f8570; --ok:#8fc07a; --bad:#d07a6a; --blue:#7aa2d0; }
   * { box-sizing:border-box; margin:0; }
   body { background:var(--bg); color:var(--text); font:14px/1.5 ui-monospace,'SF Mono',Menlo,monospace; height:100vh; display:flex; flex-direction:column; }
-  header { padding:10px 16px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:12px; }
+  header { padding:10px 16px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
   header h1 { font-size:16px; color:var(--amber); letter-spacing:.08em; }
-  header span { color:var(--dim); font-size:12px; }
+  header .sub { color:var(--dim); font-size:12px; flex:1; }
+  .chip { font-size:11px; padding:2px 10px; border-radius:10px; border:1px solid var(--line); color:var(--dim); cursor:default; }
+  .chip.ok { color:var(--ok); border-color:var(--ok); }
+  .chip.bad { color:var(--bad); border-color:var(--bad); cursor:pointer; }
+  .chip.click { cursor:pointer; }
+  #unlockbar { display:none; padding:10px 16px; border-bottom:1px solid var(--line); background:var(--panel); align-items:center; gap:10px; }
+  #unlockbar input { background:var(--bg); border:1px solid var(--line); border-radius:6px; color:var(--text); padding:7px 10px; font:inherit; width:280px; }
+  #keybar { display:none; padding:10px 16px; border-bottom:1px solid var(--line); background:var(--panel); align-items:center; gap:10px; flex-wrap:wrap; }
+  #keybar input { background:var(--bg); border:1px solid var(--line); border-radius:6px; color:var(--text); padding:7px 10px; font:inherit; width:420px; }
   main { flex:1; display:flex; min-height:0; }
-  #side { display:flex; flex-direction:column; width:290px; border-right:1px solid var(--line); }
+  #side { display:flex; flex-direction:column; width:300px; border-right:1px solid var(--line); }
   #roster { flex:1; overflow-y:auto; padding:8px; }
   .agent { padding:10px; border:1px solid var(--line); border-radius:6px; margin-bottom:8px; cursor:pointer; }
   .agent:hover, .agent.sel { border-color:var(--amber); background:var(--panel); }
@@ -20,20 +28,31 @@
   .agent .np { color:var(--dim); font-size:11px; word-break:break-all; }
   .badge { font-size:10px; padding:1px 7px; border-radius:9px; border:1px solid; margin-left:6px; }
   .rat { color:var(--ok); border-color:var(--ok); } .unrat { color:var(--bad); border-color:var(--bad); }
+  .live { color:var(--blue); border-color:var(--blue); }
   #panel { flex:1; display:flex; flex-direction:column; min-width:0; }
-  nav { display:flex; gap:2px; border-bottom:1px solid var(--line); padding:0 10px; }
-  nav button { background:none; border:none; color:var(--dim); padding:9px 14px; cursor:pointer; font:inherit; border-bottom:2px solid transparent; }
+  nav { display:flex; gap:2px; border-bottom:1px solid var(--line); padding:0 10px; overflow-x:auto; }
+  nav button { background:none; border:none; color:var(--dim); padding:9px 14px; cursor:pointer; font:inherit; border-bottom:2px solid transparent; white-space:nowrap; }
   nav button.sel { color:var(--amber); border-bottom-color:var(--amber); }
   #content { flex:1; overflow-y:auto; padding:14px 18px; }
   pre { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:12px; overflow-x:auto; font-size:12px; white-space:pre-wrap; word-break:break-word; }
   .entry { border-left:3px solid var(--line); padding:6px 12px; margin-bottom:8px; }
-  .entry b { color:var(--amber); } .entry .meta { color:var(--dim); font-size:11px; }
-  #runbox { display:flex; gap:8px; margin-bottom:14px; }
+  .entry b { color:var(--amber); } .entry .meta, .meta { color:var(--dim); font-size:11px; }
+  .help { color:var(--dim); font-size:12px; margin:2px 0 10px; max-width:76ch; }
+  .help b { color:var(--text); }
+  .section { border:1px solid var(--line); border-radius:6px; padding:12px 14px; margin-bottom:14px; background:var(--panel); }
+  .section h3 { color:var(--amber); font-size:13px; letter-spacing:.06em; margin-bottom:4px; }
+  .kv { display:flex; gap:8px; font-size:12px; margin:2px 0; }
+  .kv .k { color:var(--dim); min-width:150px; }
+  .kv .v { word-break:break-all; }
+  .bar { height:8px; background:var(--bg); border:1px solid var(--line); border-radius:4px; overflow:hidden; margin:6px 0; max-width:420px; }
+  .bar div { height:100%; background:var(--ok); }
+  .bar div.hot { background:var(--bad); }
+  #runbox { display:flex; gap:8px; margin-bottom:8px; }
   #task { flex:1; background:var(--panel); border:1px solid var(--line); border-radius:6px; color:var(--text); padding:10px; font:inherit; resize:vertical; min-height:60px; }
   #go { background:var(--amber); color:#14120e; border:none; border-radius:6px; padding:0 22px; font:inherit; font-weight:700; cursor:pointer; }
   #go:disabled { opacity:.4; }
   .ev { padding:5px 12px; margin-bottom:5px; border-left:3px solid var(--line); font-size:13px; }
-  .ev.step { border-color:#7aa2d0; color:#7aa2d0; }
+  .ev.step { border-color:var(--blue); color:var(--blue); }
   .ev.tool { border-color:var(--amber); color:var(--amber); }
   .ev.text { border-color:var(--ok); white-space:pre-wrap; }
   .ev.err  { border-color:var(--bad); color:var(--bad); }
@@ -41,34 +60,73 @@
   .empty { color:var(--dim); padding:30px; text-align:center; }
   .btn { background:var(--panel); color:var(--amber); border:1px solid var(--amber); border-radius:6px; padding:7px 14px; font:inherit; cursor:pointer; }
   .btn.solid { background:var(--amber); color:#14120e; font-weight:700; border:none; }
+  .btn.danger { color:var(--bad); border-color:var(--bad); }
   .btn:disabled { opacity:.4; }
   #med { width:100%; min-height:320px; background:var(--panel); border:1px solid var(--line); border-radius:6px; color:var(--text); padding:12px; font:12px/1.5 inherit; resize:vertical; }
   .row { display:flex; gap:8px; align-items:center; margin:10px 0; flex-wrap:wrap; }
-  .row select { background:var(--panel); border:1px solid var(--line); border-radius:6px; color:var(--text); padding:7px 10px; font:inherit; }
+  .row select, .row input, .section input, .section select, .section textarea { background:var(--bg); border:1px solid var(--line); border-radius:6px; color:var(--text); padding:7px 10px; font:inherit; }
+  .section textarea { width:100%; resize:vertical; }
+  .grow { flex:1; min-width:160px; }
   #foundform { border:1px solid var(--line); border-radius:6px; padding:14px; margin:8px; background:var(--panel); display:none; }
-  #foundform input, #foundform textarea { width:100%; margin:4px 0 10px; background:var(--bg); border:1px solid var(--line); border-radius:6px; color:var(--text); padding:8px; font:inherit; }
+  #foundform input, #foundform textarea { width:100%; margin:2px 0 4px; background:var(--bg); border:1px solid var(--line); border-radius:6px; color:var(--text); padding:8px; font:inherit; }
+  #foundform .help { margin:0 0 8px; }
+  details { margin:8px 0; }
+  summary { color:var(--amber); cursor:pointer; font-size:12px; }
+  .chan { padding:6px 10px; border:1px solid var(--line); border-radius:6px; margin:4px 0; cursor:pointer; font-size:12px; }
+  .chan:hover { border-color:var(--amber); }
+  .msg { border-left:3px solid var(--line); padding:4px 10px; margin:4px 0; font-size:12px; }
+  .msg .who { color:var(--blue); }
+  .msg.mine .who { color:var(--amber); }
 </style>
 </head>
 <body>
-<header><h1>APIARY</h1><span>portable agents · self-owned keys · signed history</span></header>
+<header>
+  <h1>APIARY</h1><span class="sub">portable agents · self-owned keys · signed history</span>
+  <span class="chip" id="c-ver" title="host version">…</span>
+  <span class="chip" id="c-home" title="state directory (keys, manifests) — set at launch">home</span>
+  <span class="chip" id="c-auth" title="auth mode — set at launch: open (local trust) or nip98 (signed requests)">auth</span>
+  <span class="chip" id="c-model" title="whether the host environment has an Anthropic credential for runs and manifest drafting">model key</span>
+  <span class="chip click" id="c-keytool" title="npub ⇄ hex converter">key tool</span>
+  <span class="chip bad" id="c-lock" title="keystore lock state">…</span>
+</header>
+<div id="unlockbar">
+  <span class="meta">passphrase unlocks the NIP-49 keystore for this session — needed to run, ratify, found, post, seal:</span>
+  <input id="u-pass" type="password" placeholder="keystore passphrase">
+  <button class="btn solid" id="u-go">UNLOCK</button>
+  <button class="btn" id="u-lock" title="forget the passphrase; reads keep working">LOCK</button>
+  <span class="meta" id="u-status"></span>
+</div>
+<div id="keybar">
+  <span class="meta">accepts npub or 64-char hex:</span>
+  <input id="k-in" placeholder="npub1… or hex">
+  <button class="btn" id="k-go">NORMALIZE</button>
+  <span class="meta" id="k-out" style="user-select:all"></span>
+</div>
 <main>
   <div id="side">
     <div style="padding:8px"><button class="btn" style="width:100%" id="foundtoggle">+ found a new agent</button></div>
     <div id="foundform">
       <input id="f-name" placeholder="name (e.g. scribe)">
+      <div class="help">A label for humans; the identity is the generated keypair.</div>
       <textarea id="f-purpose" rows="3" placeholder="purpose — what is this agent for?"></textarea>
+      <div class="help">Seeds the draft constitution. Founding is the moment of maximum ignorance — drafts start conservative.</div>
       <input id="f-suspend" placeholder="human suspend key (npub or hex)">
+      <div class="help">Your key. Suspension authority never rests with the agent's own key, so at least one human governor is required.</div>
       <div class="row"><label><input type="checkbox" id="f-draft" style="width:auto"> draft with model</label>
       <button class="btn solid" id="foundgo">FOUND</button></div>
+      <div class="help">Model-drafted or template, the draft is only a hypothesis: nothing runs until a human ratifies it.</div>
       <div id="f-status" class="empty" style="padding:4px;display:none"></div>
     </div>
     <div id="roster"><div class="empty">loading…</div></div>
   </div>
   <div id="panel">
     <nav>
-      <button data-tab="run" class="sel">Run</button>
+      <button data-tab="overview" class="sel">Overview</button>
+      <button data-tab="run">Run</button>
       <button data-tab="log">Log</button>
       <button data-tab="manifest">Manifest</button>
+      <button data-tab="buzz">Buzz</button>
+      <button data-tab="creds">Credentials</button>
     </nav>
     <div id="content"><div class="empty">select an agent</div></div>
   </div>

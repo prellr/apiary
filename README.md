@@ -83,13 +83,53 @@ governance:
 
 State lives in `~/.apiary` (`APIARY_HOME` to override). Never commit it.
 
+## Desktop app (Tauri)
+
+Everything above — and everything the CLI can do — is also operable from the
+cockpit GUI. The desktop app runs the full `apiary-hostd` router in-process
+on a loopback port and opens the cockpit in a native window:
+
+```bash
+cargo run -p apiary-desktop
+```
+
+The window covers the whole surface, each section with inline explanations:
+
+- **Overview** — identity, ratification state, governance (suspend keys,
+  budget with a live spend meter), inference pool & routing, connectors,
+  memory tiers & relays, lease, listener state
+- **Run** — governed one-shot tasks with routing class / data class, streamed
+  as AG-UI events; every model call lands as a signed log checkpoint
+- **Log** — chain verification, publish to relays (tier-enforced: public
+  plain, self NIP-44-wrapped, local never leaves), fetch-and-verify the
+  remote copy
+- **Manifest** — YAML editor with a field guide, save-amendment →
+  auto-suspend → ratify cycle, and external ratification (export the
+  unsigned event, sign with your own tooling, import)
+- **Buzz** — profile, channel discovery/read/post/join, and the managed
+  mention listener (start/stop, live activity)
+- **Credentials** — NIP-44 seal/open against the agent's key
+- **Header** — host status, keystore lock/unlock (passphrase never touches
+  disk), npub⇄hex key tool
+
+Security posture: the embedded daemon binds `127.0.0.1` on an ephemeral port
+and requires a per-launch random token that only the app's own webview
+receives — other local processes can't drive it. The keystore starts locked
+unless `APIARY_PASSPHRASE` is set; unlocking happens in the GUI and lives in
+memory only. `ANTHROPIC_API_KEY` in the app's environment enables
+anthropic-routed runs and model-drafted foundings.
+
+The plain daemon (`apiary-hostd`) serves the same cockpit at `--bind` for
+headless hosts; add `--auth nip98` beyond localhost.
+
 ## Layout
 
 ```
 crates/apiary-core      manifest, identity, custody, keystore, log, ceremony — the substrate
 crates/apiary-runtime   inference providers, routing, spend authority, run loop
 crates/apiary-cli       `apiary` — the host's JSON front door
-crates/apiary-hostd     daemon: REST + AG-UI SSE + NIP-98 auth + cockpit at /
+crates/apiary-hostd     lib + daemon: REST + AG-UI SSE + NIP-98 auth + cockpit at /
+crates/apiary-desktop   Tauri app: the hostd router in-process, cockpit in a native window
 docs/SPEC.md            the design: architecture, governance, failure modes, phases
 ```
 

@@ -29,6 +29,34 @@ pub fn check(
     path_and_query: &str,
     body: Option<&[u8]>,
 ) -> Result<Option<PublicKey>, (StatusCode, Json<serde_json::Value>)> {
+    // Desktop token gate: when the host carries a per-launch token, every
+    // request must present it (header or, for the boot navigation and SSE,
+    // query param). This binds the embedded daemon to its own webview —
+    // other local processes never saw the token. Orthogonal to auth mode.
+    if let Some(expected) = state.token.as_deref() {
+        let from_header = headers
+            .get("x-apiary-token")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let from_query = path_and_query.split_once('?').and_then(|(_, q)| {
+            q.split('&')
+                .find_map(|kv| kv.strip_prefix("token=").map(str::to_string))
+        });
+        let presented = from_header.or(from_query).unwrap_or_default();
+        // Constant-time-ish compare; the token is 32 random bytes of hex.
+        let ok = presented.len() == expected.len()
+            && presented
+                .bytes()
+                .zip(expected.bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0;
+        if !ok {
+            return Err(crate::err(
+                StatusCode::UNAUTHORIZED,
+                "missing or wrong host token",
+            ));
+        }
+    }
     if state.auth == AuthMode::Open {
         return Ok(None);
     }
@@ -117,9 +145,11 @@ mod tests {
     fn state(auth: AuthMode) -> AppState {
         AppState {
             home: PathBuf::from("/tmp"),
-            passphrase: None,
+            passphrase: std::sync::RwLock::new(None),
             auth,
             origin: "http://127.0.0.1:7777".into(),
+            token: None,
+            listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
