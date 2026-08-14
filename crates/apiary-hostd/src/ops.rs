@@ -943,77 +943,65 @@ pub struct ListenBody {
     trigger: Option<String>,
 }
 
-/// Start the managed mention listener for an agent: ratification-gated,
-/// runs run_mention_service on a detached thread, activity into a ring
-/// buffer the status endpoint serves.
-pub async fn listener_start(
-    State(state): State<App>,
-    AxPath(npub): AxPath<String>,
-    OriginalUri(uri): OriginalUri,
-    headers: axum::http::HeaderMap,
-    raw_body: axum::body::Bytes,
-) -> impl IntoResponse {
-    let (ks, npub, dir, raw, manifest) =
-        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
-            Ok(v) => v,
-            Err(e) => return e.into_response(),
-        };
-    let body: ListenBody = match serde_json::from_slice(&raw_body) {
-        Ok(b) => b,
-        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
-    };
-    let pass = match require_pass(&state) {
-        Ok(p) => p,
-        Err(e) => return e.into_response(),
-    };
+/// Start a listener for an agent unless one is already running. The manual
+/// endpoint and the supervisor share this path, so the gates are identical:
+/// ratified constitution, unlocked keystore, one listener per agent.
+pub async fn ensure_listener(
+    state: &App,
+    npub: &str,
+    relay: &str,
+    trigger: Option<String>,
+) -> Result<serde_json::Value, Resp> {
+    let ks = Keystore::open(&state.home).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let dir = ks.agent_dir(npub);
+    let raw = std::fs::read_to_string(dir.join("manifest.yaml"))
+        .map_err(|e| err(StatusCode::NOT_FOUND, e))?;
+    let manifest = apiary_core::manifest::Manifest::from_yaml(&raw)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let pass = require_pass(state)?;
     // One listener per agent; reap a finished one silently.
     {
         let mut map = state.listeners.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(existing) = map.get(&npub) {
+        if let Some(existing) = map.get(npub) {
             if !existing.done.load(Ordering::Relaxed) {
-                return err(
+                return Err(err(
                     StatusCode::CONFLICT,
                     "listener already running for this agent",
-                )
-                .into_response();
+                ));
             }
-            map.remove(&npub);
+            map.remove(npub);
         }
     }
     // Nothing runs unratified — same gate as the CLI.
-    let agent_pk = match apiary_core::identity::parse_npub(&npub) {
-        Ok(pk) => pk,
-        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
-    };
+    let agent_pk =
+        apiary_core::identity::parse_npub(npub).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let log = EpisodicLog::open(&dir);
     match ceremony::is_ratified(&log, &raw, &agent_pk, &suspend_pks(&manifest)) {
         Ok(true) => {}
         Ok(false) => {
-            return err(
+            return Err(err(
                 StatusCode::PRECONDITION_FAILED,
                 "manifest is not ratified — nothing runs unratified",
-            )
-            .into_response()
+            ))
         }
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
     }
     let name = std::fs::read_to_string(dir.join("name"))
         .unwrap_or_default()
         .trim()
         .to_string();
-    let trigger = body
-        .trigger
-        .clone()
+    let trigger = trigger
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| format!("@{name}"));
     // Load keys off the async runtime (NIP-49 scrypt is slow by design),
     // so a wrong passphrase fails HERE, not silently inside the thread.
-    let npub2 = npub.clone();
-    let admit_result = tokio::task::spawn_blocking(move || admit(&ks, &npub2, &pass)).await;
+    let npub2 = npub.to_string();
+    let ks2 = Keystore::open(&state.home).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let admit_result = tokio::task::spawn_blocking(move || admit(&ks2, &npub2, &pass)).await;
     let (custody, handle) = match admit_result {
         Ok(Ok(v)) => v,
-        Ok(Err(e)) => return e.into_response(),
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Ok(Err(e)) => return Err(e),
+        Err(e) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
     };
     let stop = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
@@ -1021,23 +1009,22 @@ pub async fn listener_start(
     let entry = ListenerHandle {
         stop: stop.clone(),
         done: done.clone(),
-        relay: body.relay.clone(),
+        relay: relay.to_string(),
         trigger: trigger.clone(),
         started_at: now_secs(),
         lines: lines.clone(),
     };
-    let relay = body.relay.clone();
+    let relay2 = relay.to_string();
     let trigger2 = trigger.clone();
-    let manifest2 = manifest;
     std::thread::spawn(move || {
         push_line(&lines, format!("listening (trigger {trigger2:?} or p-tag)"));
         let sink_lines = lines.clone();
         let result = apiary_runtime::buzz::run_mention_service(
-            &manifest2,
+            &manifest,
             &dir,
             &custody,
             &handle,
-            &relay,
+            &relay2,
             &trigger2,
             &stop,
             move |line| push_line(&sink_lines, line),
@@ -1052,15 +1039,39 @@ pub async fn listener_start(
         .listeners
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(npub.clone(), entry);
-    Json(json!({
+        .insert(npub.to_string(), entry);
+    Ok(json!({
         "ok": true,
         "npub": npub,
-        "relay": body.relay,
+        "relay": relay,
         "trigger": trigger,
         "running": true,
     }))
-    .into_response()
+}
+
+/// Start the managed mention listener for an agent: ratification-gated,
+/// runs run_mention_service on a detached thread, activity into a ring
+/// buffer the status endpoint serves.
+pub async fn listener_start(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (_ks, npub, _dir, _raw, _manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    let body: ListenBody = match serde_json::from_slice(&raw_body) {
+        Ok(b) => b,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    match ensure_listener(&state, &npub, &body.relay, body.trigger).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 pub async fn listener_status(
@@ -1069,10 +1080,12 @@ pub async fn listener_status(
     OriginalUri(uri): OriginalUri,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let (_ks, npub, _dir, _raw, _m) = match gate(&state, &headers, "GET", &uri, None, &npub) {
+    let (_ks, npub, dir, _raw, m) = match gate(&state, &headers, "GET", &uri, None, &npub) {
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
+    let active = is_active(&dir);
+    let declared = m.presence.buzz.as_ref().map(|b| b.relay.clone());
     let map = state.listeners.lock().unwrap_or_else(|e| e.into_inner());
     match map.get(&npub) {
         Some(l) => {
@@ -1089,10 +1102,19 @@ pub async fn listener_status(
                 "trigger": l.trigger,
                 "started_at": l.started_at,
                 "lines": lines,
+                "active": active,
+                "declared_relay": declared,
             }))
             .into_response()
         }
-        None => Json(json!({"ok": true, "npub": npub, "running": false})).into_response(),
+        None => Json(json!({
+            "ok": true,
+            "npub": npub,
+            "running": false,
+            "active": active,
+            "declared_relay": declared,
+        }))
+        .into_response(),
     }
 }
 
@@ -1119,5 +1141,157 @@ pub async fn listener_stop(
             .into_response()
         }
         None => err(StatusCode::NOT_FOUND, "no listener for this agent").into_response(),
+    }
+}
+
+// ---------------------------------------------------------------- activation
+
+/// Host-local operational state: while a marker file exists in the agent's
+/// directory, this host considers the agent ACTIVE and supervises its
+/// declared standing presence. Deliberately NOT in the manifest — which
+/// workspace the agent lives in is constitutional (presence.buzz, ratified);
+/// whether this host is currently running it is an operator switch.
+pub fn is_active(dir: &std::path::Path) -> bool {
+    dir.join("active").exists()
+}
+
+#[derive(serde::Deserialize)]
+pub struct ActiveBody {
+    active: bool,
+}
+
+pub async fn set_active(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    let body: ActiveBody = match serde_json::from_slice(&raw_body) {
+        Ok(b) => b,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let marker = dir.join("active");
+    let result = if body.active {
+        std::fs::write(&marker, b"1")
+    } else {
+        match std::fs::remove_file(&marker) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    };
+    if let Err(e) = result {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    // Deactivation takes effect immediately rather than on the next
+    // supervisor tick.
+    if !body.active {
+        let mut map = state.listeners.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(l) = map.remove(&npub) {
+            l.stop.store(true, Ordering::Relaxed);
+        }
+    }
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "active": body.active,
+        "buzz_declared": manifest.presence.buzz.is_some(),
+        "note": if body.active {
+            "active — the supervisor starts declared presence within ~10s"
+        } else {
+            "inactive — standing presence stopped; one-shot runs stay available"
+        },
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------------- supervisor
+
+/// The presence supervisor: reconciles desired state (agent ACTIVE and
+/// manifest declares presence.buzz) with reality (listener running) every
+/// tick. Starts declared listeners, restarts dead ones (with backoff so a
+/// dead relay is not hammered), and stops any listener whose agent went
+/// inactive. Locked keystore and unratified manifests simply wait — the
+/// supervisor never weakens a gate, it only presses the same button an
+/// operator would.
+pub fn spawn_supervisor(state: App) {
+    tokio::spawn(async move {
+        let mut last_attempt: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            reconcile(&state, &mut last_attempt).await;
+        }
+    });
+}
+
+const RETRY_BACKOFF_SECS: u64 = 30;
+
+async fn reconcile(state: &App, last_attempt: &mut std::collections::HashMap<String, u64>) {
+    let Ok(ks) = Keystore::open(&state.home) else {
+        return;
+    };
+    let Ok(agents) = ks.list() else {
+        return;
+    };
+    for npub in agents {
+        let dir = ks.agent_dir(&npub);
+        let active = is_active(&dir);
+        let running = {
+            let mut map = state.listeners.lock().unwrap_or_else(|e| e.into_inner());
+            match map.get(&npub) {
+                Some(l) if !l.done.load(Ordering::Relaxed) => {
+                    if active {
+                        true
+                    } else {
+                        // Inactive agents hold no standing presence, however
+                        // the listener was started.
+                        if let Some(l) = map.remove(&npub) {
+                            l.stop.store(true, Ordering::Relaxed);
+                        }
+                        continue;
+                    }
+                }
+                Some(_) => {
+                    // Finished thread: reap so a restart can happen below.
+                    map.remove(&npub);
+                    false
+                }
+                None => false,
+            }
+        };
+        if !active || running {
+            continue;
+        }
+        let declared = std::fs::read_to_string(dir.join("manifest.yaml"))
+            .ok()
+            .and_then(|raw| apiary_core::manifest::Manifest::from_yaml(&raw).ok())
+            .and_then(|m| m.presence.buzz);
+        let Some(buzz) = declared else {
+            continue; // active, but no declared presence — nothing to supervise
+        };
+        if state.passphrase_clone().is_none() {
+            continue; // locked keystore: wait for the operator to unlock
+        }
+        let now = now_secs();
+        if now.saturating_sub(*last_attempt.get(&npub).unwrap_or(&0)) < RETRY_BACKOFF_SECS {
+            continue;
+        }
+        last_attempt.insert(npub.clone(), now);
+        match ensure_listener(state, &npub, &buzz.relay, buzz.trigger.clone()).await {
+            Ok(_) => eprintln!("supervisor: started listener for {npub} on {}", buzz.relay),
+            Err((_, body)) => eprintln!(
+                "supervisor: could not start listener for {npub}: {}",
+                body.0
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("unknown")
+            ),
+        }
     }
 }

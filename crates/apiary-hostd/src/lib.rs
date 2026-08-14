@@ -93,6 +93,7 @@ pub fn build_router(state: App) -> Router {
         .route("/api/agents/{npub}/buzz/post", post(ops::buzz_post))
         .route("/api/agents/{npub}/buzz/profile", post(ops::buzz_profile))
         .route("/api/agents/{npub}/buzz/join", post(ops::buzz_join))
+        .route("/api/agents/{npub}/active", post(ops::set_active))
         .route(
             "/api/agents/{npub}/listener",
             get(ops::listener_status)
@@ -221,6 +222,8 @@ async fn list_agents(
             "name": name,
             "ratified": ratified(&dir, &npub, &raw, &m),
             "log_entries": entries,
+            "active": ops::is_active(&dir),
+            "buzz_declared": m.presence.buzz.is_some(),
         }));
     }
     Json(json!({"ok": true, "agents": agents})).into_response()

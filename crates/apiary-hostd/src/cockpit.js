@@ -62,6 +62,14 @@ async function loadStatus() {
     : 'no ANTHROPIC_API_KEY in the host environment — anthropic-routed runs and model drafting will refuse';
   set('c-lock', hostStatus.unlocked ? 'unlocked' : 'LOCKED — click to unlock',
       'chip click ' + (hostStatus.unlocked ? 'ok' : 'bad'));
+  // Once unlocked, never ask again: the passphrase prompt disappears and
+  // the bar only offers LOCK.
+  const unlocked = !!hostStatus.unlocked;
+  document.getElementById('u-pass').style.display = unlocked ? 'none' : '';
+  document.getElementById('u-go').style.display = unlocked ? 'none' : '';
+  document.getElementById('u-help').textContent = unlocked
+    ? 'keystore unlocked for this session — LOCK to forget the passphrase'
+    : 'passphrase unlocks the NIP-49 keystore for this session — needed to run, ratify, found, post, seal:';
 }
 
 document.getElementById('c-lock').onclick = () => {
@@ -82,7 +90,10 @@ document.getElementById('u-go').onclick = async () => {
   st.textContent = r.ok
     ? (r.verified_against_key ? 'unlocked ✓ (verified against a stored key)' : 'unlocked ✓ (empty keystore — nothing to verify against)')
     : 'refused: ' + r.error;
-  if (r.ok) document.getElementById('u-pass').value = '';
+  if (r.ok) {
+    document.getElementById('u-pass').value = '';
+    setTimeout(() => { document.getElementById('unlockbar').style.display = 'none'; }, 1200);
+  }
   loadStatus();
 };
 document.getElementById('u-lock').onclick = async () => {
@@ -108,6 +119,7 @@ async function loadRoster() {
     const card = el('div', 'agent' + (sel === a.npub ? ' sel' : ''));
     const nm = el('div', 'nm', a.name || '(unnamed)');
     nm.append(el('span', 'badge ' + (a.ratified ? 'rat' : 'unrat'), a.ratified ? 'ratified' : 'unratified'));
+    nm.append(el('span', 'badge ' + (a.active ? 'live' : 'unrat'), a.active ? 'active' : 'inactive'));
     if (running.has(a.npub)) nm.append(el('span', 'badge live', 'listening'));
     card.append(nm, el('div', 'np', a.npub), el('div', 'np', a.log_entries + ' log entries'));
     card.onclick = () => { sel = a.npub; render(); loadRoster(); };
@@ -160,6 +172,26 @@ async function renderOverview(c) {
   idSec.append(kv('ratified', d.ratified ? 'yes — constitution in force' : 'NO — nothing runs unratified'));
   idSec.append(kv('manifest sha256', d.manifest_sha256));
   c.append(idSec);
+
+  const roster = agents.find(a => a.npub === sel) || {};
+  const actSec = section('Activation',
+    'Host-local operator switch — deliberately not part of the constitution. While ACTIVE, this host supervises the agent’s declared standing presence: if the manifest declares presence.buzz, the mention listener runs, restarts if it dies, and stops on deactivation. Inactive agents hold no standing presence; one-shot runs stay available either way.');
+  actSec.append(kv('state', roster.active ? 'ACTIVE' : 'inactive'));
+  actSec.append(kv('presence.buzz', roster.buzz_declared ? 'declared in manifest — supervised' : 'not declared — nothing to supervise (see the Manifest field guide)'));
+  const actRow = el('div', 'row');
+  const actBtn = el('button', 'btn' + (roster.active ? ' danger' : ' solid'), roster.active ? 'DEACTIVATE' : 'ACTIVATE');
+  const actSt = el('span', 'meta', '');
+  actRow.append(actBtn, actSt);
+  actSec.append(actRow);
+  actBtn.onclick = async () => {
+    const r = await j(api('/active'), {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ active: !roster.active }),
+    });
+    actSt.textContent = r.ok ? r.note : 'failed: ' + r.error;
+    await loadRoster(); render();
+  };
+  c.append(actSec);
 
   const govSec = section('Governance',
     'Suspend keys are the human governors: only they ratify, and any of them can suspend. Ratification = the agent signs its manifest hash AND a suspend-key holder countersigns; both land in the public log. Editing the manifest changes the hash, which suspends the agent until re-ratified.');
@@ -374,6 +406,7 @@ async function renderManifest(c) {
     ['memory.log', 'default tier for new log entries: public | self | local'],
     ['memory.index', 'semantic index location (local)'],
     ['memory.log_relays[]', 'nostr relays the log publishes to (tier-enforced)'],
+    ['presence.buzz', 'standing workspace membership: {relay, trigger?}. Constitutional — where the agent lives is ratified. While the agent is ACTIVE (Overview), the host supervises its mention listener.'],
     ['governance.suspend_keys[]', 'human governor npubs — ratifiers; at least one required'],
     ['governance.budgets.tokens_per_day', 'hard daily token ceiling, enforced by atomic reservations'],
     ['lease', 'which host runs the agent: relay-event heartbeats, takeover policy (contested-human = a person resolves disputes), timings'],
@@ -556,7 +589,9 @@ async function renderBuzz(c) {
   };
 
   const lisSec = section('Mention listener',
-    'The agent as a teammate: watches every channel and answers @mentions through the governed run path — ratification required, channel text framed as untrusted DATA, budget-capped, every mention logged. Replies carry no p-tag so two listening agents can never trigger each other into a loop. Runs inside this host process; stopping the host stops it.');
+    'The agent as a teammate: watches every channel and answers @mentions through the governed run path — ratification required, channel text framed as untrusted DATA, budget-capped, every mention logged. Replies carry no p-tag so two listening agents can never trigger each other into a loop. Declare presence.buzz in the manifest and activate the agent (Overview) for supervised presence: started automatically, restarted if it dies, stopped on deactivation. The buttons below are the manual override.');
+  const supNote = el('div', 'kv');
+  lisSec.append(supNote);
   const trigIn = el('input'); trigIn.placeholder = 'trigger (default @name)';
   const startBtn = el('button', 'btn solid', 'START');
   const stopBtn = el('button', 'btn danger', 'STOP');
@@ -569,6 +604,10 @@ async function renderBuzz(c) {
   const pollListener = async () => {
     const r = await j(api('/listener'));
     if (!r.ok) return;
+    supNote.replaceChildren(el('span', 'k', 'supervision'), el('span', 'v',
+      r.declared_relay
+        ? (r.active ? `presence.buzz → ${r.declared_relay} · agent ACTIVE — supervisor keeps this running` : `presence.buzz → ${r.declared_relay} · agent INACTIVE — activate in Overview to start`)
+        : 'no presence.buzz declared — manual control only'));
     if (r.running) {
       lSt.textContent = `running on ${r.relay} · trigger ${r.trigger}`;
       lLines.style.display = 'block';

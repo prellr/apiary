@@ -61,6 +61,7 @@ async fn main() {
         token: None,
         listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
+    apiary_hostd::ops::spawn_supervisor(state.clone());
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(&args.bind)
         .await

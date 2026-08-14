@@ -151,6 +151,23 @@ fn default_index() -> String {
 pub struct Presence {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agui: Option<AguiPresence>,
+    /// Standing Buzz-workspace membership. Declared here because WHERE the
+    /// agent lives is constitutional — adding or moving a workspace is an
+    /// amendment a human ratifies. The host supervises the listener while
+    /// the agent is active (activation itself is host-local operational
+    /// state, not part of the constitution).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buzz: Option<BuzzPresence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuzzPresence {
+    /// The workspace relay (wss://…).
+    pub relay: String,
+    /// Mention trigger text; defaults to "@" + the agent's stored name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

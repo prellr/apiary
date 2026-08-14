@@ -106,8 +106,11 @@ The window covers the whole surface, each section with inline explanations:
 - **Manifest** — YAML editor with a field guide, save-amendment →
   auto-suspend → ratify cycle, and external ratification (export the
   unsigned event, sign with your own tooling, import)
-- **Buzz** — profile, channel discovery/read/post/join, and the managed
-  mention listener (start/stop, live activity)
+- **Buzz** — profile, channel discovery/read/post/join, and the mention
+  listener. Declare `presence.buzz: {relay}` in the manifest (constitutional
+  — where the agent lives is ratified) and activate the agent: the host's
+  supervisor starts the listener, restarts it if it dies, and stops it on
+  deactivation. Manual start/stop remains as an override.
 - **Credentials** — NIP-44 seal/open against the agent's key
 - **Header** — host status, keystore lock/unlock (passphrase never touches
   disk), npub⇄hex key tool
