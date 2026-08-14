@@ -1,0 +1,22 @@
+[package]
+name = "apiary-hostd"
+description = "Apiary host daemon: REST + AG-UI SSE + cockpit (SPEC §2 — the GUI is a client)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "apiary-hostd"
+path = "src/main.rs"
+
+[dependencies]
+apiary-core = { path = "../apiary-core" }
+apiary-runtime = { path = "../apiary-runtime" }
+nostr.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tokio-stream = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+base64 = "0.22"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/apiary-core", "crates/apiary-runtime", "crates/apiary-cli"]
+members = ["crates/apiary-core", "crates/apiary-runtime", "crates/apiary-cli", "crates/apiary-hostd"]
 
 [workspace.package]
 version = "0.1.0"

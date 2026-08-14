@@ -22,6 +22,20 @@ pub struct RunOutcome {
     pub log_event_id: String,
 }
 
+/// Stage-boundary events for observers (the AG-UI stream, the cockpit).
+/// Coarse-grained on purpose: sign checkpoints, stream observations —
+/// the log stays the source of truth; this is a live window onto it.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RunEvent {
+    Started { slot: String, model: String },
+    ToolCallStarted { name: String, args: serde_json::Value },
+    ToolCallFinished { name: String, ok: bool, detail: String },
+    Finished { outcome: String, text: String, input_tokens: u64, output_tokens: u64 },
+}
+
+pub type Observer<'a> = &'a (dyn Fn(RunEvent) + Send + Sync);
+
 /// How many recent log entries hydrate the working set.
 const MEMORY_TAIL: usize = 12;
 
@@ -33,6 +47,24 @@ pub fn run_task(
     task: &str,
     ctx: &TaskContext,
 ) -> Result<RunOutcome, crate::Error> {
+    run_task_observed(manifest, agent_dir, custody, agent, task, ctx, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_task_observed(
+    manifest: &Manifest,
+    agent_dir: &Path,
+    custody: &Custody,
+    agent: &AgentHandle,
+    task: &str,
+    ctx: &TaskContext,
+    observer: Option<Observer>,
+) -> Result<RunOutcome, crate::Error> {
+    let emit = |e: RunEvent| {
+        if let Some(f) = observer {
+            f(e)
+        }
+    };
     let log = EpisodicLog::open(agent_dir);
     let ledger = SpendLedger::open(agent_dir);
 
@@ -72,6 +104,8 @@ pub fn run_task(
     };
     let provider = bind(&slot.provider, credential)?;
 
+    emit(RunEvent::Started { slot: slot_name.clone(), model: model.clone() });
+
     // 4. Hydrate the working set: constitution + recency tail + semantic
     //    retrieval, all framed with provenance (memory is DATA, never
     //    instructions — SPEC §12.4, Phase 1 scope).
@@ -87,6 +121,7 @@ pub fn run_task(
         let tool_defs: Vec<crate::connector::ToolDef> =
             connectors.iter().map(|c| c.def()).collect();
         let mut dispatch = |name: &str, args: &serde_json::Value| {
+            emit(RunEvent::ToolCallStarted { name: name.into(), args: args.clone() });
             let connector = connectors
                 .iter()
                 .find(|c| c.def().name == name)
@@ -94,6 +129,14 @@ pub fn run_task(
                     crate::Error::Provider(format!("model requested unknown tool '{name}'"))
                 })?;
             let result = connector.execute(custody, agent, args);
+            emit(RunEvent::ToolCallFinished {
+                name: name.into(),
+                ok: result.is_ok(),
+                detail: match &result {
+                    Ok(r) => r.chars().take(200).collect(),
+                    Err(e) => e.to_string(),
+                },
+            });
             log.append(
                 custody,
                 agent,
@@ -138,6 +181,13 @@ pub fn run_task(
         },
     )?;
     ledger.record(completion.input_tokens, completion.output_tokens)?;
+
+    emit(RunEvent::Finished {
+        outcome: completion.outcome.clone(),
+        text: completion.text.clone(),
+        input_tokens: completion.input_tokens,
+        output_tokens: completion.output_tokens,
+    });
 
     Ok(RunOutcome {
         completion,
