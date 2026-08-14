@@ -36,6 +36,10 @@ pub struct ListenerHandle {
     pub trigger: String,
     pub started_at: u64,
     pub lines: Arc<Mutex<VecDeque<String>>>,
+    /// Hash of the manifest the listener started under. The supervisor
+    /// stops the listener when the on-disk manifest diverges — a running
+    /// listener must never keep acting under a superseded constitution.
+    pub manifest_sha: String,
 }
 
 fn push_line(lines: &Mutex<VecDeque<String>>, line: String) {
@@ -1013,6 +1017,7 @@ pub async fn ensure_listener(
         trigger: trigger.clone(),
         started_at: now_secs(),
         lines: lines.clone(),
+        manifest_sha: ceremony::manifest_hash(&raw),
     };
     let relay2 = relay.to_string();
     let trigger2 = trigger.clone();
@@ -1242,19 +1247,34 @@ async fn reconcile(state: &App, last_attempt: &mut std::collections::HashMap<Str
     for npub in agents {
         let dir = ks.agent_dir(&npub);
         let active = is_active(&dir);
+        let disk_sha = std::fs::read_to_string(dir.join("manifest.yaml"))
+            .ok()
+            .map(|raw| ceremony::manifest_hash(&raw));
         let running = {
             let mut map = state.listeners.lock().unwrap_or_else(|e| e.into_inner());
             match map.get(&npub) {
                 Some(l) if !l.done.load(Ordering::Relaxed) => {
-                    if active {
-                        true
-                    } else {
+                    if !active {
                         // Inactive agents hold no standing presence, however
                         // the listener was started.
                         if let Some(l) = map.remove(&npub) {
                             l.stop.store(true, Ordering::Relaxed);
                         }
                         continue;
+                    } else if disk_sha.as_deref() != Some(l.manifest_sha.as_str()) {
+                        // Constitution changed under a live listener: stop it.
+                        // ensure_listener refuses to restart until the new
+                        // manifest is ratified, then brings it back with the
+                        // new capabilities bound.
+                        eprintln!(
+                            "supervisor: manifest changed for {npub} — stopping listener pending re-ratification"
+                        );
+                        if let Some(l) = map.remove(&npub) {
+                            l.stop.store(true, Ordering::Relaxed);
+                        }
+                        continue;
+                    } else {
+                        true
                     }
                 }
                 Some(_) => {
@@ -1294,4 +1314,260 @@ async fn reconcile(state: &App, last_attempt: &mut std::collections::HashMap<Str
             ),
         }
     }
+}
+
+// ---------------------------------------------------------------- connectors
+
+/// The host connector library: named, reusable connector CONFIGURATIONS
+/// (kind + caps), stored host-side in connectors.yaml. Deliberately no
+/// secrets — a credential is sealed per-agent at grant time, because NIP-44
+/// blobs bind to one key and a library secret would be a shared secret.
+///
+/// Granting copies a library entry into an agent's manifest connectors[]
+/// (sealing a credential to that agent if provided). That edit changes the
+/// manifest hash, so every grant is ratified by a human — and because the
+/// grant lives in the manifest, it travels with the agent: portability
+/// includes capabilities and their sealed credentials. The destination
+/// host must merely bind the kind (BOUND_KINDS); an unbindable declared
+/// connector fails loudly at run start.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+pub struct ConnectorLibrary {
+    #[serde(default)]
+    pub connectors: Vec<LibraryEntry>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct LibraryEntry {
+    /// Human label, unique in the library ("publish-main").
+    pub name: String,
+    /// Connector kind the host binds ("nostr-publish").
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub caps: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+fn library_path(state: &AppState) -> std::path::PathBuf {
+    state.home.join("connectors.yaml")
+}
+
+fn load_library(state: &AppState) -> Result<ConnectorLibrary, Resp> {
+    let p = library_path(state);
+    if !p.exists() {
+        return Ok(ConnectorLibrary::default());
+    }
+    let raw = std::fs::read_to_string(&p).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    serde_yaml::from_str(&raw).map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("connectors.yaml: {e}"),
+        )
+    })
+}
+
+pub async fn connectors_get(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let pq = uri
+        .path_and_query()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| uri.path().to_string());
+    if let Err(e) = nip98::check(&state, &headers, "GET", &pq, None) {
+        return e.into_response();
+    }
+    match load_library(&state) {
+        Ok(lib) => Json(json!({
+            "ok": true,
+            "library": lib.connectors,
+            "host_binds": apiary_runtime::connector::BOUND_KINDS,
+        }))
+        .into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct LibraryBody {
+    library: Vec<LibraryEntry>,
+}
+
+pub async fn connectors_put(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let pq = uri
+        .path_and_query()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| uri.path().to_string());
+    if let Err(e) = nip98::check(&state, &headers, "PUT", &pq, Some(&raw_body)) {
+        return e.into_response();
+    }
+    let body: LibraryBody = match serde_json::from_slice(&raw_body) {
+        Ok(b) => b,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let mut seen = std::collections::HashSet::new();
+    for e2 in &body.library {
+        if e2.name.trim().is_empty() {
+            return err(StatusCode::BAD_REQUEST, "library entry with empty name").into_response();
+        }
+        if !seen.insert(e2.name.clone()) {
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!("duplicate library name '{}'", e2.name),
+            )
+            .into_response();
+        }
+        if !apiary_runtime::connector::BOUND_KINDS.contains(&e2.kind.as_str()) {
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "kind '{}' is not bindable by this host (host binds: {})",
+                    e2.kind,
+                    apiary_runtime::connector::BOUND_KINDS.join(", ")
+                ),
+            )
+            .into_response();
+        }
+    }
+    let lib = ConnectorLibrary {
+        connectors: body.library,
+    };
+    let yaml = match serde_yaml::to_string(&lib) {
+        Ok(y) => y,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    if let Err(e) = std::fs::write(library_path(&state), yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(json!({"ok": true, "count": lib.connectors.len()})).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct GrantBody {
+    /// Library entry name to grant.
+    name: String,
+    /// Optional secret to seal to THIS agent (API key etc.). Never stored
+    /// anywhere else — the sealed blob lands in the manifest.
+    #[serde(default)]
+    credential: Option<String>,
+}
+
+pub async fn connector_grant(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (ks, npub, dir, raw, mut manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    let body: GrantBody = match serde_json::from_slice(&raw_body) {
+        Ok(b) => b,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let lib = match load_library(&state) {
+        Ok(l) => l,
+        Err(e) => return e.into_response(),
+    };
+    let Some(entry) = lib.connectors.iter().find(|c| c.name == body.name) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("no library entry named '{}'", body.name),
+        )
+        .into_response();
+    };
+    // Seal the credential to THIS agent, if one was provided.
+    let credential = match body.credential.as_deref().filter(|c| !c.is_empty()) {
+        None => None,
+        Some(secret) => {
+            let pass = match require_pass(&state) {
+                Ok(p) => p,
+                Err(e) => return e.into_response(),
+            };
+            let npub2 = npub.clone();
+            let secret = secret.to_string();
+            let sealed = tokio::task::spawn_blocking(move || {
+                let (custody, handle) = admit(&ks, &npub2, &pass)?;
+                custody
+                    .seal(&handle, secret.trim_end())
+                    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+            })
+            .await
+            .unwrap_or_else(|e| Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)));
+            match sealed {
+                Ok(blob) => Some(blob),
+                Err(e) => return e.into_response(),
+            }
+        }
+    };
+    // Upsert by kind: one manifest entry per connector kind.
+    manifest.connectors.retain(|c| c.kind != entry.kind);
+    manifest.connectors.push(apiary_core::manifest::Connector {
+        kind: entry.kind.clone(),
+        credential,
+        caps: entry.caps.clone(),
+    });
+    let yaml = match serde_yaml::to_string(&manifest) {
+        Ok(y) => y,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    let _ = raw; // superseded
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "granted": entry.name,
+        "kind": entry.kind,
+        "manifest_sha256": ceremony::manifest_hash(&yaml),
+        "ratified": false,
+        "note": "grant written to the manifest — a capability change is an amendment; re-ratify before the agent runs again",
+    }))
+    .into_response()
+}
+
+pub async fn connector_revoke(
+    State(state): State<App>,
+    AxPath((npub, kind)): AxPath<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "DELETE", &uri, None, &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    let before = manifest.connectors.len();
+    manifest.connectors.retain(|c| c.kind != kind);
+    if manifest.connectors.len() == before {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("agent has no '{kind}' connector"),
+        )
+        .into_response();
+    }
+    let yaml = match serde_yaml::to_string(&manifest) {
+        Ok(y) => y,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "revoked": kind,
+        "manifest_sha256": ceremony::manifest_hash(&yaml),
+        "ratified": false,
+        "note": "revocation is an amendment too — re-ratify. Until then the agent cannot run at all.",
+    }))
+    .into_response()
 }

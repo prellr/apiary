@@ -21,3 +21,4 @@ tokio-stream = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 base64 = "0.22"
 sha2 = "0.10"
+serde_yaml.workspace = true

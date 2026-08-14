@@ -153,6 +153,7 @@ async function render() {
   if (tab === 'log') return renderLog(c);
   if (tab === 'manifest') return renderManifest(c);
   if (tab === 'buzz') return renderBuzz(c);
+  if (tab === 'connectors') return renderConnectors(c);
   if (tab === 'creds') return renderCreds(c);
 }
 
@@ -226,6 +227,7 @@ async function renderOverview(c) {
     'Everything the agent can touch is a connector, declared here and default-deny at runtime. Credentials are NIP-44-sealed to the agent’s own key (see the Credentials tab) — a manifest dump is not a credential dump.');
   for (const con of (m.connectors || [])) conSec.append(kv(con.name || con.type || '?', JSON.stringify(con.caps || {})));
   if (!(m.connectors || []).length) conSec.append(kv('connectors', 'none — the agent can think and speak, not act'));
+  conSec.append(help('Grant and revoke in the Connectors tab: definitions are configured once at host level, grants are per-agent manifest amendments (ratified, portable).'));
   c.append(conSec);
 
   const mem = m.memory || {};
@@ -423,7 +425,7 @@ async function renderManifest(c) {
     ['routing.default', 'slot used when no rule matches'],
     ['routing.rules[]', 'per-task-class slot choices, e.g. {class: reasoning, use: workhorse}'],
     ['routing.floors[]', 'human-owned clamps, e.g. {data_class: sensitive, require_provider: ollama} — routing may be stricter than a floor, never looser'],
-    ['connectors[]', 'what the agent may touch, default-deny. Each entry: {name, caps, credential?}. Credentials are NIP-44-sealed blobs (Credentials tab).'],
+    ['connectors[]', 'what the agent may touch, default-deny. Each entry: {type, caps, credential?}. Managed from the Connectors tab: host library holds configurations, grants are per-agent amendments with credentials sealed to this agent alone.'],
     ['memory.log', 'default tier for new log entries: public | self | local'],
     ['memory.index', 'semantic index location (local)'],
     ['memory.log_relays[]', 'nostr relays the log publishes to (tier-enforced)'],
@@ -655,6 +657,110 @@ async function renderBuzz(c) {
     const r = await j(api('/listener'), { method: 'DELETE' });
     lSt.textContent = r.ok ? 'stop signalled (≤15s)' : 'failed: ' + r.error;
     pollListener(); loadStatus(); loadRoster();
+  };
+}
+
+// ------------------------------------------------------------ connectors
+
+async function renderConnectors(c) {
+  c.append(help('Two layers. The HOST LIBRARY holds named connector configurations (kind + caps, no secrets) — configure once, assign to any agent. A GRANT copies one into this agent’s manifest, sealing any credential to this agent’s key alone. Grants are constitutional: each one changes the manifest hash and needs re-ratification, and each travels with the agent — portability includes capabilities and their sealed credentials. A destination host only needs to bind the kind; a declared kind it cannot bind fails loudly at run start.'));
+
+  const lib = await j('/api/connectors');
+  if (!lib.ok) { c.append(el('div', 'ev err', 'error: ' + lib.error)); return; }
+  const d = await j(api('/manifest'));
+  if (!d.ok) { c.append(el('div', 'ev err', 'error: ' + d.error)); return; }
+
+  // ---- this agent's grants
+  const gSec = section('This agent’s grants',
+    'What the manifest declares now. Revoking is an amendment too — until re-ratified the agent cannot run at all.');
+  const grants = (d.manifest.connectors || []);
+  if (!grants.length) gSec.append(kv('grants', 'none — the agent can think and speak, not act'));
+  for (const g of grants) {
+    const row = el('div', 'row');
+    row.append(el('span', 'v', `${g.type} · caps ${JSON.stringify(g.caps || {})} · credential ${g.credential ? 'sealed to this agent' : 'none'}`));
+    const rv = el('button', 'btn danger', 'REVOKE');
+    row.append(rv);
+    gSec.append(row);
+    rv.onclick = async () => {
+      const r = await j(api('/connectors/' + encodeURIComponent(g.type)), { method: 'DELETE' });
+      gStatus.textContent = r.ok ? `revoked ${g.type} — re-ratify in the Manifest tab` : 'failed: ' + r.error;
+      loadRoster(); render();
+    };
+  }
+  const gRow = el('div', 'row');
+  const gSel = el('select');
+  for (const e of (lib.library || [])) {
+    const o = el('option', null, `${e.name} (${e.kind})`);
+    o.value = e.name; gSel.append(o);
+  }
+  if (!(lib.library || []).length) gSel.append(el('option', null, 'library is empty — add below'));
+  const gCred = el('input', 'grow'); gCred.type = 'password';
+  gCred.placeholder = 'secret to seal to this agent (optional)';
+  const gGo = el('button', 'btn solid', 'GRANT');
+  const gStatus = el('span', 'meta', '');
+  gRow.append(gSel, gCred, gGo, gStatus);
+  gSec.append(gRow,
+    help('The secret (if any) is sealed with NIP-44 to this agent’s key at grant time and lands in the manifest as a blob — never stored anywhere else, unreadable by other agents or hosts.'));
+  c.append(gSec);
+  gGo.onclick = async () => {
+    if (!gSel.value) return;
+    gStatus.textContent = 'granting…';
+    const r = await j(api('/connectors'), {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: gSel.value, credential: gCred.value || null }),
+    });
+    gStatus.textContent = r.ok ? `granted ${r.kind} — re-ratify in the Manifest tab` : 'failed: ' + r.error;
+    gCred.value = '';
+    loadRoster(); if (r.ok) render();
+  };
+
+  // ---- host library
+  const lSec = section('Host connector library',
+    'Named configurations this host offers, stored in connectors.yaml under the state directory. No secrets live here. Kinds this host can bind: ' + (lib.host_binds || []).join(', ') + '.');
+  const entries = (lib.library || []).slice();
+  const list = el('div');
+  const drawList = () => {
+    list.replaceChildren();
+    if (!entries.length) list.append(kv('library', 'empty'));
+    entries.forEach((e, i) => {
+      const row = el('div', 'row');
+      row.append(el('span', 'v', `${e.name} · ${e.kind} · caps ${JSON.stringify(e.caps || {})}`));
+      const del = el('button', 'btn danger', 'REMOVE');
+      row.append(del);
+      del.onclick = async () => {
+        entries.splice(i, 1);
+        await saveLib();
+      };
+      list.append(row);
+    });
+  };
+  const nName = el('input'); nName.placeholder = 'name (e.g. publish-main)';
+  const nKind = el('select');
+  for (const k of (lib.host_binds || [])) { const o = el('option', null, k); o.value = k; nKind.append(o); }
+  const nCaps = el('input', 'grow'); nCaps.placeholder = 'caps JSON (e.g. {"relays":["wss://nos.lol"]})';
+  const nGo = el('button', 'btn', 'ADD TO LIBRARY');
+  const lStatus = el('span', 'meta', '');
+  const nRow = el('div', 'row'); nRow.append(nName, nKind, nCaps, nGo, lStatus);
+  lSec.append(list, nRow,
+    help('caps are the human-owned behavioral limits enforced host-side at every call — e.g. nostr-publish requires caps.relays, an allowlist of where the agent may publish. The model’s arguments are requests; caps are law.'));
+  c.append(lSec);
+  const saveLib = async () => {
+    const r = await j('/api/connectors', {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ library: entries }),
+    });
+    lStatus.textContent = r.ok ? `saved (${r.count} entries)` : 'rejected: ' + r.error;
+    if (r.ok) render();
+  };
+  drawList();
+  nGo.onclick = async () => {
+    let caps = {};
+    if (nCaps.value.trim()) {
+      try { caps = JSON.parse(nCaps.value); } catch { lStatus.textContent = 'caps is not valid JSON'; return; }
+    }
+    if (!nName.value.trim()) { lStatus.textContent = 'name required'; return; }
+    entries.push({ name: nName.value.trim(), kind: nKind.value, caps });
+    await saveLib();
   };
 }
 

@@ -106,6 +106,14 @@ The window covers the whole surface, each section with inline explanations:
 - **Manifest** — YAML editor with a field guide, save-amendment →
   auto-suspend → ratify cycle, and external ratification (export the
   unsigned event, sign with your own tooling, import)
+- **Connectors** — two layers: a host **connector library** of named
+  configurations (kind + caps, no secrets, `connectors.yaml`), and
+  per-agent **grants** that copy an entry into the agent's manifest with
+  any credential NIP-44-sealed to that agent alone. Grants are
+  constitutional (each one is a ratified amendment) and portable (they
+  travel in the manifest; a destination host only needs to bind the kind).
+  A live listener is bounced by the supervisor the moment its manifest
+  changes and returns only once re-ratified.
 - **Buzz** — profile, channel discovery/read/post/join, and the mention
   listener. Declare `presence.buzz: {relay}` in the manifest (constitutional
   — where the agent lives is ratified) and activate the agent: the host's

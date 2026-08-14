@@ -66,6 +66,10 @@ pub fn build_router(state: App) -> Router {
         .route("/api/unlock", post(ops::unlock))
         .route("/api/lock", post(ops::lock))
         .route("/api/key", get(ops::key_normalize))
+        .route(
+            "/api/connectors",
+            get(ops::connectors_get).put(ops::connectors_put),
+        )
         .route("/api/agents", get(list_agents))
         .route("/api/agents/found", post(found_agent))
         .route(
@@ -94,6 +98,11 @@ pub fn build_router(state: App) -> Router {
         .route("/api/agents/{npub}/buzz/profile", post(ops::buzz_profile))
         .route("/api/agents/{npub}/buzz/join", post(ops::buzz_join))
         .route("/api/agents/{npub}/active", post(ops::set_active))
+        .route("/api/agents/{npub}/connectors", post(ops::connector_grant))
+        .route(
+            "/api/agents/{npub}/connectors/{kind}",
+            axum::routing::delete(ops::connector_revoke),
+        )
         .route(
             "/api/agents/{npub}/listener",
             get(ops::listener_status)

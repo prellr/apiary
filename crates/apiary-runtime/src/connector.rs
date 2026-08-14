@@ -30,6 +30,10 @@ pub trait Connector {
     ) -> Result<String, crate::Error>;
 }
 
+/// The connector kinds this host can bind — the one list (README:
+/// "one list per concept"); bind_connectors and the API both read it.
+pub const BOUND_KINDS: &[&str] = &["nostr-publish", "mock-echo"];
+
 /// Build the agent's connector set from its manifest. Unknown kinds are an
 /// error, not a skip — a manifest declaring a capability the host can't
 /// bind should fail loudly at run start, not silently at dispatch.
@@ -60,7 +64,8 @@ pub fn bind_connectors(manifest: &Manifest) -> Result<Vec<Box<dyn Connector>>, c
             "mock-echo" => out.push(Box::new(MockEcho)),
             other => {
                 return Err(crate::Error::Provider(format!(
-                    "unknown connector kind '{other}' (host binds: nostr-publish, mock-echo)"
+                    "unknown connector kind '{other}' (host binds: {})",
+                    BOUND_KINDS.join(", ")
                 )))
             }
         }
