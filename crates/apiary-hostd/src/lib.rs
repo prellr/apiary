@@ -43,6 +43,9 @@ pub struct AppState {
     pub listeners: std::sync::Mutex<std::collections::HashMap<String, ops::ListenerHandle>>,
     /// In-flight OAuth grants, keyed by the `state` parameter.
     pub pending_oauth: std::sync::Mutex<std::collections::HashMap<String, ops::PendingOauth>>,
+    /// Last supervisor outcome per agent (contested lease, failed start…),
+    /// surfaced by the listener status endpoint.
+    pub supervisor_notes: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl AppState {
@@ -107,6 +110,11 @@ pub fn build_router(state: App) -> Router {
         )
         .route("/oauth/callback", get(ops::oauth_callback))
         .route("/api/agents/{npub}/name", post(ops::rename_agent))
+        .route("/api/agents/{npub}/lease", get(ops::lease_status))
+        .route(
+            "/api/agents/{npub}/lease/takeover",
+            post(ops::lease_takeover),
+        )
         .route(
             "/api/agents/{npub}/connectors/{kind}",
             axum::routing::delete(ops::connector_revoke),

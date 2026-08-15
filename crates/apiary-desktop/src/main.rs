@@ -52,6 +52,7 @@ fn main() {
         token: Some(token.clone()),
         listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
         pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
+        supervisor_notes: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     std::thread::spawn(move || {

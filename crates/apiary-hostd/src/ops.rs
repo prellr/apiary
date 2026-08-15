@@ -1092,6 +1092,12 @@ pub async fn listener_status(
     };
     let active = is_active(&dir);
     let declared = m.presence.buzz.as_ref().map(|b| b.relay.clone());
+    let note = state
+        .supervisor_notes
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&npub)
+        .cloned();
     let map = state.listeners.lock().unwrap_or_else(|e| e.into_inner());
     match map.get(&npub) {
         Some(l) => {
@@ -1110,6 +1116,7 @@ pub async fn listener_status(
                 "lines": lines,
                 "active": active,
                 "declared_relay": declared,
+                "supervisor_note": note,
             }))
             .into_response()
         }
@@ -1119,6 +1126,7 @@ pub async fn listener_status(
             "running": false,
             "active": active,
             "declared_relay": declared,
+            "supervisor_note": note,
         }))
         .into_response(),
     }
@@ -1279,8 +1287,21 @@ async fn reconcile(state: &App, last_attempt: &mut std::collections::HashMap<Str
                     }
                 }
                 Some(_) => {
-                    // Finished thread: reap so a restart can happen below.
-                    map.remove(&npub);
+                    // Finished thread: reap so a restart can happen below,
+                    // keeping its last words (contested lease, crash) where
+                    // the GUI can see them.
+                    if let Some(dead) = map.remove(&npub) {
+                        if let Ok(q) = dead.lines.lock() {
+                            if let Some(last) = q.iter().rev().find(|l| l.contains("listener died"))
+                            {
+                                state
+                                    .supervisor_notes
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .insert(npub.clone(), last.clone());
+                            }
+                        }
+                    }
                     false
                 }
                 None => false,
@@ -1305,14 +1326,28 @@ async fn reconcile(state: &App, last_attempt: &mut std::collections::HashMap<Str
         }
         last_attempt.insert(npub.clone(), now);
         match ensure_listener(state, &npub, &buzz.relay, buzz.trigger.clone()).await {
-            Ok(_) => eprintln!("supervisor: started listener for {npub} on {}", buzz.relay),
-            Err((_, body)) => eprintln!(
-                "supervisor: could not start listener for {npub}: {}",
-                body.0
+            Ok(_) => {
+                eprintln!("supervisor: started listener for {npub} on {}", buzz.relay);
+                state
+                    .supervisor_notes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&npub);
+            }
+            Err((_, body)) => {
+                let msg = body
+                    .0
                     .get("error")
                     .and_then(|e| e.as_str())
                     .unwrap_or("unknown")
-            ),
+                    .to_string();
+                eprintln!("supervisor: could not start listener for {npub}: {msg}");
+                state
+                    .supervisor_notes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(npub.clone(), msg);
+            }
         }
     }
 }
@@ -2019,5 +2054,133 @@ pub async fn oauth_callback(
             ),
         ),
         Err(e) => callback_page("Grant failed", &e),
+    }
+}
+
+// ---------------------------------------------------------------- lease
+
+pub async fn lease_status(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, npub, _dir, _raw, manifest) = match gate(&state, &headers, "GET", &uri, None, &npub) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    let relays = manifest.memory.log_relays.clone();
+    let host = apiary_runtime::lease::host_id(&state.home);
+    if relays.is_empty() {
+        return Json(json!({
+            "ok": true,
+            "npub": npub,
+            "mechanism": "relay-event",
+            "coordinated": false,
+            "host_id": host,
+            "note": "no memory.log_relays declared — presence runs without cross-host coordination",
+        }))
+        .into_response();
+    }
+    let agent_hex = match apiary_core::identity::parse_npub(&npub) {
+        Ok(pk) => pk.to_hex(),
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let relays2 = relays.clone();
+    let view =
+        tokio::task::spawn_blocking(move || apiary_runtime::lease::fetch(&relays2, &agent_hex))
+            .await
+            .unwrap_or(None);
+    match view {
+        Some(l) => {
+            let expired = l.expired(now_secs());
+            Json(json!({
+                "ok": true,
+                "npub": npub,
+                "mechanism": "relay-event",
+                "coordinated": true,
+                "host_id": host,
+                "lease": {
+                    "holder": l.host,
+                    "ours": l.host == host,
+                    "seq": l.seq,
+                    "expires_at": l.expires_at,
+                    "expired": expired,
+                },
+            }))
+            .into_response()
+        }
+        None => Json(json!({
+            "ok": true,
+            "npub": npub,
+            "mechanism": "relay-event",
+            "coordinated": true,
+            "host_id": host,
+            "lease": null,
+        }))
+        .into_response(),
+    }
+}
+
+/// The human decision "contested-human" defers to: supersede a live foreign
+/// lease. The losing host yields at its next heartbeat; until then, up to
+/// one heartbeat interval of overlap is inherent to lease coordination.
+pub async fn lease_takeover(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (ks, npub, _dir, _raw, manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    let relays = manifest.memory.log_relays.clone();
+    if relays.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "no memory.log_relays — nothing to take over",
+        )
+        .into_response();
+    }
+    let pass = match require_pass(&state) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let host = apiary_runtime::lease::host_id(&state.home);
+    let expiry = manifest.lease.expiry_secs.max(20);
+    let agent_hex = match apiary_core::identity::parse_npub(&npub) {
+        Ok(pk) => pk.to_hex(),
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let npub2 = npub.clone();
+    let host2 = host.clone();
+    let out = tokio::task::spawn_blocking(move || -> Result<u64, Resp> {
+        let (custody, handle) = admit(&ks, &npub2, &pass)?;
+        apiary_runtime::lease::takeover(&custody, &handle, &relays, &agent_hex, &host2, expiry)
+            .map_err(|e| err(StatusCode::BAD_GATEWAY, e))
+    })
+    .await
+    .unwrap_or_else(|e| Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)));
+    match out {
+        Ok(seq) => {
+            // Clear any contested note so the supervisor retries promptly.
+            state
+                .supervisor_notes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&npub);
+            Json(json!({
+                "ok": true,
+                "npub": npub,
+                "host_id": host,
+                "seq": seq,
+                "note": "lease taken — this host's supervisor starts the listener within a tick; the previous host yields at its next heartbeat",
+            }))
+            .into_response()
+        }
+        Err(e) => e.into_response(),
     }
 }

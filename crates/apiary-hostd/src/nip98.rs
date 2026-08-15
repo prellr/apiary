@@ -151,6 +151,7 @@ mod tests {
             token: None,
             listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
             pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
+            supervisor_notes: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 

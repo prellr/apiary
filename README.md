@@ -106,6 +106,13 @@ The window covers the whole surface, each section with inline explanations:
 - **Manifest** — YAML editor with a field guide, save-amendment →
   auto-suspend → ratify cycle, and external ratification (export the
   unsigned event, sign with your own tooling, import)
+- **Lease** — standing presence is single-host: the running host
+  heartbeats an agent-signed lease event (kind 34601, replaceable) on the
+  agent's log relays; a second host refuses to start while a live foreign
+  lease exists and says whose it is. Takeover is `contested-human`: a
+  button a person presses (Overview → Lease), never something hosts do on
+  their own — the loser yields at its next heartbeat, bounding split-brain
+  to one heartbeat interval. Graceful stops release the lease immediately.
 - **MCP** — the `mcp` connector kind speaks the Model Context Protocol
   (revision 2026-07-28: stateless, per-request `_meta`, `server/discover`
   era probing) with automatic fallback to `initialize`-era servers — so

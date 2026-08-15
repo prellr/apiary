@@ -258,11 +258,40 @@ async function renderOverview(c) {
 
   const lease = m.lease || {};
   const leaseSec = section('Lease',
-    'Which host may run this agent. Heartbeats on a relay claim the lease; takeover policy "contested-human" means a second host cannot silently steal a live agent — a human decides.');
-  leaseSec.append(kv('mechanism', lease.mechanism));
-  leaseSec.append(kv('takeover', lease.takeover));
+    'Which host may run this agent’s standing presence. The running host heartbeats an agent-signed lease event on the log relays; a second host refuses to start while a live foreign lease exists. Takeover policy "contested-human": superseding a live lease is a button a person presses, never something hosts do on their own. One-shot runs are not lease-gated.');
+  leaseSec.append(kv('mechanism / takeover', (lease.mechanism || 'relay-event') + ' / ' + (lease.takeover || 'contested-human')));
   leaseSec.append(kv('heartbeat / expiry', (lease.heartbeat_secs || '—') + 's / ' + (lease.expiry_secs || '—') + 's'));
+  const leaseLine = kv('current lease', 'checking relays…');
+  leaseSec.append(leaseLine);
+  const toRow = el('div', 'row'); toRow.style.display = 'none';
+  const toBtn = el('button', 'btn danger', 'TAKE OVER (HUMAN DECISION)');
+  const toSt = el('span', 'meta', '');
+  toRow.append(toBtn, toSt);
+  leaseSec.append(toRow);
   c.append(leaseSec);
+  j(api('/lease')).then(lz => {
+    if (!lz.ok) { leaseLine.replaceChildren(el('span','k','current lease'), el('span','v','error: ' + lz.error)); return; }
+    if (!lz.coordinated) {
+      leaseLine.replaceChildren(el('span','k','current lease'), el('span','v', lz.note));
+      return;
+    }
+    if (!lz.lease) {
+      leaseLine.replaceChildren(el('span','k','current lease'), el('span','v', 'none on the relays — first active host claims it (this host: ' + lz.host_id + ')'));
+      return;
+    }
+    const l = lz.lease;
+    const until = new Date(l.expires_at * 1000).toLocaleTimeString();
+    let text;
+    if (l.ours) text = `held by THIS host (${l.holder}) · seq ${l.seq} · renews until ${until}`;
+    else if (l.expired) text = `expired lease from host ${l.holder} — this host may claim it freely`;
+    else { text = `HELD BY ANOTHER HOST (${l.holder}) · seq ${l.seq} · expires ${until}`; toRow.style.display = 'flex'; }
+    leaseLine.replaceChildren(el('span','k','current lease'), el('span','v', text));
+  });
+  toBtn.onclick = async () => {
+    toSt.textContent = 'taking over…';
+    const r = await j(api('/lease/takeover'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    toSt.textContent = r.ok ? r.note : 'failed: ' + r.error;
+  };
 
   const lisSec = section('Buzz listener',
     'When running, the agent answers @mentions in its Buzz workspace through the governed run path. Manage it in the Buzz tab. This line is live — it follows the supervisor.');
@@ -283,6 +312,8 @@ async function renderOverview(c) {
       lstat = 'waiting — keystore is locked; the supervisor starts the listener once unlocked.';
     } else if (!d.ratified) {
       lstat = 'waiting — manifest is not ratified; nothing runs unratified.';
+    } else if (l.supervisor_note) {
+      lstat = 'blocked — ' + l.supervisor_note;
     } else {
       lstat = `starting — presence.buzz declares ${l.declared_relay}; the supervisor starts it within ~10s (retries every 30s on failure).`;
     }
@@ -645,6 +676,7 @@ async function renderBuzz(c) {
     const r = await j(api('/listener'));
     if (!r.ok) return;
     supNote.replaceChildren(el('span', 'k', 'supervision'), el('span', 'v',
+      r.supervisor_note ? ('blocked — ' + r.supervisor_note) :
       r.declared_relay
         ? (r.active ? `presence.buzz → ${r.declared_relay} · agent ACTIVE — supervisor keeps this running` : `presence.buzz → ${r.declared_relay} · agent INACTIVE — activate in Overview to start`)
         : 'no presence.buzz declared — manual control only'));

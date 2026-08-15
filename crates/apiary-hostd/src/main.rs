@@ -61,6 +61,7 @@ async fn main() {
         token: None,
         listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
         pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
+        supervisor_notes: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
     apiary_hostd::ops::spawn_supervisor(state.clone());
     let app = build_router(state);

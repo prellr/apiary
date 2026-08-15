@@ -10,6 +10,7 @@ pub mod buzz;
 pub mod connector;
 pub mod index;
 pub mod inference;
+pub mod lease;
 pub mod mcp;
 pub mod publish;
 pub mod relay;

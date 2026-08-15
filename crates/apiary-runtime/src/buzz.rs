@@ -380,12 +380,13 @@ impl<'a> BuzzSession<'a> {
                 match self.recv() {
                     Ok(v) => v,
                     Err(crate::Error::Provider(msg)) if msg == "recv-timeout" => {
-                        // Quiet interval: ping. A dead socket fails the send
-                        // and the caller reconnects; a live one just answers.
+                        // Quiet interval: ping, then hand control back as a
+                        // TICK (Ok(None) with stop unset) so the caller can
+                        // do periodic work — lease heartbeats live there.
                         self.socket
                             .send(Message::Ping(Vec::new().into()))
                             .map_err(|e| crate::Error::Provider(format!("keepalive ping: {e}")))?;
-                        continue;
+                        return Ok(None);
                     }
                     Err(e) => return Err(e),
                 }
@@ -494,17 +495,115 @@ pub fn run_mention_service(
 ) -> Result<(), crate::Error> {
     use std::sync::atomic::Ordering;
     let log = apiary_core::log::EpisodicLog::open(agent_dir);
+    // ---- lease: standing presence is single-host (SPEC §8). The lease
+    // lives on the agent's log relays; without any, presence runs
+    // uncoordinated (loudly).
+    let lease_relays = manifest.memory.log_relays.clone();
+    let agent_hex = handle.pubkey().to_hex();
+    let home = agent_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| agent_dir.to_path_buf());
+    let host = crate::lease::host_id(&home);
+    let heartbeat_secs = manifest.lease.heartbeat_secs.max(10);
+    let expiry_secs = manifest.lease.expiry_secs.max(heartbeat_secs * 2);
+    let mut lease_seq: Option<u64> = None;
+    if lease_relays.is_empty() {
+        sink(
+            "lease: no memory.log_relays declared — running WITHOUT cross-host coordination".into(),
+        );
+    } else {
+        match crate::lease::claim(
+            custody,
+            handle,
+            &lease_relays,
+            &agent_hex,
+            &host,
+            expiry_secs,
+        )? {
+            crate::lease::Claim::Held { seq } => {
+                lease_seq = Some(seq);
+                sink(format!("lease claimed (host {host}, seq {seq})"));
+            }
+            crate::lease::Claim::Contested(l) => {
+                return Err(crate::Error::Provider(format!(
+                    "lease held by host {} (seq {}, expires in {}s) — this agent appears to be                      running elsewhere; takeover is a human decision (Overview → Lease)",
+                    l.host,
+                    l.seq,
+                    l.expires_at.saturating_sub(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs()
+                    ),
+                )));
+            }
+        }
+    }
+    let mut last_heartbeat = std::time::Instant::now();
+    // On any exit path with a held lease and a graceful stop, release it.
+    let finish = |custody: &Custody,
+                  handle: &AgentHandle,
+                  lease_seq: Option<u64>,
+                  sink: &mut dyn FnMut(String)| {
+        if let Some(seq) = lease_seq {
+            match crate::lease::release(custody, handle, &lease_relays, &host, seq) {
+                Ok(()) => sink("lease released".into()),
+                Err(e) => sink(format!("lease release failed ({e}) — expires naturally")),
+            }
+        }
+    };
     let mut session = BuzzSession::connect(relay, custody, handle)?;
     session.enable_keepalive(std::time::Duration::from_secs(15));
     let channels = channel_ids(&mut session)?;
     sink(format!("watching {} channels", channels.len()));
     loop {
         if stop.load(Ordering::Relaxed) {
+            finish(custody, handle, lease_seq, &mut sink);
             return Ok(());
+        }
+        // Lease heartbeat when due: read first (a foreign seq bump means a
+        // human moved the agent — yield), then renew.
+        if let Some(seq) = lease_seq {
+            if last_heartbeat.elapsed().as_secs() >= heartbeat_secs {
+                last_heartbeat = std::time::Instant::now();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                match crate::lease::fetch(&lease_relays, &agent_hex) {
+                    Some(l) if l.host != host && l.seq > seq => {
+                        sink(format!(
+                            "lease superseded by host {} (seq {}) — yielding",
+                            l.host, l.seq
+                        ));
+                        return Ok(());
+                    }
+                    _ => {
+                        if let Err(e) = crate::lease::publish(
+                            custody,
+                            handle,
+                            &lease_relays,
+                            &host,
+                            seq,
+                            now + expiry_secs,
+                        ) {
+                            sink(format!("lease heartbeat failed ({e}); retrying next tick"));
+                        }
+                    }
+                }
+            }
         }
         let mention = match session.next_mention(trigger, &channels, stop) {
             Ok(Some(m)) => m,
-            Ok(None) => return Ok(()),
+            Ok(None) => {
+                if stop.load(Ordering::Relaxed) {
+                    finish(custody, handle, lease_seq, &mut sink);
+                    return Ok(());
+                }
+                continue; // keepalive tick — heartbeat handled above
+            }
             Err(e) => {
                 // Dead or dropped connection: reconnect with backoff
                 // rather than dying (or hanging).
