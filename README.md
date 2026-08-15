@@ -64,13 +64,17 @@ model runs). What exists today:
   one heartbeat interval
 
 - **Native portability**: `agent export` packs manifest + NIP-49-locked
-  key + full signed log into one verified bundle; `agent import` refuses
+  key + full signed log + semantic index into one verified bundle — ALL
+  of the agent's memory travels, recall included; `agent import` refuses
   anything that fails key↔manifest agreement, a signature, the chain, or
   ratification, and arrivals are INACTIVE (the lease referees the
   switchover). `agent recover` rebuilds an agent from its relays alone —
   the manifest publishes as an addressable event (kind 34600) alongside
   the log, so npub + key + passphrase is enough to resurrect the agent
-  anywhere (local-tier entries stay home by design; gaps are reported)
+  anywhere (local-tier entries stay home by design; gaps are reported).
+  The index is unsigned derived data, so import verifies every row
+  against the signed log — a row whose text disagrees with its signed
+  entry is dropped, never trusted
 
 **The host** (`apiary-hostd`, `apiary-desktop`)
 

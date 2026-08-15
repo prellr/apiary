@@ -70,6 +70,22 @@ pub struct EntryBody {
     pub detail: Option<serde_json::Value>,
 }
 
+impl EntryBody {
+    /// The canonical text a log entry contributes to the semantic index.
+    /// ONE derivation, owned by core: the runtime indexes with it and
+    /// portability verifies imported index rows against it — an unsigned
+    /// index row that disagrees with the signed log is dropped.
+    pub fn index_text(&self) -> String {
+        let task = self
+            .detail
+            .as_ref()
+            .and_then(|d| d.get("task"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        format!("{} {} {}", self.action, self.outcome, task)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Cost {
     pub input_tokens: u64,

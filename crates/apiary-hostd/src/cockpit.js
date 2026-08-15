@@ -212,7 +212,7 @@ async function renderOverview(c) {
   c.append(actSec);
 
   const portSec = section('Portability',
-    'The agent IS manifest + key + signed log — this exports exactly that as one verified bundle. The key inside stays NIP-49-locked; share the passphrase out of band, never alongside the file. Import on the other host verifies the key, manifest, every signature, the chain, and ratification before anything lands; the agent arrives INACTIVE and the lease referees the switchover: export → import there → deactivate here → activate there.');
+    'The agent IS manifest + key + signed log + semantic index — this exports ALL of it as one verified bundle, recall included: the imported agent needs nothing rebuilt and no matching embedding model. The key inside stays NIP-49-locked; share the passphrase out of band, never alongside the file. Import on the other host verifies the key, manifest, every signature, the chain, and ratification before anything lands; the agent arrives INACTIVE and the lease referees the switchover: export → import there → deactivate here → activate there.');
   const pRow2 = el('div', 'row');
   const exBtn = el('button', 'btn', 'EXPORT BUNDLE');
   const exStat = el('span', 'meta', '');
@@ -221,7 +221,7 @@ async function renderOverview(c) {
   exBtn.onclick = async () => {
     exStat.textContent = 'exporting…';
     const r = await j(api('/export'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
-    exStat.textContent = r.ok ? `saved: ${r.path} (${r.log_entries} log entries)` : 'failed: ' + r.error;
+    exStat.textContent = r.ok ? `saved: ${r.path} (${r.log_entries} log entries, ${r.index_rows} index rows)` : 'failed: ' + r.error;
   };
   c.append(portSec);
 
@@ -950,7 +950,7 @@ document.getElementById('importgo').onclick = async () => {
     body: JSON.stringify({ bundle }),
   });
   st.textContent = r.ok
-    ? `imported ${r.name || r.npub.slice(0, 12)} · ${r.log_entries} log entries · ${r.ratified ? 'ratified' : 'NOT ratified'} — arrives inactive`
+    ? `imported ${r.name || r.npub.slice(0, 12)} · ${r.log_entries} log entries · ${r.index_rows} index rows${r.index_dropped ? ` (${r.index_dropped} dropped: disagreed with the signed log)` : ''} · ${r.ratified ? 'ratified' : 'NOT ratified'} — arrives inactive`
     : 'refused: ' + r.error;
   if (r.ok) { document.getElementById('i-bundle').value = ''; loadRoster(); }
 };

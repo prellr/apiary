@@ -52,6 +52,10 @@ pub fn export(agent_dir: &Path, npub: &str) -> Result<Value, crate::Error> {
     let published: Option<Value> = std::fs::read_to_string(agent_dir.join("published.json"))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok());
+    // ALL of the agent's memory travels: the signed log above and the
+    // semantic index here — recall included, nothing to rebuild, no
+    // dependency on the destination having the same embedding model.
+    let index_jsonl = std::fs::read_to_string(agent_dir.join("index.jsonl")).ok();
     Ok(json!({
         "apiary_export": EXPORT_VERSION,
         "exported_at": now_secs(),
@@ -61,6 +65,7 @@ pub fn export(agent_dir: &Path, npub: &str) -> Result<Value, crate::Error> {
         "key_ncryptsec": key_ncryptsec,
         "log": log_events,
         "published": published,
+        "index_jsonl": index_jsonl,
     }))
 }
 
@@ -69,6 +74,11 @@ pub struct ImportReport {
     pub name: String,
     pub log_entries: usize,
     pub ratified: bool,
+    /// Semantic-index rows accepted (verified against the signed log).
+    pub index_rows: usize,
+    /// Index rows dropped: unknown event id or text disagreeing with the
+    /// signed entry — an unsigned index never overrides the log.
+    pub index_dropped: usize,
     /// False only for gap-tolerant imports (relay recovery without the
     /// local tier).
     pub chain_intact: bool,
@@ -181,6 +191,43 @@ pub fn import_with_options(
         write("name", &name)?;
     }
     write("log.jsonl", &(lines.join("\n") + "\n"))?;
+    // Semantic index: unsigned derived data, so every row is checked
+    // against the signed log — the event id must exist and the text must
+    // equal what that entry derives. Disagreeing rows are dropped, not
+    // trusted; a missing index just rebuilds on the next run.
+    let mut index_rows = 0usize;
+    let mut index_dropped = 0usize;
+    if let Some(index_raw) = bundle.get("index_jsonl").and_then(Value::as_str) {
+        let mut expected: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for line in &lines {
+            if let Ok(event) = Event::from_json(line.as_str()) {
+                if let Ok(body) = serde_json::from_str::<crate::log::EntryBody>(&event.content) {
+                    expected.insert(event.id.to_hex(), body.index_text());
+                }
+            }
+        }
+        let mut kept = Vec::new();
+        for line in index_raw.lines().filter(|l| !l.trim().is_empty()) {
+            let ok = serde_json::from_str::<Value>(line).ok().is_some_and(|row| {
+                row.get("event_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| expected.get(id))
+                    .is_some_and(|want| {
+                        row.get("text").and_then(Value::as_str) == Some(want.as_str())
+                    })
+            });
+            if ok {
+                kept.push(line.to_string());
+                index_rows += 1;
+            } else {
+                index_dropped += 1;
+            }
+        }
+        if !kept.is_empty() {
+            write("index.jsonl", &(kept.join("\n") + "\n"))?;
+        }
+    }
     if let Some(published) = bundle.get("published").filter(|v| !v.is_null()) {
         write("published.json", &published.to_string())?;
     }
@@ -211,6 +258,8 @@ pub fn import_with_options(
         name,
         log_entries: entries,
         ratified,
+        index_rows,
+        index_dropped,
         chain_intact,
     })
 }

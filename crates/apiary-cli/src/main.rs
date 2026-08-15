@@ -408,6 +408,8 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                     "name": report.name,
                     "log_entries": report.log_entries,
                     "ratified": report.ratified,
+                    "index_rows": report.index_rows,
+                    "index_dropped": report.index_dropped,
                     "note": "imported INACTIVE — activate to run standing presence; the lease referees any host overlap",
                 }))
             }

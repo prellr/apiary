@@ -2232,6 +2232,7 @@ pub async fn export_agent(
         "npub": npub,
         "path": file.display().to_string(),
         "log_entries": bundle["log"].as_array().map(|a| a.len()).unwrap_or(0),
+        "index_rows": bundle["index_jsonl"].as_str().map(|s| s.lines().count()).unwrap_or(0),
         "note": "the key inside stays NIP-49-locked — share the passphrase out of band, never alongside the file",
     }))
     .into_response()
@@ -2277,6 +2278,8 @@ pub async fn import_agent(
             "name": r.name,
             "log_entries": r.log_entries,
             "ratified": r.ratified,
+            "index_rows": r.index_rows,
+            "index_dropped": r.index_dropped,
             "note": "imported INACTIVE — activate in Overview to run standing presence; the lease referees any host overlap",
         }))
         .into_response(),

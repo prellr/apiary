@@ -125,13 +125,7 @@ pub struct Hit {
 }
 
 fn entry_text(body: &EntryBody) -> String {
-    let task = body
-        .detail
-        .as_ref()
-        .and_then(|d| d.get("task"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
-    format!("{} {} {}", body.action, body.outcome, task)
+    body.index_text()
 }
 
 impl SemanticIndex {
