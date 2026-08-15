@@ -2195,6 +2195,10 @@ pub struct ExportBody {
     /// keystore passphrase never travels). Empty/absent = verbatim copy.
     #[serde(default)]
     export_passphrase: Option<String>,
+    /// Seal the whole bundle to this recipient key (npub or hex) as a
+    /// signed kind-4602 envelope. Mutually exclusive with the passphrase.
+    #[serde(default)]
+    to_npub: Option<String>,
 }
 
 pub async fn export_agent(
@@ -2211,6 +2215,70 @@ pub async fn export_agent(
         };
     let body: ExportBody = serde_json::from_slice(&raw_body).unwrap_or_default();
     let export_pass = body.export_passphrase.filter(|p| !p.is_empty());
+    let to_npub = body.to_npub.filter(|p| !p.is_empty());
+    if export_pass.is_some() && to_npub.is_some() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "choose ONE: a handoff passphrase or a recipient npub, not both",
+        )
+        .into_response();
+    }
+    if let Some(recipient) = &to_npub {
+        let recipient_pk = match apiary_core::identity::parse_npub(recipient) {
+            Ok(pk) => pk,
+            Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+        };
+        let Some(session_pass) = state.passphrase_clone() else {
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unlock the keystore first — sealing signs with the agent's key",
+            )
+            .into_response();
+        };
+        let dir2 = dir.clone();
+        let npub2 = npub.clone();
+        let sealed = tokio::task::spawn_blocking(move || {
+            apiary_core::portability::seal(&dir2, &npub2, &session_pass, &recipient_pk)
+        })
+        .await
+        .unwrap_or_else(|e| Err(apiary_core::Error::Keystore(e.to_string())));
+        let envelope = match sealed {
+            Ok(v) => v,
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        };
+        let exports = state.home.join("exports");
+        if let Err(e) = std::fs::create_dir_all(&exports) {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+        let name = std::fs::read_to_string(dir.join("name"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let file = exports.join(format!(
+            "{}-{}.apiary-sealed.json",
+            if name.is_empty() { &npub[..16] } else { &name },
+            now_secs()
+        ));
+        if let Err(e) = std::fs::write(
+            &file,
+            serde_json::to_string_pretty(&envelope).unwrap_or_default(),
+        ) {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
+        }
+        return Json(json!({
+            "ok": true,
+            "npub": npub,
+            "path": file.display().to_string(),
+            "sealed_to": recipient,
+            "note": "sealed kind-4602 envelope — only that key can open it; the whole bundle is signed by the agent, so any tampering or truncation is detectable. Safe to send over any channel.",
+        }))
+        .into_response();
+    }
     let bundle = match &export_pass {
         Some(ep) => {
             let Some(session_pass) = state.passphrase_clone() else {
@@ -2287,6 +2355,10 @@ pub struct ImportBody {
     /// for handoff. Absent = the bundle uses this keystore's passphrase.
     #[serde(default)]
     bundle_passphrase: Option<String>,
+    /// For sealed envelopes: which keystore-held key receives (default:
+    /// the envelope's p tag, if that key is held here).
+    #[serde(default)]
+    as_npub: Option<String>,
 }
 
 pub async fn import_agent(
@@ -2313,13 +2385,14 @@ pub async fn import_agent(
     let home = state.home.clone();
     let out = tokio::task::spawn_blocking(move || {
         let ks = Keystore::open(&home).map_err(|e| e.to_string())?;
-        let bundle_pass = body
-            .bundle_passphrase
-            .as_deref()
-            .filter(|p| !p.is_empty())
-            .unwrap_or(&pass);
-        apiary_core::portability::import(&ks, &body.bundle, bundle_pass, &pass)
-            .map_err(|e| e.to_string())
+        apiary_core::portability::import_any(
+            &ks,
+            &body.bundle,
+            body.bundle_passphrase.as_deref().filter(|p| !p.is_empty()),
+            &pass,
+            body.as_npub.as_deref().filter(|p| !p.is_empty()),
+        )
+        .map_err(|e| e.to_string())
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()));

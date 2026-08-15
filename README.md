@@ -70,7 +70,12 @@ model runs). What exists today:
   disposable handoff secret, so an agent can be GIVEN to someone else:
   your keystore passphrase never travels, and their host re-encrypts
   under their own passphrase on arrival (the key lets them act as the
-  agent; amending its constitution still requires a listed suspend key); `agent import` refuses
+  agent; amending its constitution still requires a listed suspend key).
+  With `--to <npub>`, the whole bundle is SEALED instead: one kind-4602
+  event signed by the agent's own key and NIP-44-encrypted to the
+  recipient — no secret in flight, tamper- and truncation-evident,
+  local-tier memory confidential in transit, safe to send over any
+  channel. Three modes, none required: plain / passphrase / sealed; `agent import` refuses
   anything that fails key↔manifest agreement, a signature, the chain, or
   ratification, and arrivals are INACTIVE (the lease referees the
   switchover). `agent recover` rebuilds an agent from its relays alone —

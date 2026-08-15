@@ -137,8 +137,13 @@ enum AgentCmd {
         /// the handoff secret for giving the agent to someone else. Your
         /// keystore passphrase never travels. Requires the keystore
         /// passphrase to unlock the key first.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "to")]
         export_passphrase: Option<String>,
+        /// Seal the whole bundle to a recipient's key (npub or hex): one
+        /// kind-4602 event signed by the agent, NIP-44-encrypted to the
+        /// recipient — no secret in flight, tamper-evident end to end.
+        #[arg(long)]
+        to: Option<String>,
     },
     /// Import a bundle on this host. Verifies key↔npub↔manifest agreement,
     /// every log signature, the chain, and ratification before anything
@@ -151,6 +156,10 @@ enum AgentCmd {
         /// arrival either way.
         #[arg(long)]
         bundle_passphrase: Option<String>,
+        /// For sealed envelopes: which keystore-held key is the recipient
+        /// (default: the key the envelope's p tag names, if held here).
+        #[arg(long = "as", value_name = "NPUB")]
+        as_key: Option<String>,
     },
     /// Rebuild an agent from its relays: the addressable manifest event
     /// (kind 34600) plus the published log, with the key supplied as an
@@ -391,18 +400,27 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                 npub,
                 out,
                 export_passphrase,
+                to,
             } => {
                 let npub = &normalize_key(npub)?;
-                let bundle = match export_passphrase {
-                    Some(export_pass) => {
-                        let keystore_pass = require_passphrase(cli)?;
-                        apiary_core::portability::export_with_passphrase(
-                            &ks.agent_dir(npub),
-                            npub,
-                            Some((keystore_pass, export_pass)),
-                        )?
-                    }
-                    None => apiary_core::portability::export(&ks.agent_dir(npub), npub)?,
+                let bundle = if let Some(recipient) = to {
+                    let keystore_pass = require_passphrase(cli)?;
+                    let recipient_pk = apiary_core::identity::parse_npub(recipient)?;
+                    apiary_core::portability::seal(
+                        &ks.agent_dir(npub),
+                        npub,
+                        keystore_pass,
+                        &recipient_pk,
+                    )?
+                } else if let Some(export_pass) = export_passphrase {
+                    let keystore_pass = require_passphrase(cli)?;
+                    apiary_core::portability::export_with_passphrase(
+                        &ks.agent_dir(npub),
+                        npub,
+                        Some((keystore_pass, export_pass)),
+                    )?
+                } else {
+                    apiary_core::portability::export(&ks.agent_dir(npub), npub)?
                 };
                 match out {
                     Some(path) => {
@@ -428,15 +446,17 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
             AgentCmd::Import {
                 file,
                 bundle_passphrase,
+                as_key,
             } => {
                 let passphrase = require_passphrase(cli)?;
-                let bundle: serde_json::Value =
+                let value: serde_json::Value =
                     serde_json::from_str(&std::fs::read_to_string(file)?)?;
-                let report = apiary_core::portability::import(
+                let report = apiary_core::portability::import_any(
                     &ks,
-                    &bundle,
-                    bundle_passphrase.as_deref().unwrap_or(passphrase),
+                    &value,
+                    bundle_passphrase.as_deref(),
                     passphrase,
+                    as_key.as_deref(),
                 )?;
                 Ok(json!({
                     "ok": true,

@@ -216,15 +216,19 @@ async function renderOverview(c) {
   const pRow2 = el('div', 'row');
   const exPass = el('input'); exPass.type = 'password';
   exPass.placeholder = 'handoff passphrase (optional)';
+  const exTo = el('input', 'grow'); exTo.placeholder = 'or seal to recipient npub (optional)';
   const exBtn = el('button', 'btn', 'EXPORT BUNDLE');
   const exStat = el('span', 'meta', '');
-  pRow2.append(exPass, exBtn, exStat);
-  portSec.append(pRow2, help('With a handoff passphrase, the traveling key is re-encrypted under it — your keystore passphrase never leaves this host, and the recipient re-encrypts under their own on import. Share the handoff passphrase out of band. To hand over governance too, first amend suspend_keys to include the recipient and ratify — the key lets them act AS the agent, only a listed suspend key can amend its constitution.'));
+  pRow2.append(exPass, exTo, exBtn, exStat);
+  portSec.append(pRow2, help('Three modes, none required: plain (for your own hosts), handoff passphrase (zero recipient setup — share the secret out of band), or SEALED to a recipient npub — a kind-4602 envelope signed by the agent and encrypted so only that key opens it: no secret in flight, tamper- and truncation-evident, safe over any channel. The recipient needs that key in their keystore. To hand over governance too, first amend suspend_keys to include the recipient and ratify — the key lets them act AS the agent, only a listed suspend key can amend its constitution.'));
   exBtn.onclick = async () => {
-    exStat.textContent = exPass.value ? 'unlocking + re-encrypting…' : 'exporting…';
-    const r = await j(api('/export'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ export_passphrase: exPass.value || null }) });
-    exPass.value = '';
-    exStat.textContent = r.ok ? `saved: ${r.path} (${r.log_entries} log entries, ${r.index_rows} index rows${r.handoff_passphrase ? ', handoff-locked' : ''})` : 'failed: ' + r.error;
+    if (exPass.value && exTo.value) { exStat.textContent = 'choose ONE: passphrase or npub'; return; }
+    exStat.textContent = (exPass.value || exTo.value) ? 'unlocking + sealing…' : 'exporting…';
+    const r = await j(api('/export'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ export_passphrase: exPass.value || null, to_npub: exTo.value.trim() || null }) });
+    exPass.value = ''; exTo.value = '';
+    exStat.textContent = r.ok
+      ? (r.sealed_to ? `sealed to ${r.sealed_to.slice(0, 16)}… → ${r.path}` : `saved: ${r.path} (${r.log_entries} log entries, ${r.index_rows} index rows${r.handoff_passphrase ? ', handoff-locked' : ''})`)
+      : 'failed: ' + r.error;
   };
   c.append(portSec);
 

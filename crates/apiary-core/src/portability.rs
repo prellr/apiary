@@ -303,3 +303,249 @@ pub fn import_with_options(
         chain_intact,
     })
 }
+
+// ---------------------------------------------------------------- sealed
+
+/// Sealed handoff event kind (see docs/SCOPE_sealed-handoffs.md).
+pub const HANDOFF_KIND: u16 = 4602;
+
+/// Seal an agent to a recipient's key: one kind-4602 nostr event, AUTHORED
+/// BY THE AGENT'S OWN KEY (the agent signs its own handoff), p-tagged to
+/// the recipient, content = NIP-44 ciphertext of the bundle. Inside the
+/// ciphertext the traveling key is locked under a one-time machine
+/// passphrase no human ever sees. No shared secret in flight; any
+/// truncation or omission breaks the envelope signature.
+pub fn seal(
+    agent_dir: &Path,
+    npub: &str,
+    keystore_passphrase: &str,
+    recipient: &PublicKey,
+) -> Result<Value, crate::Error> {
+    let fail = |msg: String| crate::Error::Keystore(format!("seal: {msg}"));
+    // One-time inner passphrase: 32 random bytes of hex, never displayed.
+    let otp = crate::identity::generate().secret_key().to_secret_hex();
+    let mut bundle = export_with_passphrase(agent_dir, npub, Some((keystore_passphrase, &otp)))?;
+    bundle["key_passphrase"] = json!(otp);
+    // The agent's key signs the envelope and performs the ECDH.
+    let ncryptsec = std::fs::read_to_string(agent_dir.join("key.ncryptsec"))
+        .map_err(|e| fail(e.to_string()))?;
+    let enc = EncryptedSecretKey::from_bech32(ncryptsec.trim())
+        .map_err(|e| fail(format!("parse ncryptsec: {e}")))?;
+    let keys = Keys::new(
+        enc.decrypt(keystore_passphrase)
+            .map_err(|e| fail(format!("keystore passphrase does not open the key: {e}")))?,
+    );
+    let ciphertext = nip44::encrypt(
+        keys.secret_key(),
+        recipient,
+        bundle.to_string(),
+        nip44::Version::V2,
+    )
+    .map_err(|e| fail(format!("nip44 encrypt: {e}")))?;
+    let event = EventBuilder::new(Kind::Custom(HANDOFF_KIND), ciphertext)
+        .tag(Tag::public_key(*recipient))
+        .finalize(&keys)
+        .map_err(|e| fail(format!("sign envelope: {e}")))?;
+    serde_json::from_str(&event.as_json()).map_err(|e| fail(e.to_string()))
+}
+
+/// Is this JSON a sealed handoff envelope (vs a plain bundle)?
+pub fn is_sealed(v: &Value) -> bool {
+    v.get("kind").and_then(Value::as_u64) == Some(HANDOFF_KIND as u64) && v.get("sig").is_some()
+}
+
+/// Open a sealed envelope with the recipient's keys. Verifies the envelope
+/// signature, the kind, that the p tag names this recipient, and the
+/// self-consistency rule: the envelope author must be the very npub inside
+/// the decrypted bundle — the agent being handed over signed the handoff.
+pub fn open_sealed(envelope: &Value, recipient: &Keys) -> Result<Value, crate::Error> {
+    let fail = |msg: String| crate::Error::Keystore(format!("sealed import: {msg}"));
+    let event = Event::from_json(envelope.to_string())
+        .map_err(|e| fail(format!("not a nostr event: {e}")))?;
+    if event.kind != Kind::Custom(HANDOFF_KIND) {
+        return Err(fail(format!(
+            "kind {} is not a handoff",
+            event.kind.as_u16()
+        )));
+    }
+    event
+        .verify()
+        .map_err(|_| fail("envelope signature does not verify".into()))?;
+    let addressed_to = event.tags.iter().find_map(|t| {
+        let s = t.as_slice();
+        (s.first().map(String::as_str) == Some("p")).then(|| s.get(1).cloned())?
+    });
+    if addressed_to.as_deref() != Some(recipient.public_key().to_hex().as_str()) {
+        return Err(fail(format!(
+            "envelope is addressed to {}, not to this key",
+            addressed_to.unwrap_or_else(|| "nobody".into())
+        )));
+    }
+    let plain = nip44::decrypt(recipient.secret_key(), &event.pubkey, &event.content)
+        .map_err(|e| fail(format!("decrypt failed — wrong recipient key? ({e})")))?;
+    let bundle: Value =
+        serde_json::from_str(&plain).map_err(|e| fail(format!("inner bundle: {e}")))?;
+    let inner_npub = bundle
+        .get("npub")
+        .and_then(Value::as_str)
+        .ok_or_else(|| fail("inner bundle has no npub".into()))?;
+    let inner_pk = crate::identity::parse_npub(inner_npub)?;
+    if inner_pk != event.pubkey {
+        return Err(fail(
+            "envelope author is not the agent inside — self-consistency failed".into(),
+        ));
+    }
+    Ok(bundle)
+}
+
+/// One import entry for every form: plain bundle (optionally
+/// handoff-locked) or sealed envelope, auto-detected. For sealed input the
+/// recipient key is resolved from the keystore by the envelope's p tag
+/// (`as_npub` overrides), and the inner one-time key passphrase is
+/// consumed automatically.
+pub fn import_any(
+    ks: &Keystore,
+    value: &Value,
+    bundle_passphrase: Option<&str>,
+    keystore_passphrase: &str,
+    as_npub: Option<&str>,
+) -> Result<ImportReport, crate::Error> {
+    let fail = |msg: String| crate::Error::Keystore(format!("import: {msg}"));
+    if !is_sealed(value) {
+        return import_with_options(
+            ks,
+            value,
+            bundle_passphrase.unwrap_or(keystore_passphrase),
+            keystore_passphrase,
+            true,
+        );
+    }
+    let addressed_to = value
+        .get("tags")
+        .and_then(Value::as_array)
+        .and_then(|tags| {
+            tags.iter().find_map(|t| {
+                let a = t.as_array()?;
+                (a.first()?.as_str()? == "p").then(|| a.get(1)?.as_str().map(String::from))?
+            })
+        })
+        .ok_or_else(|| fail("envelope has no recipient p tag".into()))?;
+    let recipient_npub = match as_npub {
+        Some(n) => {
+            let pk = crate::identity::parse_npub(n)?;
+            if pk.to_hex() != addressed_to {
+                return Err(fail(format!(
+                    "--as key does not match the envelope's recipient ({addressed_to})"
+                )));
+            }
+            crate::identity::to_npub(&pk)?
+        }
+        None => {
+            let want = crate::identity::to_npub(
+                &PublicKey::from_hex(&addressed_to)
+                    .map_err(|e| fail(format!("envelope p tag is not a public key: {e}")))?,
+            )?;
+            if !ks.list()?.contains(&want) {
+                return Err(fail(format!(
+                    "the envelope is sealed to {want}, and this keystore holds no such key — \
+                     import that key first, or check you are the intended recipient"
+                )));
+            }
+            want
+        }
+    };
+    let recipient_keys = ks.load(&recipient_npub, keystore_passphrase)?;
+    let bundle = open_sealed(value, &recipient_keys)?;
+    let otp = bundle
+        .get("key_passphrase")
+        .and_then(Value::as_str)
+        .ok_or_else(|| fail("sealed bundle carries no inner key passphrase".into()))?
+        .to_string();
+    import_with_options(ks, &bundle, &otp, keystore_passphrase, true)
+}
+
+#[cfg(test)]
+mod sealed_tests {
+    use super::*;
+
+    fn fixture(dir: &Path, pass: &str) -> (Keystore, String) {
+        let ks = Keystore::open(dir).unwrap();
+        let keys = crate::identity::generate();
+        let npub = crate::identity::to_npub(&keys.public_key()).unwrap();
+        ks.store(&keys, pass).unwrap();
+        // Suspension authority never rests with the agent's own key —
+        // the invariant holds even in fixtures.
+        let governor = crate::identity::to_npub(&crate::identity::generate().public_key()).unwrap();
+        let adir = ks.agent_dir(&npub);
+        std::fs::write(
+            adir.join("manifest.yaml"),
+            format!(
+                "manifest_version: 1\nidentity:\n  npub: {npub}\nmemory:\n  log: local\n  \
+                 index: local\ngovernance:\n  suspend_keys:\n  - {governor}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(adir.join("name"), "fixture").unwrap();
+        (ks, npub)
+    }
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("apiary-sealed-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn sealed_round_trip_and_refusals() {
+        let sender_home = tmp("sender");
+        let (ks, npub) = fixture(&sender_home, "sender-pass");
+        let recipient = crate::identity::generate();
+        let envelope = seal(
+            &ks.agent_dir(&npub),
+            &npub,
+            "sender-pass",
+            &recipient.public_key(),
+        )
+        .unwrap();
+        assert!(is_sealed(&envelope));
+
+        // Right key opens; self-consistency holds.
+        let bundle = open_sealed(&envelope, &recipient).unwrap();
+        assert_eq!(bundle["npub"].as_str().unwrap(), npub);
+        assert!(bundle["key_passphrase"].as_str().is_some());
+
+        // Wrong recipient key: refused at the p-tag gate.
+        let stranger = crate::identity::generate();
+        assert!(open_sealed(&envelope, &stranger).is_err());
+
+        // Tampered ciphertext: refused.
+        let mut tampered = envelope.clone();
+        let mut ct = tampered["content"].as_str().unwrap().to_string();
+        ct.replace_range(10..11, if &ct[10..11] == "A" { "B" } else { "A" });
+        tampered["content"] = json!(ct);
+        assert!(
+            Event::from_json(tampered.to_string()).is_err() || {
+                // signature breaks before decrypt is even attempted
+                open_sealed(&tampered, &recipient).is_err()
+            }
+        );
+
+        // Full import into the recipient's own keystore, THEIR passphrase.
+        let rx_home = tmp("rx");
+        let rx_ks = Keystore::open(&rx_home).unwrap();
+        let rx_npub = crate::identity::to_npub(&recipient.public_key()).unwrap();
+        rx_ks.store(&recipient, "rx-pass").unwrap();
+        let report = import_any(&rx_ks, &envelope, None, "rx-pass", None).unwrap();
+        assert_eq!(report.npub, npub);
+        // The stored key opens under the RECIPIENT's passphrase now.
+        assert!(rx_ks.load(&npub, "rx-pass").is_ok());
+        // Plain no-flag export still round-trips (nothing is required).
+        let _ = rx_npub;
+        let plain = export(&rx_ks.agent_dir(&npub), &npub);
+        assert!(plain.is_ok());
+
+        let _ = std::fs::remove_dir_all(&sender_home);
+        let _ = std::fs::remove_dir_all(&rx_home);
+    }
+}

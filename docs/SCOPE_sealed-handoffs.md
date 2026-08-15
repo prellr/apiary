@@ -31,15 +31,15 @@ Sealed imports add an envelope layer in front of the existing pipeline:
   
 
 What this closes that the passphrase path cannot: **truncation and omission**. Today an interceptor can drop the log tail (still a valid shorter chain) or strip the index invisibly; any such edit now breaks the envelope signature. It also closes the **plaintext local-tier gap**: a passphrase bundle's log is readable by anyone holding the file — a sealed bundle is opaque to everyone but the recipient.
-
 ## Export modes — protection is optional, never required
 Three modes, choosing **zero or one** of the two flags:
 
-1. **Plain** (no flag): the traveling key stays under the keystore
-   passphrase — for moving agents between your own hosts. Neither an npub
-   nor a passphrase is required; this mode remains first-class.
-2. **`--export-passphrase <secret>`**: handoff-locked, zero recipient setup.
-3. **`--to <npub>`**: sealed envelope, no secret in flight.
+1. **Plain** (no flag): the traveling key stays under the keystore passphrase — for moving agents between your own hosts. Neither an npub nor a passphrase is required; this mode remains first-class.
+  
+2. `--export-passphrase <secret>`: handoff-locked, zero recipient setup.
+  
+3. `--to <npub>`: sealed envelope, no secret in flight.
+  
 
 Import auto-detects all three. The test plan asserts each mode round-trips.
 ## Surface changes
@@ -79,13 +79,11 @@ Their receiving key must live in their Apiary keystore (the same way your `ryan`
   
 3. Whole-bundle symmetric encryption for the _passphrase_ path (closing its plaintext local-tier gap too).
   
+  {++⁠May as well do all three of these++}{id="s1" by="user" at="2026-08-15T21:22:07.052Z"}
+  
 ## Estimate
 Core envelope seal/open + import auto-detect ≈ 160 lines; CLI/API/GUI ≈ 150; tests + live proof ≈ 100. A half-day chunk, no new dependencies.
 
----
-comments:
-  c1:
-    body: Integrated — added an "Export modes" section making the three-mode contract explicit (plain / passphrase / sealed, zero-or-one flag), and the test plan now asserts the plain no-flag mode round-trips. Nothing is required; both protections are optional.
-    by: AI
-    at: "2026-08-15T21:22:00.000Z"
-    re: s1
+* * *
+
+comments: c1: body: Integrated — added an "Export modes" section making the three-mode contract explicit (plain / passphrase / sealed, zero-or-one flag), and the test plan now asserts the plain no-flag mode round-trips. Nothing is required; both protections are optional. by: AI at: "2026-08-15T21:22:00.000Z" re: s1
