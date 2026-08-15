@@ -5,6 +5,7 @@
 'use strict';
 
 let sel = null, tab = 'overview', agents = [], hostStatus = {};
+let hostView = false;
 let listenerPoll = null;
 
 // Desktop mode hands the per-launch token in the boot URL; every API call
@@ -122,12 +123,13 @@ async function loadRoster() {
     nm.append(el('span', 'badge ' + (a.active ? 'live' : 'unrat'), a.active ? 'active' : 'inactive'));
     if (running.has(a.npub)) nm.append(el('span', 'badge live', 'listening'));
     card.append(nm, el('div', 'np', a.npub), el('div', 'np', a.log_entries + ' log entries'));
-    card.onclick = () => { sel = a.npub; render(); loadRoster(); };
+    card.onclick = () => { hostView = false; sel = a.npub; render(); loadRoster(); };
     root.append(card);
   }
 }
 
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  hostView = false;
   tab = b.dataset.tab;
   document.querySelectorAll('nav button').forEach(x => x.classList.toggle('sel', x === b));
   render();
@@ -147,7 +149,8 @@ async function render() {
   if (listenerPoll) { clearInterval(listenerPoll); listenerPoll = null; }
   const c = document.getElementById('content');
   c.replaceChildren();
-  if (!sel) { c.append(el('div', 'empty', 'select an agent')); return; }
+  if (hostView) return renderLibrary(c);
+  if (!sel) { c.append(el('div', 'empty', 'select an agent — or open the host connector library from the sidebar')); return; }
   if (tab === 'overview') return renderOverview(c);
   if (tab === 'run') return renderRun(c);
   if (tab === 'log') return renderLog(c);
@@ -678,6 +681,11 @@ async function renderBuzz(c) {
 
 async function renderConnectors(c) {
   c.append(help('Two layers. The HOST LIBRARY holds named connector configurations (kind + caps, no secrets) — configure once, assign to any agent. A GRANT copies one into this agent’s manifest, sealing any credential to this agent’s key alone. Grants are constitutional: each one changes the manifest hash and needs re-ratification, and each travels with the agent — portability includes capabilities and their sealed credentials. A destination host only needs to bind the kind; a declared kind it cannot bind fails loudly at run start.'));
+  const libHint = el('div', 'row');
+  const libBtn = el('button', 'btn', 'OPEN HOST CONNECTOR LIBRARY');
+  libBtn.onclick = () => { hostView = true; render(); };
+  libHint.append(libBtn, el('span', 'meta', 'definitions are host-scoped, shared by all agents — this tab only grants and revokes for the selected agent'));
+  c.append(libHint);
   c.append(help('The mcp kind speaks the Model Context Protocol (2026-07-28, with automatic fallback to initialize-era servers). stdio example caps: {"transport":"stdio","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/data"],"allowed_tools":["read_text_file","list_directory"]}. Remote example: {"transport":"http","url":"https://mcp.example.com/mcp","allowed_tools":["search"],"oauth_client_id":"…"} — grant via OAuth below, or paste a bearer token as the secret. allowed_tools is required: the server offers whatever it likes, the manifest decides what the agent may touch.'));
 
   const lib = await j('/api/connectors');
@@ -753,17 +761,39 @@ async function renderConnectors(c) {
     loadRoster(); if (r.ok) render();
   };
 
-  // ---- host library
-  const lSec = section('Host connector library',
-    'Named configurations this host offers, stored in connectors.yaml under the state directory. No secrets live here. Kinds this host can bind: ' + (lib.host_binds || []).join(', ') + '.');
+
+}
+
+// ------------------------------------------------------------ host library (host-scoped, all agents)
+
+async function renderLibrary(c) {
+  c.append(help('HOST-SCOPED: this library belongs to the host, not to any one agent. Entries are named connector configurations (kind + caps — never secrets) stored in connectors.yaml under the state directory. Grant them to individual agents from an agent’s Connectors tab; each grant is a ratified manifest amendment for that agent alone.'));
+  const lib = await j('/api/connectors');
+  if (!lib.ok) { c.append(el('div', 'ev err', 'error: ' + lib.error)); return; }
+
+  // Which agents hold a grant of each kind — the all-agents view.
+  const grantsByKind = {};
+  for (const a of agents) {
+    const d = await j(`/api/agents/${encodeURIComponent(a.npub)}/manifest`);
+    if (!d.ok) continue;
+    for (const g of (d.manifest.connectors || [])) {
+      (grantsByKind[g.type] = grantsByKind[g.type] || []).push(a.name || a.npub.slice(0, 12));
+    }
+  }
+
+  const lSec = section('Entries',
+    'Kinds this host can bind: ' + (lib.host_binds || []).join(', ') + '. An entry granted to an agent travels in that agent’s manifest — a destination host only needs to bind the kind.');
   const entries = (lib.library || []).slice();
   const list = el('div');
+  const lStatus = el('span', 'meta', '');
   const drawList = () => {
     list.replaceChildren();
     if (!entries.length) list.append(kv('library', 'empty'));
     entries.forEach((e, i) => {
       const row = el('div', 'row');
+      const holders = grantsByKind[e.kind] || [];
       row.append(el('span', 'v', `${e.name} · ${e.kind} · caps ${JSON.stringify(e.caps || {})}`));
+      row.append(el('span', 'meta', holders.length ? 'granted to: ' + holders.join(', ') : 'granted to: nobody'));
       const del = el('button', 'btn danger', 'REMOVE');
       row.append(del);
       del.onclick = async () => {
@@ -778,10 +808,10 @@ async function renderConnectors(c) {
   for (const k of (lib.host_binds || [])) { const o = el('option', null, k); o.value = k; nKind.append(o); }
   const nCaps = el('input', 'grow'); nCaps.placeholder = 'caps JSON (e.g. {"relays":["wss://nos.lol"]})';
   const nGo = el('button', 'btn', 'ADD TO LIBRARY');
-  const lStatus = el('span', 'meta', '');
   const nRow = el('div', 'row'); nRow.append(nName, nKind, nCaps, nGo, lStatus);
   lSec.append(list, nRow,
-    help('caps are the human-owned behavioral limits enforced host-side at every call — e.g. nostr-publish requires caps.relays, an allowlist of where the agent may publish. The model’s arguments are requests; caps are law.'));
+    help('caps are the human-owned behavioral limits enforced host-side at every call — e.g. nostr-publish requires caps.relays (a publish allowlist); mcp requires caps.allowed_tools (the server offers whatever it likes, the manifest decides). Removing an entry here does NOT revoke existing grants — those live in agent manifests and are revoked per-agent.'));
+  lSec.append(help('mcp stdio example caps: {"transport":"stdio","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/data"],"allowed_tools":["read_text_file","list_directory"]} — remote: {"transport":"http","url":"https://mcp.example.com/mcp","allowed_tools":["search"],"oauth_client_id":"…"}.'));
   c.append(lSec);
   const saveLib = async () => {
     const r = await j('/api/connectors', {
@@ -845,6 +875,12 @@ function renderCreds(c) {
 }
 
 // ------------------------------------------------------------ founding
+
+document.getElementById('libtoggle').onclick = () => {
+  hostView = true;
+  document.querySelectorAll('nav button').forEach(x => x.classList.remove('sel'));
+  render();
+};
 
 document.getElementById('foundtoggle').onclick = () => {
   const f = document.getElementById('foundform');
