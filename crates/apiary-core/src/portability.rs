@@ -32,14 +32,48 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// Package an agent directory into the export bundle.
+/// Package an agent directory into the export bundle, key copied verbatim
+/// (still locked with the keystore passphrase).
 pub fn export(agent_dir: &Path, npub: &str) -> Result<Value, crate::Error> {
+    export_with_passphrase(agent_dir, npub, None)
+}
+
+/// Package with the key RE-ENCRYPTED under a dedicated export passphrase —
+/// the handoff secret. This is how an agent is given to someone else: your
+/// keystore passphrase never travels, the recipient never learns it, and
+/// the export passphrase is disposable after one import (their host
+/// re-encrypts under their own passphrase on arrival).
+///
+/// Note on governance: handing over the key hands over the ability to act
+/// AS the agent — but not to amend its constitution. Amendments still need
+/// ratification by a listed suspend key, so a proper transfer amends
+/// `governance.suspend_keys` to include the recipient (ratified by YOU)
+/// before export.
+pub fn export_with_passphrase(
+    agent_dir: &Path,
+    npub: &str,
+    reencrypt: Option<(&str, &str)>, // (keystore passphrase, export passphrase)
+) -> Result<Value, crate::Error> {
     let read = |name: &str| -> Result<String, crate::Error> {
         std::fs::read_to_string(agent_dir.join(name))
             .map_err(|e| crate::Error::Keystore(format!("export: cannot read {name}: {e}")))
     };
     let manifest_yaml = read("manifest.yaml")?;
-    let key_ncryptsec = read("key.ncryptsec")?.trim().to_string();
+    let mut key_ncryptsec = read("key.ncryptsec")?.trim().to_string();
+    if let Some((keystore_pass, export_pass)) = reencrypt {
+        if export_pass.is_empty() {
+            return Err(crate::Error::Keystore("export passphrase is empty".into()));
+        }
+        let enc = EncryptedSecretKey::from_bech32(&key_ncryptsec)
+            .map_err(|e| crate::Error::Keystore(format!("parse ncryptsec: {e}")))?;
+        let sk = enc.decrypt(keystore_pass).map_err(|e| {
+            crate::Error::Keystore(format!("keystore passphrase does not open the key: {e}"))
+        })?;
+        key_ncryptsec = EncryptedSecretKey::new(&sk, export_pass, 16, KeySecurity::Medium)
+            .map_err(|e| crate::Error::Keystore(format!("nip49 re-encrypt: {e}")))?
+            .to_bech32()
+            .map_err(|e| crate::Error::Keystore(format!("bech32: {e}")))?;
+    }
     let name = std::fs::read_to_string(agent_dir.join("name"))
         .unwrap_or_default()
         .trim()
@@ -90,9 +124,10 @@ pub struct ImportReport {
 pub fn import(
     ks: &Keystore,
     bundle: &Value,
-    passphrase: &str,
+    bundle_passphrase: &str,
+    keystore_passphrase: &str,
 ) -> Result<ImportReport, crate::Error> {
-    import_with_options(ks, bundle, passphrase, true)
+    import_with_options(ks, bundle, bundle_passphrase, keystore_passphrase, true)
 }
 
 /// `strict_chain: false` is for RELAY RECOVERY: local-tier entries never
@@ -101,7 +136,8 @@ pub fn import(
 pub fn import_with_options(
     ks: &Keystore,
     bundle: &Value,
-    passphrase: &str,
+    bundle_passphrase: &str,
+    keystore_passphrase: &str,
     strict_chain: bool,
 ) -> Result<ImportReport, crate::Error> {
     let fail = |msg: String| crate::Error::Keystore(format!("import: {msg}"));
@@ -129,9 +165,11 @@ pub fn import_with_options(
     // 1. The key must decrypt with the provided passphrase and be the npub.
     let enc = EncryptedSecretKey::from_bech32(key_ncryptsec.trim())
         .map_err(|e| fail(format!("key blob is not valid ncryptsec: {e}")))?;
-    let secret = enc
-        .decrypt(passphrase)
-        .map_err(|e| fail(format!("passphrase does not open the traveling key: {e}")))?;
+    let secret = enc.decrypt(bundle_passphrase).map_err(|e| {
+        fail(format!(
+            "bundle passphrase does not open the traveling key: {e}"
+        ))
+    })?;
     let keys = Keys::new(secret);
     let derived = crate::identity::to_npub(&keys.public_key())?;
     if derived != npub {
@@ -174,7 +212,10 @@ pub fn import_with_options(
             "agent {npub} already exists on this host — refusing to overwrite"
         )));
     }
-    std::fs::create_dir_all(&dir).map_err(|e| fail(e.to_string()))?;
+    // The key is stored RE-ENCRYPTED under THIS keystore's passphrase —
+    // the whole keystore stays openable with one passphrase, and the
+    // export passphrase dies with the handoff.
+    ks.store(&keys, keystore_passphrase)?;
     let write = |name: &str, content: &str| -> Result<(), crate::Error> {
         std::fs::write(dir.join(name), content).map_err(|e| fail(format!("write {name}: {e}")))?;
         #[cfg(unix)]
@@ -185,7 +226,6 @@ pub fn import_with_options(
         }
         Ok(())
     };
-    write("key.ncryptsec", key_ncryptsec.trim())?;
     write("manifest.yaml", &manifest_yaml)?;
     if !name.is_empty() {
         write("name", &name)?;

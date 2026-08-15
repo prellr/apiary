@@ -2189,6 +2189,14 @@ pub async fn lease_takeover(
 
 /// Export the agent to a bundle file under <home>/exports/. The key inside
 /// stays NIP-49-locked; the passphrase travels human-to-human.
+#[derive(serde::Deserialize, Default)]
+pub struct ExportBody {
+    /// Re-encrypt the traveling key under this handoff secret (the host
+    /// keystore passphrase never travels). Empty/absent = verbatim copy.
+    #[serde(default)]
+    export_passphrase: Option<String>,
+}
+
 pub async fn export_agent(
     State(state): State<App>,
     AxPath(npub): AxPath<String>,
@@ -2201,9 +2209,38 @@ pub async fn export_agent(
             Ok(v) => v,
             Err(e) => return e.into_response(),
         };
-    let bundle = match apiary_core::portability::export(&dir, &npub) {
-        Ok(b) => b,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    let body: ExportBody = serde_json::from_slice(&raw_body).unwrap_or_default();
+    let export_pass = body.export_passphrase.filter(|p| !p.is_empty());
+    let bundle = match &export_pass {
+        Some(ep) => {
+            let Some(session_pass) = state.passphrase_clone() else {
+                return err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "unlock the keystore first — re-encrypting the key needs it open",
+                )
+                .into_response();
+            };
+            let dir2 = dir.clone();
+            let npub2 = npub.clone();
+            let ep2 = ep.clone();
+            match tokio::task::spawn_blocking(move || {
+                apiary_core::portability::export_with_passphrase(
+                    &dir2,
+                    &npub2,
+                    Some((&session_pass, &ep2)),
+                )
+            })
+            .await
+            {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+                Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+            }
+        }
+        None => match apiary_core::portability::export(&dir, &npub) {
+            Ok(b) => b,
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        },
     };
     let name = std::fs::read_to_string(dir.join("name"))
         .unwrap_or_default()
@@ -2233,7 +2270,12 @@ pub async fn export_agent(
         "path": file.display().to_string(),
         "log_entries": bundle["log"].as_array().map(|a| a.len()).unwrap_or(0),
         "index_rows": bundle["index_jsonl"].as_str().map(|s| s.lines().count()).unwrap_or(0),
-        "note": "the key inside stays NIP-49-locked — share the passphrase out of band, never alongside the file",
+        "handoff_passphrase": export_pass.is_some(),
+        "note": if export_pass.is_some() {
+            "key re-encrypted under the handoff passphrase — share it out of band, never alongside the file; your keystore passphrase did not travel"
+        } else {
+            "key still locked with THIS keystore's passphrase — for handing to someone else, use a handoff passphrase instead"
+        },
     }))
     .into_response()
 }
@@ -2241,6 +2283,10 @@ pub async fn export_agent(
 #[derive(serde::Deserialize)]
 pub struct ImportBody {
     bundle: serde_json::Value,
+    /// The sender's export passphrase, when the bundle was re-encrypted
+    /// for handoff. Absent = the bundle uses this keystore's passphrase.
+    #[serde(default)]
+    bundle_passphrase: Option<String>,
 }
 
 pub async fn import_agent(
@@ -2267,7 +2313,13 @@ pub async fn import_agent(
     let home = state.home.clone();
     let out = tokio::task::spawn_blocking(move || {
         let ks = Keystore::open(&home).map_err(|e| e.to_string())?;
-        apiary_core::portability::import(&ks, &body.bundle, &pass).map_err(|e| e.to_string())
+        let bundle_pass = body
+            .bundle_passphrase
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .unwrap_or(&pass);
+        apiary_core::portability::import(&ks, &body.bundle, bundle_pass, &pass)
+            .map_err(|e| e.to_string())
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()));

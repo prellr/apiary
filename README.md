@@ -65,7 +65,12 @@ model runs). What exists today:
 
 - **Native portability**: `agent export` packs manifest + NIP-49-locked
   key + full signed log + semantic index into one verified bundle — ALL
-  of the agent's memory travels, recall included; `agent import` refuses
+  of the agent's memory travels, recall included. With
+  `--export-passphrase`, the traveling key is re-encrypted under a
+  disposable handoff secret, so an agent can be GIVEN to someone else:
+  your keystore passphrase never travels, and their host re-encrypts
+  under their own passphrase on arrival (the key lets them act as the
+  agent; amending its constitution still requires a listed suspend key); `agent import` refuses
   anything that fails key↔manifest agreement, a signature, the chain, or
   ratification, and arrivals are INACTIVE (the lease referees the
   switchover). `agent recover` rebuilds an agent from its relays alone —

@@ -109,7 +109,8 @@
     <div style="padding:6px 8px 0"><button class="btn" style="width:100%" id="importtoggle">⇩ import agent</button></div>
     <div id="importform" style="display:none; border:1px solid var(--line); border-radius:6px; padding:14px; margin:8px; background:var(--panel);">
       <textarea id="i-bundle" rows="5" placeholder="paste an .apiary.json export bundle" style="width:100%; background:var(--bg); border:1px solid var(--line); border-radius:6px; color:var(--text); padding:8px; font:inherit;"></textarea>
-      <div class="help">Verified end to end before anything lands: the key must decrypt with THIS host's unlocked passphrase, the manifest must match it, every log signature and the chain must hold, and the constitution must be ratified.</div>
+      <input id="i-pass" type="password" placeholder="bundle passphrase (if handoff-locked; else uses this keystore's)" style="width:100%; margin-top:6px; background:var(--bg); border:1px solid var(--line); border-radius:6px; color:var(--text); padding:8px; font:inherit;">
+      <div class="help">Verified end to end before anything lands: the bundle passphrase must open the traveling key, the manifest must match it, every log signature and the chain must hold, and the constitution must be ratified. The key is re-encrypted under THIS keystore's passphrase on arrival.</div>
       <div class="row"><button class="btn solid" id="importgo">IMPORT</button></div>
       <div id="i-status" class="empty" style="padding:4px;display:none"></div>
     </div>

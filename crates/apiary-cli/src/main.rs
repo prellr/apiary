@@ -133,11 +133,25 @@ enum AgentCmd {
         /// Write to a file (default: stdout).
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Re-encrypt the traveling key under THIS dedicated passphrase —
+        /// the handoff secret for giving the agent to someone else. Your
+        /// keystore passphrase never travels. Requires the keystore
+        /// passphrase to unlock the key first.
+        #[arg(long)]
+        export_passphrase: Option<String>,
     },
     /// Import a bundle on this host. Verifies key↔npub↔manifest agreement,
     /// every log signature, the chain, and ratification before anything
     /// lands. Imported agents arrive INACTIVE; the lease governs who runs.
-    Import { file: PathBuf },
+    Import {
+        file: PathBuf,
+        /// Passphrase that opens the bundle's key, when it differs from
+        /// your keystore passphrase (i.e. the sender's export passphrase).
+        /// The key is re-encrypted under YOUR keystore passphrase on
+        /// arrival either way.
+        #[arg(long)]
+        bundle_passphrase: Option<String>,
+    },
     /// Rebuild an agent from its relays: the addressable manifest event
     /// (kind 34600) plus the published log, with the key supplied as an
     /// ncryptsec file. Local-tier entries never left the origin host, so
@@ -373,9 +387,23 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                     "events": { "signed": signed.id.to_hex(), "ratified": ratified.id.to_hex() },
                 }))
             }
-            AgentCmd::Export { npub, out } => {
+            AgentCmd::Export {
+                npub,
+                out,
+                export_passphrase,
+            } => {
                 let npub = &normalize_key(npub)?;
-                let bundle = apiary_core::portability::export(&ks.agent_dir(npub), npub)?;
+                let bundle = match export_passphrase {
+                    Some(export_pass) => {
+                        let keystore_pass = require_passphrase(cli)?;
+                        apiary_core::portability::export_with_passphrase(
+                            &ks.agent_dir(npub),
+                            npub,
+                            Some((keystore_pass, export_pass)),
+                        )?
+                    }
+                    None => apiary_core::portability::export(&ks.agent_dir(npub), npub)?,
+                };
                 match out {
                     Some(path) => {
                         std::fs::write(path, serde_json::to_string_pretty(&bundle)?)?;
@@ -397,11 +425,19 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                     None => Ok(bundle),
                 }
             }
-            AgentCmd::Import { file } => {
+            AgentCmd::Import {
+                file,
+                bundle_passphrase,
+            } => {
                 let passphrase = require_passphrase(cli)?;
                 let bundle: serde_json::Value =
                     serde_json::from_str(&std::fs::read_to_string(file)?)?;
-                let report = apiary_core::portability::import(&ks, &bundle, passphrase)?;
+                let report = apiary_core::portability::import(
+                    &ks,
+                    &bundle,
+                    bundle_passphrase.as_deref().unwrap_or(passphrase),
+                    passphrase,
+                )?;
                 Ok(json!({
                     "ok": true,
                     "npub": report.npub,
@@ -514,8 +550,9 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                         .collect::<Vec<_>>(),
                     "published": null,
                 });
-                let report =
-                    apiary_core::portability::import_with_options(&ks, &bundle, passphrase, false)?;
+                let report = apiary_core::portability::import_with_options(
+                    &ks, &bundle, passphrase, passphrase, false,
+                )?;
                 Ok(json!({
                     "ok": true,
                     "npub": report.npub,

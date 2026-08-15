@@ -214,14 +214,17 @@ async function renderOverview(c) {
   const portSec = section('Portability',
     'The agent IS manifest + key + signed log + semantic index — this exports ALL of it as one verified bundle, recall included: the imported agent needs nothing rebuilt and no matching embedding model. The key inside stays NIP-49-locked; share the passphrase out of band, never alongside the file. Import on the other host verifies the key, manifest, every signature, the chain, and ratification before anything lands; the agent arrives INACTIVE and the lease referees the switchover: export → import there → deactivate here → activate there.');
   const pRow2 = el('div', 'row');
+  const exPass = el('input'); exPass.type = 'password';
+  exPass.placeholder = 'handoff passphrase (optional)';
   const exBtn = el('button', 'btn', 'EXPORT BUNDLE');
   const exStat = el('span', 'meta', '');
-  pRow2.append(exBtn, exStat);
-  portSec.append(pRow2);
+  pRow2.append(exPass, exBtn, exStat);
+  portSec.append(pRow2, help('With a handoff passphrase, the traveling key is re-encrypted under it — your keystore passphrase never leaves this host, and the recipient re-encrypts under their own on import. Share the handoff passphrase out of band. To hand over governance too, first amend suspend_keys to include the recipient and ratify — the key lets them act AS the agent, only a listed suspend key can amend its constitution.'));
   exBtn.onclick = async () => {
-    exStat.textContent = 'exporting…';
-    const r = await j(api('/export'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
-    exStat.textContent = r.ok ? `saved: ${r.path} (${r.log_entries} log entries, ${r.index_rows} index rows)` : 'failed: ' + r.error;
+    exStat.textContent = exPass.value ? 'unlocking + re-encrypting…' : 'exporting…';
+    const r = await j(api('/export'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ export_passphrase: exPass.value || null }) });
+    exPass.value = '';
+    exStat.textContent = r.ok ? `saved: ${r.path} (${r.log_entries} log entries, ${r.index_rows} index rows${r.handoff_passphrase ? ', handoff-locked' : ''})` : 'failed: ' + r.error;
   };
   c.append(portSec);
 
@@ -947,7 +950,7 @@ document.getElementById('importgo').onclick = async () => {
   st.textContent = 'verifying and importing… (key decrypt is deliberately slow)';
   const r = await j('/api/agents/import', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ bundle }),
+    body: JSON.stringify({ bundle, bundle_passphrase: document.getElementById('i-pass').value || null }),
   });
   st.textContent = r.ok
     ? `imported ${r.name || r.npub.slice(0, 12)} · ${r.log_entries} log entries · ${r.index_rows} index rows${r.index_dropped ? ` (${r.index_dropped} dropped: disagreed with the signed log)` : ''} · ${r.ratified ? 'ratified' : 'NOT ratified'} — arrives inactive`
