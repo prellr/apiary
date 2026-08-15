@@ -77,6 +77,8 @@ pub fn build_router(state: App) -> Router {
         )
         .route("/api/agents", get(list_agents))
         .route("/api/agents/found", post(found_agent))
+        .route("/api/agents/import", post(ops::import_agent))
+        .route("/api/agents/{npub}/export", post(ops::export_agent))
         .route(
             "/api/agents/{npub}/manifest",
             get(get_manifest).put(put_manifest),

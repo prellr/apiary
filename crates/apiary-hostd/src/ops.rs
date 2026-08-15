@@ -2184,3 +2184,102 @@ pub async fn lease_takeover(
         Err(e) => e.into_response(),
     }
 }
+
+// ---------------------------------------------------------------- portability
+
+/// Export the agent to a bundle file under <home>/exports/. The key inside
+/// stays NIP-49-locked; the passphrase travels human-to-human.
+pub async fn export_agent(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, _m) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    let bundle = match apiary_core::portability::export(&dir, &npub) {
+        Ok(b) => b,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let name = std::fs::read_to_string(dir.join("name"))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let exports = state.home.join("exports");
+    if let Err(e) = std::fs::create_dir_all(&exports) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    let file = exports.join(format!(
+        "{}-{}.apiary.json",
+        if name.is_empty() { &npub[..16] } else { &name },
+        now_secs()
+    ));
+    let pretty = serde_json::to_string_pretty(&bundle).unwrap_or_default();
+    if let Err(e) = std::fs::write(&file, pretty) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
+    }
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "path": file.display().to_string(),
+        "log_entries": bundle["log"].as_array().map(|a| a.len()).unwrap_or(0),
+        "note": "the key inside stays NIP-49-locked — share the passphrase out of band, never alongside the file",
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct ImportBody {
+    bundle: serde_json::Value,
+}
+
+pub async fn import_agent(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let pq = uri
+        .path_and_query()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| uri.path().to_string());
+    if let Err(e) = nip98::check(&state, &headers, "POST", &pq, Some(&raw_body)) {
+        return e.into_response();
+    }
+    let body: ImportBody = match serde_json::from_slice(&raw_body) {
+        Ok(b) => b,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let pass = match require_pass(&state) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let home = state.home.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        let ks = Keystore::open(&home).map_err(|e| e.to_string())?;
+        apiary_core::portability::import(&ks, &body.bundle, &pass).map_err(|e| e.to_string())
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    match out {
+        Ok(r) => Json(json!({
+            "ok": true,
+            "npub": r.npub,
+            "name": r.name,
+            "log_entries": r.log_entries,
+            "ratified": r.ratified,
+            "note": "imported INACTIVE — activate in Overview to run standing presence; the lease referees any host overlap",
+        }))
+        .into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}

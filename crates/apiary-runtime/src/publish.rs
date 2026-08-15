@@ -105,6 +105,11 @@ pub fn unwrap_self_entry(
 
 /// Publish the log to the given relays, honoring tiers. Idempotent across
 /// invocations via the local publication record.
+/// Addressable manifest event: the public constitution, recoverable from
+/// relays with nothing but the npub. Replaceable per (author, d-tag);
+/// sealed credentials inside stay sealed — publishing them is safe.
+pub const MANIFEST_KIND: u16 = 34600;
+
 pub fn publish_log(
     agent_dir: &Path,
     custody: &Custody,
@@ -118,6 +123,29 @@ pub fn publish_log(
     }
     let log = EpisodicLog::open(agent_dir);
     let mut published = load_published(agent_dir);
+    // The constitution travels with the memory: publish the manifest as a
+    // replaceable event whenever its hash is new to the relays.
+    if let Ok(manifest_yaml) = std::fs::read_to_string(agent_dir.join("manifest.yaml")) {
+        let key = format!(
+            "manifest:{}",
+            apiary_core::ceremony::manifest_hash(&manifest_yaml)
+        );
+        if let std::collections::btree_map::Entry::Vacant(slot) = published.entries.entry(key) {
+            let builder = EventBuilder::new(Kind::Custom(MANIFEST_KIND), manifest_yaml)
+                .tag(Tag::custom("d", vec!["apiary-manifest".to_string()]));
+            if let Ok(event) = custody.sign(agent, builder) {
+                let mut any = false;
+                for relay in relays {
+                    if crate::relay::publish(relay, &event).is_ok() {
+                        any = true;
+                    }
+                }
+                if any {
+                    slot.insert(event.id.to_hex());
+                }
+            }
+        }
+    }
     let mut report = PublishReport {
         published_public: 0,
         published_wrapped: 0,

@@ -10,6 +10,7 @@ pub mod identity;
 pub mod keystore;
 pub mod log;
 pub mod manifest;
+pub mod portability;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

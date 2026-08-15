@@ -126,6 +126,29 @@ enum AgentCmd {
         #[arg(long, required = true)]
         suspend_key: Vec<String>,
     },
+    /// Export the agent as ONE portable JSON bundle: manifest + NIP-49-locked
+    /// key + full signed log. The passphrase travels out of band.
+    Export {
+        npub: String,
+        /// Write to a file (default: stdout).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Import a bundle on this host. Verifies key↔npub↔manifest agreement,
+    /// every log signature, the chain, and ratification before anything
+    /// lands. Imported agents arrive INACTIVE; the lease governs who runs.
+    Import { file: PathBuf },
+    /// Rebuild an agent from its relays: the addressable manifest event
+    /// (kind 34600) plus the published log, with the key supplied as an
+    /// ncryptsec file. Local-tier entries never left the origin host, so
+    /// the recovered chain may have gaps (reported, not fatal).
+    Recover {
+        npub: String,
+        #[arg(long, required = true)]
+        relay: Vec<String>,
+        #[arg(long)]
+        key_file: PathBuf,
+    },
     /// List agents in this host's keystore.
     List,
     /// Ratify an agent's manifest as a human suspend-key holder. The agent
@@ -348,6 +371,160 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                     "ratified_by": as_key,
                     "manifest_sha256": ceremony::manifest_hash(&raw),
                     "events": { "signed": signed.id.to_hex(), "ratified": ratified.id.to_hex() },
+                }))
+            }
+            AgentCmd::Export { npub, out } => {
+                let npub = &normalize_key(npub)?;
+                let bundle = apiary_core::portability::export(&ks.agent_dir(npub), npub)?;
+                match out {
+                    Some(path) => {
+                        std::fs::write(path, serde_json::to_string_pretty(&bundle)?)?;
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let _ = std::fs::set_permissions(
+                                path,
+                                std::fs::Permissions::from_mode(0o600),
+                            );
+                        }
+                        Ok(json!({
+                            "ok": true,
+                            "npub": npub,
+                            "out": path.display().to_string(),
+                            "note": "the key inside is still NIP-49-locked — the passphrase travels out of band",
+                        }))
+                    }
+                    None => Ok(bundle),
+                }
+            }
+            AgentCmd::Import { file } => {
+                let passphrase = require_passphrase(cli)?;
+                let bundle: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(file)?)?;
+                let report = apiary_core::portability::import(&ks, &bundle, passphrase)?;
+                Ok(json!({
+                    "ok": true,
+                    "npub": report.npub,
+                    "name": report.name,
+                    "log_entries": report.log_entries,
+                    "ratified": report.ratified,
+                    "note": "imported INACTIVE — activate to run standing presence; the lease referees any host overlap",
+                }))
+            }
+            AgentCmd::Recover {
+                npub,
+                relay,
+                key_file,
+            } => {
+                let npub = &normalize_key(npub)?;
+                let passphrase = require_passphrase(cli)?;
+                let pk = apiary_core::identity::parse_npub(npub)?;
+                let hex = pk.to_hex();
+                let ncryptsec = std::fs::read_to_string(key_file)?.trim().to_string();
+                // The key unlocks self-tier entries during recovery.
+                let enc = EncryptedSecretKey::from_bech32(&ncryptsec)
+                    .map_err(|e| format!("key file is not valid ncryptsec: {e}"))?;
+                let keys = Keys::new(
+                    enc.decrypt(passphrase)
+                        .map_err(|e| format!("passphrase does not open the key: {e}"))?,
+                );
+                let mut custody = Custody::new();
+                let handle = custody.admit(keys);
+                // 1. The constitution, from its addressable event.
+                let mut manifest_yaml: Option<(u64, String)> = None;
+                for r in relay {
+                    let filter = json!({
+                        "kinds": [apiary_runtime::publish::MANIFEST_KIND],
+                        "authors": [hex],
+                        "#d": ["apiary-manifest"],
+                        "limit": 3,
+                    });
+                    for e in apiary_runtime::relay::fetch(r, filter).unwrap_or_default() {
+                        if e.verify().is_ok()
+                            && manifest_yaml
+                                .as_ref()
+                                .is_none_or(|(t, _)| e.created_at.as_secs() > *t)
+                        {
+                            manifest_yaml = Some((e.created_at.as_secs(), e.content.clone()));
+                        }
+                    }
+                }
+                let Some((_, manifest_yaml)) = manifest_yaml else {
+                    return Err("no published manifest found on those relays — \
+                                run `apiary log publish` on the origin host first, \
+                                or move the agent with export/import"
+                        .into());
+                };
+                // 2. The memory: published log events, self-tier unwrapped.
+                let mut events: Vec<Event> = Vec::new();
+                for r in relay {
+                    let own = json!({
+                        "authors": [hex],
+                        "kinds": [
+                            apiary_core::log::LOG_ENTRY_KIND,
+                            apiary_runtime::publish::WRAPPED_KIND,
+                        ],
+                    });
+                    let about = json!({
+                        "kinds": [apiary_core::log::LOG_ENTRY_KIND],
+                        "#p": [hex],
+                    });
+                    for fetched in [
+                        apiary_runtime::relay::fetch(r, own),
+                        apiary_runtime::relay::fetch(r, about),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        for e in fetched {
+                            if e.verify().is_err() {
+                                continue;
+                            }
+                            let inner = if e.kind.as_u16() == apiary_runtime::publish::WRAPPED_KIND
+                            {
+                                match apiary_runtime::publish::unwrap_self_entry(
+                                    &custody, &handle, &e,
+                                ) {
+                                    Ok(inner) => inner,
+                                    Err(_) => continue,
+                                }
+                            } else {
+                                e
+                            };
+                            if !events.iter().any(|x| x.id == inner.id) {
+                                events.push(inner);
+                            }
+                        }
+                    }
+                }
+                events.sort_by_key(|e| e.created_at.as_secs());
+                let bundle = json!({
+                    "apiary_export": apiary_core::portability::EXPORT_VERSION,
+                    "exported_at": 0,
+                    "npub": npub,
+                    "name": "",
+                    "manifest_yaml": manifest_yaml,
+                    "key_ncryptsec": ncryptsec,
+                    "log": events
+                        .iter()
+                        .map(|e| serde_json::from_str::<serde_json::Value>(&e.as_json())
+                            .unwrap_or_default())
+                        .collect::<Vec<_>>(),
+                    "published": null,
+                });
+                let report =
+                    apiary_core::portability::import_with_options(&ks, &bundle, passphrase, false)?;
+                Ok(json!({
+                    "ok": true,
+                    "npub": report.npub,
+                    "log_entries": report.log_entries,
+                    "ratified": report.ratified,
+                    "chain_intact": report.chain_intact,
+                    "note": if report.chain_intact {
+                        "fully recovered from relays"
+                    } else {
+                        "recovered with chain gaps — local-tier entries never left the origin host (expected)"
+                    },
                 }))
             }
             AgentCmd::List => {
