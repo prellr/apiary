@@ -2241,7 +2241,15 @@ fn spawn_channel(
             },
         };
         let sink_lines = lines.clone();
-        let mut sink = move |l: String| push_line(&sink_lines, l);
+        let sink_kind = kind.clone();
+        let mut sink = move |l: String| {
+            // Failures must be loud in the supervisor log, not only in the
+            // GUI ring buffer — a silent refusal cost a live debugging round.
+            if l.contains("failed") || l.contains("refused") || l.contains("died") {
+                eprintln!("supervisor[{sink_kind}]: {l}");
+            }
+            push_line(&sink_lines, l);
+        };
         let on_tick_lost = keeper_lost.clone();
         let result: Result<(), apiary_runtime::Error> = (|| {
             let mut adapter: Box<dyn apiary_runtime::presence::ChannelAdapter> = match kind.as_str()
