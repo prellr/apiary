@@ -315,7 +315,6 @@ pub fn fetch(url: &str, filter: Value) -> Result<Vec<Event>, crate::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
