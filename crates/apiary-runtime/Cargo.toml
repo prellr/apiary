@@ -14,6 +14,6 @@ zeroize.workspace = true
 fs2 = "0.4"
 base64 = "0.22"
 sha2 = "0.10"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
 nostr.workspace = true
 tungstenite = { version = "0.28", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }

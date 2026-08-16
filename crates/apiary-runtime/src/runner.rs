@@ -149,6 +149,20 @@ pub fn run_task_observed(
         model: model.clone(),
     });
 
+    // 3b. Hear before you think: audio attachments become text through the
+    //     `transcribe` slot (host equipment; absent → honestly unheard).
+    //     Transcripts join the TASK as DATA — the provenance framing that
+    //     wraps the message wraps them too. Cost is logged per clip.
+    let (task_owned, audio_tokens) = prep!(transcribe_attachments(
+        manifest,
+        custody,
+        agent,
+        &log,
+        task,
+        &ctx.attachments
+    ));
+    let task: &str = &task_owned;
+
     // 4. Hydrate the working set: constitution + recency tail + semantic
     //    retrieval, all framed with provenance (memory is DATA, never
     //    instructions — SPEC §12.4, Phase 1 scope).
@@ -167,7 +181,8 @@ pub fn run_task_observed(
         .collect();
     let input_estimate = crate::inference::estimate_tokens(&system)
         + crate::inference::estimate_tokens(task)
-        + images.len() as u64 * crate::inference::IMAGE_TOKEN_ESTIMATE;
+        + images.len() as u64 * crate::inference::IMAGE_TOKEN_ESTIMATE
+        + audio_tokens;
     if input_estimate >= reservation.amount {
         let _ = ledger.settle(reservation, 0, 0);
         return Err(crate::Error::Budget(format!(
@@ -308,6 +323,96 @@ pub fn run_task_observed(
         slot: slot_name,
         log_event_id: event.id.to_hex(),
     })
+}
+
+/// Turn audio attachments into transcript text appended to the task, via
+/// the manifest's `transcribe` slot. Returns the (possibly extended) task
+/// and the audio token estimate already charged to the run's budget.
+/// No slot → the task gains an honest "unheard" note and nothing is
+/// called. Each clip's transcription is its own signed log entry.
+fn transcribe_attachments(
+    manifest: &Manifest,
+    custody: &Custody,
+    agent: &AgentHandle,
+    log: &EpisodicLog,
+    task: &str,
+    attachments: &[crate::presence::Attachment],
+) -> Result<(String, u64), crate::Error> {
+    use crate::presence::Attachment;
+    let clips: Vec<(&str, &str, Option<f32>)> = attachments
+        .iter()
+        .filter_map(|a| match a {
+            Attachment::Audio {
+                media_type,
+                base64,
+                duration_secs,
+            } => Some((media_type.as_str(), base64.as_str(), *duration_secs)),
+            _ => None,
+        })
+        .collect();
+    if clips.is_empty() {
+        return Ok((task.to_string(), 0));
+    }
+    let slot = crate::transcribe::transcribe_slot(manifest);
+    let credential = match slot.and_then(|s| s.credential.as_ref()) {
+        Some(blob) => Some(custody.open(agent, blob)?),
+        None => None,
+    };
+    let Some(engine) = crate::transcribe::bind_transcriber(manifest, credential) else {
+        // Named, not swallowed: the framing already says audio arrived.
+        return Ok((task.to_string(), 0));
+    };
+    let mut out = task.to_string();
+    let mut tokens = 0u64;
+    for (i, (media_type, b64, hint)) in clips.iter().enumerate() {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| {
+                crate::Error::Provider(format!("audio attachment {i}: bad base64: {e}"))
+            })?;
+        let started = std::time::Instant::now();
+        let result = engine.transcribe(&bytes, media_type);
+        let (outcome, detail) = match &result {
+            Ok(t) => (
+                "ok".to_string(),
+                json!({
+                    "clip": i, "media_type": media_type, "bytes": bytes.len(),
+                    "duration_secs": t.duration_secs.or(*hint), "language": t.language,
+                    "chars": t.text.len(), "ms": started.elapsed().as_millis() as u64,
+                }),
+            ),
+            Err(e) => (
+                format!("error: {e}"),
+                json!({ "clip": i, "media_type": media_type, "bytes": bytes.len() }),
+            ),
+        };
+        log.append(
+            custody,
+            agent,
+            Tier::Self_,
+            &EntryBody {
+                action: "transcribe".into(),
+                model: Some(engine.id()),
+                cost: None,
+                harness: Some("native".into()),
+                outcome,
+                detail: Some(detail),
+            },
+        )?;
+        let t = result?;
+        tokens += crate::transcribe::estimate_audio_tokens(t.duration_secs.or(*hint));
+        out.push_str(&format!(
+            "\n[voice message {}, transcribed by {}{}: \"{}\"]",
+            i + 1,
+            t.engine,
+            t.duration_secs
+                .map(|d| format!(", {d:.0}s"))
+                .unwrap_or_default(),
+            t.text.replace('"', "'")
+        ));
+    }
+    Ok((out, tokens))
 }
 
 /// Build the agent's system prompt: constitution, recency tail, semantic
@@ -555,6 +660,61 @@ governance:
         ));
         std::fs::create_dir_all(&dir).unwrap();
         (manifest, dir, custody, handle)
+    }
+
+    #[test]
+    fn audio_attachments_are_transcribed_into_the_task_and_logged() {
+        let (mut manifest, dir, custody, handle) = setup();
+        manifest
+            .inference
+            .push(apiary_core::manifest::InferenceSlot {
+                name: "transcribe".into(),
+                provider: "mock".into(),
+                model: None,
+                credential: None,
+                requires: Default::default(),
+            });
+        let ctx = TaskContext {
+            attachments: vec![crate::presence::Attachment::Audio {
+                media_type: "audio/ogg".into(),
+                base64: "QUJD".into(), // "ABC"
+                duration_secs: Some(2.0),
+            }],
+            ..Default::default()
+        };
+        let out = run_task(&manifest, &dir, &custody, &handle, "hello", &ctx).unwrap();
+        // The mock provider echoes its prompt, so the transcript must be in it.
+        assert!(
+            out.completion.text.contains("mock transcript of 3 bytes"),
+            "transcript should reach the model: {}",
+            out.completion.text
+        );
+        let log = EpisodicLog::open(&dir);
+        let entries = log.read_all().unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.content.contains("\"action\":\"transcribe\"")),
+            "transcription must be its own signed log entry"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn audio_without_a_transcribe_slot_is_named_not_swallowed() {
+        let (manifest, dir, custody, handle) = setup();
+        let ctx = TaskContext {
+            attachments: vec![crate::presence::Attachment::Audio {
+                media_type: "audio/ogg".into(),
+                base64: "QUJD".into(),
+                duration_secs: None,
+            }],
+            ..Default::default()
+        };
+        // No transcribe slot: the run still succeeds, nothing is transcribed.
+        let out = run_task(&manifest, &dir, &custody, &handle, "hello", &ctx).unwrap();
+        assert!(!out.completion.text.contains("transcript"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

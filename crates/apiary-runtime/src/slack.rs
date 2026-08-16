@@ -174,7 +174,7 @@ impl SlackRules {
     }
 }
 
-/// Download image files from a Slack event (url_private + bot bearer),
+/// Download image and audio files from a Slack event (url_private + bot bearer),
 /// size-capped; failures skip the file, never the mention.
 fn fetch_slack_images(
     http: &reqwest::blocking::Client,
@@ -185,7 +185,10 @@ fn fetch_slack_images(
     let mut out = Vec::new();
     for f in event["files"].as_array().cloned().unwrap_or_default() {
         let mime = f["mimetype"].as_str().unwrap_or_default().to_string();
-        if !mime.starts_with("image/") || f["size"].as_u64().unwrap_or(0) > MAX_BYTES {
+        let is_image = mime.starts_with("image/");
+        let is_audio = mime.starts_with("audio/")
+            || mime == "video/webm" && f["subtype"].as_str() == Some("slack_audio");
+        if !(is_image || is_audio) || f["size"].as_u64().unwrap_or(0) > MAX_BYTES {
             continue;
         }
         let Some(url) = f["url_private"].as_str() else {
@@ -199,9 +202,22 @@ fn fetch_slack_images(
             continue;
         }
         use base64::Engine;
-        out.push(crate::presence::Attachment::Image {
-            media_type: mime,
-            base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        let base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        out.push(if is_image {
+            crate::presence::Attachment::Image {
+                media_type: mime,
+                base64,
+            }
+        } else {
+            crate::presence::Attachment::Audio {
+                media_type: if mime == "video/webm" {
+                    "audio/webm".into()
+                } else {
+                    mime
+                },
+                base64,
+                duration_secs: f["duration_ms"].as_f64().map(|d| (d / 1000.0) as f32),
+            }
         });
         if out.len() >= crate::presence::MAX_ATTACHMENTS {
             break;

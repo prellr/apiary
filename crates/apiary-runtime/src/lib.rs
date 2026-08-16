@@ -21,6 +21,7 @@ pub mod runner;
 pub mod slack;
 pub mod spend;
 pub mod telegram;
+pub mod transcribe;
 pub mod vault;
 
 #[derive(Debug, thiserror::Error)]

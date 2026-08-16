@@ -75,11 +75,10 @@ impl TelegramAdapter {
         self.allowed_chats.iter().any(|c| c == "*" || c == chat_id)
     }
 
-    /// Download a Telegram photo (largest size) as a base64 image input.
-    /// Size-capped: an oversized file is skipped, not fatal.
-    fn fetch_photo(&self, msg: &Value) -> Option<crate::presence::Attachment> {
+    /// Download a Telegram file by id, size-capped: an oversized or
+    /// failed file is skipped, never fatal to the mention.
+    fn fetch_file(&self, file_id: &str) -> Option<Vec<u8>> {
         const MAX_BYTES: u64 = crate::presence::MAX_ATTACHMENT_BYTES;
-        let file_id = msg["photo"].as_array()?.last()?["file_id"].as_str()?;
         let f = self.call("getFile", json!({"file_id": file_id})).ok()?;
         if f["result"]["file_size"].as_u64().unwrap_or(0) > MAX_BYTES {
             return None;
@@ -98,11 +97,43 @@ impl TelegramAdapter {
         if bytes.len() as u64 > MAX_BYTES {
             return None;
         }
+        Some(bytes.to_vec())
+    }
+
+    /// Everything attached to a message that the agent can take as DATA:
+    /// the largest photo size, a voice note, or an audio file.
+    fn attachments(&self, msg: &Value) -> Vec<crate::presence::Attachment> {
+        use crate::presence::Attachment;
         use base64::Engine;
-        Some(crate::presence::Attachment::Image {
-            media_type: "image/jpeg".into(), // Telegram photos are JPEG
-            base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
-        })
+        let b64 = |b: Vec<u8>| base64::engine::general_purpose::STANDARD.encode(b);
+        let mut out = Vec::new();
+        if let Some(id) = msg["photo"]
+            .as_array()
+            .and_then(|a| a.last())
+            .and_then(|p| p["file_id"].as_str())
+        {
+            if let Some(bytes) = self.fetch_file(id) {
+                out.push(Attachment::Image {
+                    media_type: "image/jpeg".into(), // Telegram photos are JPEG
+                    base64: b64(bytes),
+                });
+            }
+        }
+        // `voice` = recorded in-app (OGG/Opus); `audio` = an uploaded file.
+        for key in ["voice", "audio"] {
+            let a = &msg[key];
+            let Some(id) = a["file_id"].as_str() else {
+                continue;
+            };
+            if let Some(bytes) = self.fetch_file(id) {
+                out.push(Attachment::Audio {
+                    media_type: a["mime_type"].as_str().unwrap_or("audio/ogg").to_string(),
+                    base64: b64(bytes),
+                    duration_secs: a["duration"].as_f64().map(|d| d as f32),
+                });
+            }
+        }
+        out
     }
 
     /// Trigger rules: DMs always; groups on @botname or a reply to the bot.
@@ -162,14 +193,15 @@ impl crate::presence::ChannelAdapter for TelegramAdapter {
                 self.offset = self.offset.max(id + 1);
             }
             let msg = &u["message"];
-            // Text, a captioned photo, or a bare photo all engage.
-            let has_photo = msg["photo"].is_array();
+            // Text, a captioned photo/voice note, or a bare one all engage.
+            let has_media =
+                msg["photo"].is_array() || msg["voice"].is_object() || msg["audio"].is_object();
             let text = msg["text"]
                 .as_str()
                 .or_else(|| msg["caption"].as_str())
                 .unwrap_or_default()
                 .to_string();
-            if text.is_empty() && !has_photo {
+            if text.is_empty() && !has_media {
                 continue;
             }
             let chat_id = match msg["chat"]["id"].as_i64() {
@@ -184,13 +216,17 @@ impl crate::presence::ChannelAdapter for TelegramAdapter {
                 .map(String::from)
                 .unwrap_or_else(|| msg["from"]["id"].as_i64().unwrap_or(0).to_string());
             let reply_ref = msg["message_id"].as_i64().unwrap_or(0).to_string();
-            let attachments = if has_photo {
-                self.fetch_photo(msg).into_iter().collect()
+            let attachments = if has_media {
+                self.attachments(msg)
             } else {
                 Vec::new()
             };
             let text = if text.is_empty() {
-                "(an image, with no caption)".to_string()
+                if msg["voice"].is_object() || msg["audio"].is_object() {
+                    "(a voice message, with no caption)".to_string()
+                } else {
+                    "(an image, with no caption)".to_string()
+                }
             } else {
                 text
             };
@@ -266,6 +302,18 @@ mod tests {
         assert!(a.triggers(&json!({
             "chat": {"type": "group"}, "photo": [{}],
             "caption": "what is this @scout_bot?"
+        })));
+    }
+
+    #[test]
+    fn voice_notes_engage_like_photos() {
+        let a = adapter();
+        // Bare voice note in a DM engages; in a group it needs a caption mention.
+        assert!(a.triggers(&json!({"chat": {"type": "private"}, "voice": {"file_id": "v"}})));
+        assert!(!a.triggers(&json!({"chat": {"type": "group"}, "voice": {"file_id": "v"}})));
+        assert!(a.triggers(&json!({
+            "chat": {"type": "group"}, "voice": {"file_id": "v"},
+            "caption": "@scout_bot listen to this"
         })));
     }
 
