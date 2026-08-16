@@ -12,11 +12,15 @@ pub mod index;
 pub mod inference;
 pub mod lease;
 pub mod mcp;
+pub mod plugin;
+pub mod presence;
 pub mod publish;
 pub mod relay;
 pub mod routing;
 pub mod runner;
+pub mod slack;
 pub mod spend;
+pub mod telegram;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

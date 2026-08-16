@@ -55,9 +55,18 @@ model runs). What exists today:
 - Tiered log publication: public entries publish as-is, self-tier publish
   NIP-44-wrapped to the agent's own key, local never leaves; the remote
   copy is fetched, verified, and decrypted back — portable memory, proven
-- Buzz membership: NIP-42 auth with the agent's own key — channels,
-  posting, profiles, and a mention listener that answers through the
-  governed run path (loop-guarded, causally timestamped)
+- **Multi-channel presence**: an agent lives on many platforms at once —
+  Buzz (NIP-42, the agent's own key), Telegram (Bot API long poll, sealed
+  token, chat allowlist), Slack (Socket Mode, sealed app+bot tokens), and
+  anything the community builds via the **Channel Plugin Protocol**
+  (`apiary-channel/1`, docs/CHANNEL_PLUGINS.md): plugins are executables
+  speaking newline JSON-RPC on stdio, spawned env-scrubbed, handed their
+  one sealed credential at initialize. Every mention on every platform
+  takes the same governed path (logged, DATA-framed, budgeted); one lease
+  spans all of an agent's channels; the supervisor runs, restarts, and
+  bounces each channel independently. Alongside MCP (tools) and ACP
+  (harnesses), presence plugins complete Apiary's three plugin standards —
+  only the last one is ours, because only it had no industry standard
 - **Lease**: single-host standing presence via agent-signed replaceable
   relay events; contested starts refuse and name the holder; takeover is
   `contested-human` — a button a person presses; the loser yields within

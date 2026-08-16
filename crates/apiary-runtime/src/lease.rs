@@ -205,6 +205,73 @@ pub fn release(
     Ok(())
 }
 
+/// The per-agent lease keeper: claims once for ALL of an agent's presence
+/// channels, heartbeats, yields on a foreign seq bump, releases on
+/// graceful stop. `lost` flips when the lease is contested at claim or
+/// superseded later — the supervisor stops every channel of the agent.
+#[allow(clippy::too_many_arguments)]
+pub fn run_keeper(
+    custody: &Custody,
+    agent: &AgentHandle,
+    relays: &[String],
+    agent_hex: &str,
+    host: &str,
+    heartbeat_secs: u64,
+    expiry_secs: u64,
+    stop: &std::sync::atomic::AtomicBool,
+    lost: &std::sync::atomic::AtomicBool,
+    mut sink: impl FnMut(String),
+) -> Result<(), crate::Error> {
+    use std::sync::atomic::Ordering;
+    let heartbeat_secs = heartbeat_secs.max(10);
+    let expiry_secs = expiry_secs.max(heartbeat_secs * 2);
+    let seq = match claim(custody, agent, relays, agent_hex, host, expiry_secs)? {
+        Claim::Held { seq } => {
+            sink(format!("lease claimed (host {host}, seq {seq})"));
+            seq
+        }
+        Claim::Contested(l) => {
+            sink(format!(
+                "lease held by host {} (seq {}) — presence blocked; takeover is a human decision",
+                l.host, l.seq
+            ));
+            lost.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+    };
+    let mut last = std::time::Instant::now();
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            match release(custody, agent, relays, host, seq) {
+                Ok(()) => sink("lease released".into()),
+                Err(e) => sink(format!("lease release failed ({e}) — expires naturally")),
+            }
+            return Ok(());
+        }
+        if last.elapsed().as_secs() >= heartbeat_secs {
+            last = std::time::Instant::now();
+            match fetch(relays, agent_hex) {
+                Some(l) if l.host != host && l.seq > seq => {
+                    sink(format!(
+                        "lease superseded by host {} (seq {}) — yielding all channels",
+                        l.host, l.seq
+                    ));
+                    lost.store(true, Ordering::Relaxed);
+                    return Ok(());
+                }
+                _ => {
+                    if let Err(e) =
+                        publish(custody, agent, relays, host, seq, now_secs() + expiry_secs)
+                    {
+                        sink(format!("lease heartbeat failed ({e}); retrying next tick"));
+                    }
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

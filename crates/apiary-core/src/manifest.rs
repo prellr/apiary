@@ -146,41 +146,48 @@ fn default_index() -> String {
     "local".into()
 }
 
+/// Standing presence: which platforms the agent LIVES on, answering when
+/// spoken to. A map so channels are pluggable — built-ins (buzz, telegram,
+/// slack) and installed Channel Plugin Protocol plugins share one shape.
+/// Where the agent lives is constitutional: each entry is ratified.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Presence {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agui: Option<AguiPresence>,
-    /// Standing Buzz-workspace membership. Declared here because WHERE the
-    /// agent lives is constitutional — adding or moving a workspace is an
-    /// amendment a human ratifies. The host supervises the listener while
-    /// the agent is active (activation itself is host-local operational
-    /// state, not part of the constitution).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub buzz: Option<BuzzPresence>,
+    #[serde(flatten)]
+    pub channels: std::collections::BTreeMap<String, PresenceChannel>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BuzzPresence {
-    /// The workspace relay (wss://…).
-    pub relay: String,
-    /// Mention trigger text; defaults to "@" + the agent's stored name.
+/// One presence channel: an optional credential sealed to the agent (a
+/// platform token — the platform shim; the identity stays the npub) plus
+/// kind-specific configuration keys.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PresenceChannel {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub trigger: Option<String>,
+    pub credential: Option<EncryptedBlob>,
+    #[serde(flatten)]
+    pub config: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AguiPresence {
-    pub endpoint: String,
-    /// Session auth scheme; "nip98" binds the AG-UI session to the npub.
-    #[serde(default = "default_agui_auth")]
-    pub auth: String,
+impl Presence {
+    pub fn channel(&self, kind: &str) -> Option<&PresenceChannel> {
+        self.channels.get(kind)
+    }
 }
 
-fn default_agui_auth() -> String {
-    "nip98".into()
+impl PresenceChannel {
+    pub fn str_config(&self, key: &str) -> Option<&str> {
+        self.config.get(key).and_then(|v| v.as_str())
+    }
+    pub fn list_config(&self, key: &str) -> Vec<String> {
+        self.config
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

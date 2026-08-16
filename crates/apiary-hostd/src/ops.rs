@@ -27,22 +27,6 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// One running Buzz mention listener. The thread detaches; `stop` is the
-/// only control and `done` the only completion signal — no join handles to
-/// poison a request path.
-pub struct ListenerHandle {
-    pub stop: Arc<AtomicBool>,
-    pub done: Arc<AtomicBool>,
-    pub relay: String,
-    pub trigger: String,
-    pub started_at: u64,
-    pub lines: Arc<Mutex<VecDeque<String>>>,
-    /// Hash of the manifest the listener started under. The supervisor
-    /// stops the listener when the on-disk manifest diverges — a running
-    /// listener must never keep acting under a superseded constitution.
-    pub manifest_sha: String,
-}
-
 fn push_line(lines: &Mutex<VecDeque<String>>, line: String) {
     if let Ok(mut q) = lines.lock() {
         if q.len() >= 300 {
@@ -133,11 +117,17 @@ pub async fn status(
         .lock()
         .map(|m| {
             m.iter()
-                .map(|(npub, l)| {
+                .map(|(npub, p)| {
+                    let running: Vec<&String> = p
+                        .channels
+                        .iter()
+                        .filter(|(_, c)| !c.done.load(Ordering::Relaxed))
+                        .map(|(k, _)| k)
+                        .collect();
                     json!({
                         "npub": npub,
-                        "relay": l.relay,
-                        "running": !l.done.load(Ordering::Relaxed),
+                        "channels": running,
+                        "running": !running.is_empty(),
                     })
                 })
                 .collect()
@@ -941,223 +931,6 @@ pub async fn buzz_join(
 
 // ---------------------------------------------------------------- listener
 
-#[derive(serde::Deserialize)]
-pub struct ListenBody {
-    relay: String,
-    #[serde(default)]
-    trigger: Option<String>,
-}
-
-/// Start a listener for an agent unless one is already running. The manual
-/// endpoint and the supervisor share this path, so the gates are identical:
-/// ratified constitution, unlocked keystore, one listener per agent.
-pub async fn ensure_listener(
-    state: &App,
-    npub: &str,
-    relay: &str,
-    trigger: Option<String>,
-) -> Result<serde_json::Value, Resp> {
-    let ks = Keystore::open(&state.home).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let dir = ks.agent_dir(npub);
-    let raw = std::fs::read_to_string(dir.join("manifest.yaml"))
-        .map_err(|e| err(StatusCode::NOT_FOUND, e))?;
-    let manifest = apiary_core::manifest::Manifest::from_yaml(&raw)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let pass = require_pass(state)?;
-    // One listener per agent; reap a finished one silently.
-    {
-        let mut map = state.listeners.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(existing) = map.get(npub) {
-            if !existing.done.load(Ordering::Relaxed) {
-                return Err(err(
-                    StatusCode::CONFLICT,
-                    "listener already running for this agent",
-                ));
-            }
-            map.remove(npub);
-        }
-    }
-    // Nothing runs unratified — same gate as the CLI.
-    let agent_pk =
-        apiary_core::identity::parse_npub(npub).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
-    let log = EpisodicLog::open(&dir);
-    match ceremony::is_ratified(&log, &raw, &agent_pk, &suspend_pks(&manifest)) {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(err(
-                StatusCode::PRECONDITION_FAILED,
-                "manifest is not ratified — nothing runs unratified",
-            ))
-        }
-        Err(e) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
-    }
-    let name = std::fs::read_to_string(dir.join("name"))
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let trigger = trigger
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| format!("@{name}"));
-    // Load keys off the async runtime (NIP-49 scrypt is slow by design),
-    // so a wrong passphrase fails HERE, not silently inside the thread.
-    let npub2 = npub.to_string();
-    let ks2 = Keystore::open(&state.home).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let admit_result = tokio::task::spawn_blocking(move || admit(&ks2, &npub2, &pass)).await;
-    let (custody, handle) = match admit_result {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => return Err(e),
-        Err(e) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
-    };
-    let stop = Arc::new(AtomicBool::new(false));
-    let done = Arc::new(AtomicBool::new(false));
-    let lines = Arc::new(Mutex::new(VecDeque::new()));
-    let entry = ListenerHandle {
-        stop: stop.clone(),
-        done: done.clone(),
-        relay: relay.to_string(),
-        trigger: trigger.clone(),
-        started_at: now_secs(),
-        lines: lines.clone(),
-        manifest_sha: ceremony::manifest_hash(&raw),
-    };
-    let relay2 = relay.to_string();
-    let trigger2 = trigger.clone();
-    std::thread::spawn(move || {
-        push_line(&lines, format!("listening (trigger {trigger2:?} or p-tag)"));
-        let sink_lines = lines.clone();
-        let result = apiary_runtime::buzz::run_mention_service(
-            &manifest,
-            &dir,
-            &custody,
-            &handle,
-            &relay2,
-            &trigger2,
-            &stop,
-            move |line| push_line(&sink_lines, line),
-        );
-        match result {
-            Ok(()) => push_line(&lines, "listener stopped".into()),
-            Err(e) => push_line(&lines, format!("listener died: {e}")),
-        }
-        done.store(true, Ordering::Relaxed);
-    });
-    state
-        .listeners
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(npub.to_string(), entry);
-    Ok(json!({
-        "ok": true,
-        "npub": npub,
-        "relay": relay,
-        "trigger": trigger,
-        "running": true,
-    }))
-}
-
-/// Start the managed mention listener for an agent: ratification-gated,
-/// runs run_mention_service on a detached thread, activity into a ring
-/// buffer the status endpoint serves.
-pub async fn listener_start(
-    State(state): State<App>,
-    AxPath(npub): AxPath<String>,
-    OriginalUri(uri): OriginalUri,
-    headers: axum::http::HeaderMap,
-    raw_body: axum::body::Bytes,
-) -> impl IntoResponse {
-    let (_ks, npub, _dir, _raw, _manifest) =
-        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
-            Ok(v) => v,
-            Err(e) => return e.into_response(),
-        };
-    let body: ListenBody = match serde_json::from_slice(&raw_body) {
-        Ok(b) => b,
-        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
-    };
-    match ensure_listener(&state, &npub, &body.relay, body.trigger).await {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => e.into_response(),
-    }
-}
-
-pub async fn listener_status(
-    State(state): State<App>,
-    AxPath(npub): AxPath<String>,
-    OriginalUri(uri): OriginalUri,
-    headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
-    let (_ks, npub, dir, _raw, m) = match gate(&state, &headers, "GET", &uri, None, &npub) {
-        Ok(v) => v,
-        Err(e) => return e.into_response(),
-    };
-    let active = is_active(&dir);
-    let declared = m.presence.buzz.as_ref().map(|b| b.relay.clone());
-    let note = state
-        .supervisor_notes
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&npub)
-        .cloned();
-    let map = state.listeners.lock().unwrap_or_else(|e| e.into_inner());
-    match map.get(&npub) {
-        Some(l) => {
-            let lines: Vec<String> = l
-                .lines
-                .lock()
-                .map(|q| q.iter().rev().take(60).rev().cloned().collect())
-                .unwrap_or_default();
-            Json(json!({
-                "ok": true,
-                "npub": npub,
-                "running": !l.done.load(Ordering::Relaxed),
-                "relay": l.relay,
-                "trigger": l.trigger,
-                "started_at": l.started_at,
-                "lines": lines,
-                "active": active,
-                "declared_relay": declared,
-                "supervisor_note": note,
-            }))
-            .into_response()
-        }
-        None => Json(json!({
-            "ok": true,
-            "npub": npub,
-            "running": false,
-            "active": active,
-            "declared_relay": declared,
-            "supervisor_note": note,
-        }))
-        .into_response(),
-    }
-}
-
-pub async fn listener_stop(
-    State(state): State<App>,
-    AxPath(npub): AxPath<String>,
-    OriginalUri(uri): OriginalUri,
-    headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
-    let (_ks, npub, _dir, _raw, _m) = match gate(&state, &headers, "DELETE", &uri, None, &npub) {
-        Ok(v) => v,
-        Err(e) => return e.into_response(),
-    };
-    let mut map = state.listeners.lock().unwrap_or_else(|e| e.into_inner());
-    match map.remove(&npub) {
-        Some(l) => {
-            l.stop.store(true, Ordering::Relaxed);
-            Json(json!({
-                "ok": true,
-                "npub": npub,
-                "running": false,
-                "note": "stop signalled — the thread exits within its keepalive interval (≤15s)",
-            }))
-            .into_response()
-        }
-        None => err(StatusCode::NOT_FOUND, "no listener for this agent").into_response(),
-    }
-}
-
 // ---------------------------------------------------------------- activation
 
 /// Host-local operational state: while a marker file exists in the agent's
@@ -1203,18 +976,18 @@ pub async fn set_active(
         return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
     // Deactivation takes effect immediately rather than on the next
-    // supervisor tick.
+    // supervisor tick — every channel and the lease keeper.
     if !body.active {
         let mut map = state.listeners.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(l) = map.remove(&npub) {
-            l.stop.store(true, Ordering::Relaxed);
+        if let Some(mut p) = map.remove(&npub) {
+            stop_all(&mut p);
         }
     }
     Json(json!({
         "ok": true,
         "npub": npub,
         "active": body.active,
-        "buzz_declared": manifest.presence.buzz.is_some(),
+        "declared_channels": manifest.presence.channels.keys().cloned().collect::<Vec<_>>(),
         "note": if body.active {
             "active — the supervisor starts declared presence within ~10s"
         } else {
@@ -1225,132 +998,6 @@ pub async fn set_active(
 }
 
 // ---------------------------------------------------------------- supervisor
-
-/// The presence supervisor: reconciles desired state (agent ACTIVE and
-/// manifest declares presence.buzz) with reality (listener running) every
-/// tick. Starts declared listeners, restarts dead ones (with backoff so a
-/// dead relay is not hammered), and stops any listener whose agent went
-/// inactive. Locked keystore and unratified manifests simply wait — the
-/// supervisor never weakens a gate, it only presses the same button an
-/// operator would.
-pub fn spawn_supervisor(state: App) {
-    tokio::spawn(async move {
-        let mut last_attempt: std::collections::HashMap<String, u64> =
-            std::collections::HashMap::new();
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            reconcile(&state, &mut last_attempt).await;
-        }
-    });
-}
-
-const RETRY_BACKOFF_SECS: u64 = 30;
-
-async fn reconcile(state: &App, last_attempt: &mut std::collections::HashMap<String, u64>) {
-    let Ok(ks) = Keystore::open(&state.home) else {
-        return;
-    };
-    let Ok(agents) = ks.list() else {
-        return;
-    };
-    for npub in agents {
-        let dir = ks.agent_dir(&npub);
-        let active = is_active(&dir);
-        let disk_sha = std::fs::read_to_string(dir.join("manifest.yaml"))
-            .ok()
-            .map(|raw| ceremony::manifest_hash(&raw));
-        let running = {
-            let mut map = state.listeners.lock().unwrap_or_else(|e| e.into_inner());
-            match map.get(&npub) {
-                Some(l) if !l.done.load(Ordering::Relaxed) => {
-                    if !active {
-                        // Inactive agents hold no standing presence, however
-                        // the listener was started.
-                        if let Some(l) = map.remove(&npub) {
-                            l.stop.store(true, Ordering::Relaxed);
-                        }
-                        continue;
-                    } else if disk_sha.as_deref() != Some(l.manifest_sha.as_str()) {
-                        // Constitution changed under a live listener: stop it.
-                        // ensure_listener refuses to restart until the new
-                        // manifest is ratified, then brings it back with the
-                        // new capabilities bound.
-                        eprintln!(
-                            "supervisor: manifest changed for {npub} — stopping listener pending re-ratification"
-                        );
-                        if let Some(l) = map.remove(&npub) {
-                            l.stop.store(true, Ordering::Relaxed);
-                        }
-                        continue;
-                    } else {
-                        true
-                    }
-                }
-                Some(_) => {
-                    // Finished thread: reap so a restart can happen below,
-                    // keeping its last words (contested lease, crash) where
-                    // the GUI can see them.
-                    if let Some(dead) = map.remove(&npub) {
-                        if let Ok(q) = dead.lines.lock() {
-                            if let Some(last) = q.iter().rev().find(|l| l.contains("listener died"))
-                            {
-                                state
-                                    .supervisor_notes
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .insert(npub.clone(), last.clone());
-                            }
-                        }
-                    }
-                    false
-                }
-                None => false,
-            }
-        };
-        if !active || running {
-            continue;
-        }
-        let declared = std::fs::read_to_string(dir.join("manifest.yaml"))
-            .ok()
-            .and_then(|raw| apiary_core::manifest::Manifest::from_yaml(&raw).ok())
-            .and_then(|m| m.presence.buzz);
-        let Some(buzz) = declared else {
-            continue; // active, but no declared presence — nothing to supervise
-        };
-        if state.passphrase_clone().is_none() {
-            continue; // locked keystore: wait for the operator to unlock
-        }
-        let now = now_secs();
-        if now.saturating_sub(*last_attempt.get(&npub).unwrap_or(&0)) < RETRY_BACKOFF_SECS {
-            continue;
-        }
-        last_attempt.insert(npub.clone(), now);
-        match ensure_listener(state, &npub, &buzz.relay, buzz.trigger.clone()).await {
-            Ok(_) => {
-                eprintln!("supervisor: started listener for {npub} on {}", buzz.relay);
-                state
-                    .supervisor_notes
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&npub);
-            }
-            Err((_, body)) => {
-                let msg = body
-                    .0
-                    .get("error")
-                    .and_then(|e| e.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                eprintln!("supervisor: could not start listener for {npub}: {msg}");
-                state
-                    .supervisor_notes
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(npub.clone(), msg);
-            }
-        }
-    }
-}
 
 // ---------------------------------------------------------------- connectors
 
@@ -2410,4 +2057,718 @@ pub async fn import_agent(
         .into_response(),
         Err(e) => err(StatusCode::BAD_REQUEST, e).into_response(),
     }
+}
+
+// ============================================================ presence
+
+/// One running channel thread for one agent.
+pub struct ChannelHandle {
+    pub stop: Arc<AtomicBool>,
+    pub done: Arc<AtomicBool>,
+    pub started_at: u64,
+    pub lines: Arc<Mutex<VecDeque<String>>>,
+}
+
+/// The per-agent lease keeper thread: one lease spans every channel.
+pub struct KeeperHandle {
+    pub stop: Arc<AtomicBool>,
+    pub done: Arc<AtomicBool>,
+    pub lost: Arc<AtomicBool>,
+    pub lines: Arc<Mutex<VecDeque<String>>>,
+}
+
+/// Everything the host is running for one agent's standing presence.
+#[derive(Default)]
+pub struct AgentPresence {
+    /// Manifest hash the presence started under — a diverging disk hash
+    /// bounces every channel (amendment-bounce, now agent-wide).
+    pub manifest_sha: String,
+    pub keeper: Option<KeeperHandle>,
+    pub channels: std::collections::HashMap<String, ChannelHandle>,
+}
+
+fn stop_all(p: &mut AgentPresence) {
+    for (_, ch) in p.channels.drain() {
+        ch.stop.store(true, Ordering::Relaxed);
+    }
+    if let Some(k) = p.keeper.take() {
+        k.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The channel kinds this host can start for a manifest entry: built-ins
+/// plus installed Channel Plugin Protocol plugins.
+pub fn available_kinds(state: &AppState) -> Vec<String> {
+    let mut kinds: Vec<String> = apiary_runtime::presence::PRESENCE_KINDS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if let Ok(reg) = apiary_runtime::plugin::load_registry(&state.home) {
+        for p in reg.plugins {
+            if !kinds.contains(&p.name) {
+                kinds.push(p.name);
+            }
+        }
+    }
+    kinds
+}
+
+/// Spawn one channel thread. All slow work (scrypt key load, network
+/// connects) happens inside the thread; failures land in the ring buffer
+/// and flip `done` so the supervisor can reap, note, and back off.
+#[allow(clippy::too_many_arguments)]
+fn spawn_channel(
+    state: &AppState,
+    npub: &str,
+    kind: &str,
+    dir: std::path::PathBuf,
+    manifest: apiary_core::manifest::Manifest,
+    keeper_lost: Option<Arc<AtomicBool>>,
+) -> Result<ChannelHandle, String> {
+    let entry = manifest
+        .presence
+        .channel(kind)
+        .cloned()
+        .ok_or_else(|| format!("manifest declares no presence.{kind}"))?;
+    let pass = state
+        .passphrase_clone()
+        .ok_or("keystore is locked — unlock first")?;
+    let home = state.home.clone();
+    let npub = npub.to_string();
+    let kind = kind.to_string();
+    let stop = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let lines = Arc::new(Mutex::new(VecDeque::new()));
+    let handle = ChannelHandle {
+        stop: stop.clone(),
+        done: done.clone(),
+        started_at: now_secs(),
+        lines: lines.clone(),
+    };
+    // Installed plugin specs resolve outside the thread (cheap, fallible
+    // in a way the caller should see immediately).
+    let plugin_spec = if apiary_runtime::presence::PRESENCE_KINDS.contains(&kind.as_str()) {
+        None
+    } else {
+        let reg = apiary_runtime::plugin::load_registry(&state.home).map_err(|e| e.to_string())?;
+        Some(
+            reg.plugins
+                .into_iter()
+                .find(|p| p.name == kind)
+                .ok_or_else(|| {
+                    format!("presence.{kind} declared but no such plugin is installed")
+                })?,
+        )
+    };
+    std::thread::spawn(move || {
+        let fail = |lines: &Mutex<VecDeque<String>>, done: &AtomicBool, msg: String| {
+            push_line(lines, msg);
+            done.store(true, Ordering::Relaxed);
+        };
+        let ks = match Keystore::open(&home) {
+            Ok(k) => k,
+            Err(e) => return fail(&lines, &done, format!("keystore: {e}")),
+        };
+        let (custody, agent_handle) = match admit(&ks, &npub, &pass) {
+            Ok(v) => v,
+            Err((_, j)) => return fail(&lines, &done, format!("channel died: {}", j.0)),
+        };
+        let name = std::fs::read_to_string(dir.join("name"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        // Open the sealed platform credential just-in-time, in-thread.
+        let credential_plain = match &entry.credential {
+            None => None,
+            Some(blob) => match custody.open(&agent_handle, blob) {
+                Ok(z) => Some(z.as_str().to_string()),
+                Err(e) => return fail(&lines, &done, format!("channel died: credential: {e}")),
+            },
+        };
+        let sink_lines = lines.clone();
+        let mut sink = move |l: String| push_line(&sink_lines, l);
+        let on_tick_lost = keeper_lost.clone();
+        let result: Result<(), apiary_runtime::Error> = (|| {
+            let mut adapter: Box<dyn apiary_runtime::presence::ChannelAdapter> = match kind.as_str()
+            {
+                "buzz" => {
+                    let relay = entry
+                        .str_config("relay")
+                        .ok_or_else(|| {
+                            apiary_runtime::Error::Provider(
+                                "presence.buzz requires config relay".into(),
+                            )
+                        })?
+                        .to_string();
+                    let trigger = entry
+                        .str_config("trigger")
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("@{name}"));
+                    Box::new(apiary_runtime::buzz::BuzzAdapter::connect(
+                        &relay,
+                        &custody,
+                        &agent_handle,
+                        trigger,
+                    )?)
+                }
+                "telegram" => {
+                    let token = credential_plain.as_deref().ok_or_else(|| {
+                        apiary_runtime::Error::Provider(
+                            "presence.telegram requires a sealed bot-token credential".into(),
+                        )
+                    })?;
+                    Box::new(apiary_runtime::telegram::TelegramAdapter::connect(
+                        token,
+                        entry.list_config("allowed_chats"),
+                    )?)
+                }
+                "slack" => {
+                    let cred = credential_plain.as_deref().ok_or_else(|| {
+                        apiary_runtime::Error::Provider(
+                            "presence.slack requires a sealed {app_token, bot_token} credential"
+                                .into(),
+                        )
+                    })?;
+                    Box::new(apiary_runtime::slack::SlackAdapter::connect(
+                        cred,
+                        entry.list_config("allowed_channels"),
+                    )?)
+                }
+                _ => {
+                    let spec = plugin_spec.as_ref().expect("resolved before spawn");
+                    let config = serde_json::to_value(&entry.config).unwrap_or_default();
+                    Box::new(apiary_runtime::plugin::PluginAdapter::connect(
+                        spec,
+                        &config,
+                        credential_plain.as_deref(),
+                    )?)
+                }
+            };
+            apiary_runtime::presence::run_presence(
+                adapter.as_mut(),
+                &manifest,
+                &dir,
+                &custody,
+                &agent_handle,
+                &stop,
+                || {
+                    Ok(on_tick_lost
+                        .as_ref()
+                        .map(|l| !l.load(Ordering::Relaxed))
+                        .unwrap_or(true))
+                },
+                &mut sink,
+            )
+        })();
+        match result {
+            Ok(()) => push_line(&lines, format!("{kind}: channel stopped")),
+            Err(e) => push_line(&lines, format!("channel died: {e}")),
+        }
+        done.store(true, Ordering::Relaxed);
+    });
+    Ok(handle)
+}
+
+fn spawn_keeper(
+    state: &AppState,
+    npub: &str,
+    manifest: &apiary_core::manifest::Manifest,
+) -> Result<Option<KeeperHandle>, String> {
+    let relays = manifest.memory.log_relays.clone();
+    if relays.is_empty() {
+        return Ok(None); // uncoordinated, loudly noted by the caller
+    }
+    let pass = state
+        .passphrase_clone()
+        .ok_or("keystore is locked — unlock first")?;
+    let home = state.home.clone();
+    let npub = npub.to_string();
+    let heartbeat = manifest.lease.heartbeat_secs;
+    let expiry = manifest.lease.expiry_secs;
+    let stop = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let lost = Arc::new(AtomicBool::new(false));
+    let lines = Arc::new(Mutex::new(VecDeque::new()));
+    let handle = KeeperHandle {
+        stop: stop.clone(),
+        done: done.clone(),
+        lost: lost.clone(),
+        lines: lines.clone(),
+    };
+    std::thread::spawn(move || {
+        let sink_lines = lines.clone();
+        let mut sink = move |l: String| push_line(&sink_lines, l);
+        let run = (|| -> Result<(), apiary_runtime::Error> {
+            let ks = Keystore::open(&home)?;
+            let (custody, agent_handle) = admit(&ks, &npub, &pass)
+                .map_err(|(_, j)| apiary_runtime::Error::Provider(j.0.to_string()))?;
+            let agent_hex = agent_handle.pubkey().to_hex();
+            let host = apiary_runtime::lease::host_id(&home);
+            apiary_runtime::lease::run_keeper(
+                &custody,
+                &agent_handle,
+                &relays,
+                &agent_hex,
+                &host,
+                heartbeat,
+                expiry,
+                &stop,
+                &lost,
+                &mut sink,
+            )
+        })();
+        if let Err(e) = run {
+            push_line(&lines, format!("lease keeper died: {e}"));
+            lost.store(true, Ordering::Relaxed);
+        }
+        done.store(true, Ordering::Relaxed);
+    });
+    Ok(Some(handle))
+}
+
+pub fn spawn_supervisor(state: App) {
+    tokio::spawn(async move {
+        let mut backoff: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            reconcile(&state, &mut backoff);
+        }
+    });
+}
+
+const RETRY_BACKOFF_SECS: u64 = 30;
+
+/// Reconcile desired presence (ACTIVE + declared + ratified + unlocked,
+/// lease permitting) with running threads, per (agent, channel). One
+/// channel failing never blocks its siblings; the keeper failing stops
+/// them all — the lease is agent-wide.
+fn reconcile(state: &App, backoff: &mut std::collections::HashMap<String, u64>) {
+    let Ok(ks) = Keystore::open(&state.home) else {
+        return;
+    };
+    let Ok(agents) = ks.list() else {
+        return;
+    };
+    let kinds_available = available_kinds(state);
+    for npub in agents {
+        let dir = ks.agent_dir(&npub);
+        let active = is_active(&dir);
+        let raw = std::fs::read_to_string(dir.join("manifest.yaml")).unwrap_or_default();
+        let disk_sha = ceremony::manifest_hash(&raw);
+        let manifest = apiary_core::manifest::Manifest::from_yaml(&raw).ok();
+        let mut map = state.listeners.lock().unwrap_or_else(|e| e.into_inner());
+        let presence = map.entry(npub.clone()).or_default();
+
+        // Inactive, unparseable, or amended: everything stops.
+        let declared: Vec<String> = manifest
+            .as_ref()
+            .map(|m| m.presence.channels.keys().cloned().collect())
+            .unwrap_or_default();
+        if !active || manifest.is_none() || declared.is_empty() {
+            stop_all(presence);
+            map.remove(&npub);
+            continue;
+        }
+        if !presence.channels.is_empty() && presence.manifest_sha != disk_sha {
+            eprintln!("supervisor: manifest changed for {npub} — bouncing all channels");
+            stop_all(presence);
+            presence.manifest_sha.clear();
+            continue; // restart next tick, ratification permitting
+        }
+        let manifest = manifest.expect("checked above");
+
+        // Ratification gates everything (checked only when we may start).
+        let needs_start = presence.keeper.is_none()
+            || declared.iter().any(|k| !presence.channels.contains_key(k));
+        if needs_start {
+            let suspend = suspend_pks(&manifest);
+            let Ok(agent_pk) = apiary_core::identity::parse_npub(&npub) else {
+                continue;
+            };
+            let log = EpisodicLog::open(&dir);
+            if !ceremony::is_ratified(&log, &raw, &agent_pk, &suspend).unwrap_or(false) {
+                state
+                    .supervisor_notes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        npub.clone(),
+                        "manifest is not ratified — nothing runs".into(),
+                    );
+                stop_all(presence);
+                continue;
+            }
+            if state.passphrase_clone().is_none() {
+                continue; // locked: wait quietly
+            }
+        }
+
+        // Keeper first: the lease spans all channels.
+        let mut keeper_lost = None;
+        if let Some(k) = &presence.keeper {
+            if k.lost.load(Ordering::Relaxed) {
+                // Contested or superseded: stop channels; retry the claim
+                // after backoff (a released/expired foreign lease clears it).
+                let note = k
+                    .lines
+                    .lock()
+                    .ok()
+                    .and_then(|q| q.iter().rev().find(|l| l.contains("lease")).cloned())
+                    .unwrap_or_else(|| "lease unavailable".into());
+                state
+                    .supervisor_notes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(npub.clone(), note);
+                for (_, ch) in presence.channels.drain() {
+                    ch.stop.store(true, Ordering::Relaxed);
+                }
+                if k.done.load(Ordering::Relaxed)
+                    && now_secs().saturating_sub(*backoff.get(&npub).unwrap_or(&0))
+                        >= RETRY_BACKOFF_SECS
+                {
+                    presence.keeper = None; // re-claim next tick
+                }
+                continue;
+            }
+            keeper_lost = Some(k.lost.clone());
+        } else {
+            match spawn_keeper(state, &npub, &manifest) {
+                Ok(Some(k)) => {
+                    keeper_lost = Some(k.lost.clone());
+                    presence.keeper = Some(k);
+                    presence.manifest_sha = disk_sha.clone();
+                    backoff.insert(npub.clone(), now_secs());
+                }
+                Ok(None) => {
+                    presence.manifest_sha = disk_sha.clone();
+                    state
+                        .supervisor_notes
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(
+                            npub.clone(),
+                            "no memory.log_relays — presence runs WITHOUT cross-host coordination"
+                                .into(),
+                        );
+                }
+                Err(e) => {
+                    eprintln!("supervisor: keeper for {npub}: {e}");
+                    continue;
+                }
+            }
+        }
+
+        // Channels: start what's declared, reap what died.
+        let mut started_any = false;
+        for kind in &declared {
+            if !kinds_available.contains(kind) {
+                state
+                    .supervisor_notes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        format!("{npub}:{kind}"),
+                        format!("presence.{kind} declared but not installed on this host"),
+                    );
+                continue;
+            }
+            if let Some(ch) = presence.channels.get(kind) {
+                if !ch.done.load(Ordering::Relaxed) {
+                    continue; // healthy
+                }
+                // Reap, keep last words, back off before restart.
+                let last = ch
+                    .lines
+                    .lock()
+                    .ok()
+                    .and_then(|q| q.iter().rev().find(|l| l.contains("died")).cloned());
+                if let Some(l) = last {
+                    state
+                        .supervisor_notes
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(format!("{npub}:{kind}"), l);
+                }
+                presence.channels.remove(kind);
+            }
+            let key = format!("{npub}:{kind}");
+            if now_secs().saturating_sub(*backoff.get(&key).unwrap_or(&0)) < RETRY_BACKOFF_SECS {
+                continue;
+            }
+            backoff.insert(key.clone(), now_secs());
+            match spawn_channel(
+                state,
+                &npub,
+                kind,
+                dir.clone(),
+                manifest.clone(),
+                keeper_lost.clone(),
+            ) {
+                Ok(handle) => {
+                    eprintln!("supervisor: started {kind} channel for {npub}");
+                    presence.channels.insert(kind.clone(), handle);
+                    presence.manifest_sha = disk_sha.clone();
+                    started_any = true;
+                    state
+                        .supervisor_notes
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&key);
+                }
+                Err(e) => {
+                    eprintln!("supervisor: {kind} for {npub}: {e}");
+                    state
+                        .supervisor_notes
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(key, e);
+                }
+            }
+        }
+        if started_any {
+            state
+                .supervisor_notes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&npub);
+        }
+    }
+}
+
+// -------------------------------------------------- presence endpoints
+
+#[derive(serde::Deserialize)]
+pub struct ChannelQuery {
+    #[serde(default)]
+    channel: Option<String>,
+}
+
+pub async fn listener_status(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, m) = match gate(&state, &headers, "GET", &uri, None, &npub) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    let active = is_active(&dir);
+    let declared: Vec<String> = m.presence.channels.keys().cloned().collect();
+    let notes = state
+        .supervisor_notes
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let map = state.listeners.lock().unwrap_or_else(|e| e.into_inner());
+    let presence = map.get(&npub);
+    let mut channels = serde_json::Map::new();
+    for kind in &declared {
+        let running = presence
+            .and_then(|p| p.channels.get(kind))
+            .map(|c| !c.done.load(Ordering::Relaxed))
+            .unwrap_or(false);
+        let lines: Vec<String> = presence
+            .and_then(|p| p.channels.get(kind))
+            .and_then(|c| {
+                c.lines
+                    .lock()
+                    .ok()
+                    .map(|q| q.iter().rev().take(30).rev().cloned().collect())
+            })
+            .unwrap_or_default();
+        channels.insert(
+            kind.clone(),
+            json!({
+                "running": running,
+                "lines": lines,
+                "note": notes.get(&format!("{npub}:{kind}")),
+            }),
+        );
+    }
+    let keeper = presence.and_then(|p| p.keeper.as_ref()).map(|k| {
+        json!({
+            "running": !k.done.load(Ordering::Relaxed),
+            "lost": k.lost.load(Ordering::Relaxed),
+            "lines": k.lines.lock().ok().map(|q| q.iter().rev().take(10).rev().cloned().collect::<Vec<_>>()),
+        })
+    });
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "active": active,
+        "declared": declared,
+        "channels": channels,
+        "lease_keeper": keeper,
+        "supervisor_note": notes.get(&npub),
+    }))
+    .into_response()
+}
+
+/// Manual stop of one channel (or all when none named). Deactivation is
+/// the real switch; this is the override for a single misbehaving channel.
+pub async fn listener_stop(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    Query(q): Query<ChannelQuery>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, npub, _dir, _raw, _m) = match gate(&state, &headers, "DELETE", &uri, None, &npub) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    let mut map = state.listeners.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(presence) = map.get_mut(&npub) else {
+        return err(StatusCode::NOT_FOUND, "no presence running for this agent").into_response();
+    };
+    match q.channel {
+        Some(kind) => match presence.channels.remove(&kind) {
+            Some(ch) => {
+                ch.stop.store(true, Ordering::Relaxed);
+                Json(json!({"ok": true, "npub": npub, "stopped": kind,
+                    "note": "the supervisor restarts declared channels while the agent is ACTIVE — deactivate to stop for real"}))
+                .into_response()
+            }
+            None => err(
+                StatusCode::NOT_FOUND,
+                format!("no running '{kind}' channel"),
+            )
+            .into_response(),
+        },
+        None => {
+            stop_all(presence);
+            map.remove(&npub);
+            Json(json!({"ok": true, "npub": npub, "stopped": "all",
+                "note": "the supervisor restarts declared channels while the agent is ACTIVE — deactivate to stop for real"}))
+            .into_response()
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct PresenceBody {
+    /// Channel kind: a built-in (buzz, telegram, slack) or an installed
+    /// plugin name.
+    kind: String,
+    /// Platform secret to seal to the agent (bot token; for slack a JSON
+    /// {"app_token":…,"bot_token":…}). Sealed here, never stored elsewhere.
+    #[serde(default)]
+    credential: Option<String>,
+    /// Kind-specific config keys (relay, allowed_chats, …).
+    #[serde(default)]
+    config: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// Declare (or update) a presence channel: an amendment — where the agent
+/// lives is constitutional, so the hash changes and a human re-ratifies.
+pub async fn presence_declare(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (ks, npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    let body: PresenceBody = match serde_json::from_slice(&raw_body) {
+        Ok(b) => b,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    if !available_kinds(&state).contains(&body.kind) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "'{}' is not a channel this host can run (built-ins: {}; plus installed plugins)",
+                body.kind,
+                apiary_runtime::presence::PRESENCE_KINDS.join(", ")
+            ),
+        )
+        .into_response();
+    }
+    let credential = match body.credential.as_deref().filter(|c| !c.is_empty()) {
+        None => None,
+        Some(secret) => {
+            let pass = match require_pass(&state) {
+                Ok(p) => p,
+                Err(e) => return e.into_response(),
+            };
+            let npub2 = npub.clone();
+            let secret = secret.to_string();
+            let sealed = tokio::task::spawn_blocking(move || {
+                let (custody, handle) = admit(&ks, &npub2, &pass)?;
+                custody
+                    .seal(&handle, secret.trim())
+                    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+            })
+            .await
+            .unwrap_or_else(|e| Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)));
+            match sealed {
+                Ok(blob) => Some(blob),
+                Err(e) => return e.into_response(),
+            }
+        }
+    };
+    manifest.presence.channels.insert(
+        body.kind.clone(),
+        apiary_core::manifest::PresenceChannel {
+            credential,
+            config: body.config,
+        },
+    );
+    let yaml = match serde_yaml::to_string(&manifest) {
+        Ok(y) => y,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "declared": body.kind,
+        "manifest_sha256": ceremony::manifest_hash(&yaml),
+        "ratified": false,
+        "note": "presence declared — where the agent lives is constitutional; re-ratify, and the supervisor starts the channel while the agent is ACTIVE",
+    }))
+    .into_response()
+}
+
+pub async fn presence_revoke(
+    State(state): State<App>,
+    AxPath((npub, kind)): AxPath<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "DELETE", &uri, None, &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    if manifest.presence.channels.remove(&kind).is_none() {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("no presence.{kind} declared"),
+        )
+        .into_response();
+    }
+    let yaml = match serde_yaml::to_string(&manifest) {
+        Ok(y) => y,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "revoked": kind,
+        "manifest_sha256": ceremony::manifest_hash(&yaml),
+        "ratified": false,
+        "note": "presence removed — an amendment; re-ratify. The supervisor bounces the channel within a tick.",
+    }))
+    .into_response()
 }

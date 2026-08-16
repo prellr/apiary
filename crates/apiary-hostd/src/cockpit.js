@@ -314,34 +314,69 @@ async function renderOverview(c) {
     toSt.textContent = r.ok ? r.note : 'failed: ' + r.error;
   };
 
-  const lisSec = section('Buzz listener',
-    'When running, the agent answers @mentions in its Buzz workspace through the governed run path. Manage it in the Buzz tab. This line is live — it follows the supervisor.');
-  const lisLine = kv('status', '…');
-  lisSec.append(lisLine);
+  const lisSec = section('Presence channels',
+    'Everywhere the agent LIVES — each channel declared in the manifest (ratified), all supervised together under one lease while the agent is ACTIVE. Declare channels below or in the manifest; this panel is live.');
+  const chanBox = el('div');
+  lisSec.append(chanBox);
   c.append(lisSec);
   const updateListener = async () => {
     const l = await j(api('/listener'));
     if (!l.ok) return;
-    let lstat;
-    if (l.running) {
-      lstat = `running — relay ${l.relay}, trigger ${l.trigger}`;
-    } else if (!l.declared_relay) {
-      lstat = 'not running — no presence.buzz declared in the manifest, so there is nothing to supervise. Add it (see the Manifest field guide), re-ratify, and the supervisor takes over.';
-    } else if (!roster.active) {
-      lstat = `not running — presence.buzz declares ${l.declared_relay}, but the agent is inactive. Activate it above.`;
-    } else if (!hostStatus.unlocked) {
-      lstat = 'waiting — keystore is locked; the supervisor starts the listener once unlocked.';
-    } else if (!d.ratified) {
-      lstat = 'waiting — manifest is not ratified; nothing runs unratified.';
-    } else if (l.supervisor_note) {
-      lstat = 'blocked — ' + l.supervisor_note;
-    } else {
-      lstat = `starting — presence.buzz declares ${l.declared_relay}; the supervisor starts it within ~10s (retries every 30s on failure).`;
+    chanBox.replaceChildren();
+    if (!(l.declared || []).length) {
+      chanBox.append(kv('channels', 'none declared — nothing to supervise (declare below, see the field guide, or use the Buzz tab)'));
     }
-    lisLine.replaceChildren(el('span', 'k', 'status'), el('span', 'v', lstat));
+    for (const kind of (l.declared || [])) {
+      const ch = (l.channels || {})[kind] || {};
+      let status = ch.running ? 'running' : (ch.note || (roster.active ? (hostStatus.unlocked ? 'starting (supervisor ~10s, retry 30s)' : 'waiting — keystore locked') : 'inactive — activate above'));
+      const row = kv(kind, status);
+      const stopB = el('button', 'btn danger', 'STOP');
+      stopB.style.marginLeft = '8px';
+      stopB.style.display = ch.running ? '' : 'none';
+      stopB.onclick = async () => { await j(api('/listener?channel=' + encodeURIComponent(kind)), { method: 'DELETE' }); updateListener(); };
+      row.append(stopB);
+      chanBox.append(row);
+      if ((ch.lines || []).length) {
+        const pre = el('pre'); pre.textContent = ch.lines.slice(-6).join('\n');
+        chanBox.append(pre);
+      }
+    }
+    if (l.lease_keeper) {
+      chanBox.append(kv('lease keeper', l.lease_keeper.lost ? 'LOST — see Lease section' : (l.lease_keeper.running ? 'holding the lease' : 'stopped')));
+    } else if ((l.declared || []).length) {
+      chanBox.append(kv('lease keeper', l.supervisor_note || 'not running'));
+    }
   };
   updateListener();
   listenerPoll = setInterval(updateListener, 3000);
+
+  // Declare-a-channel forms: telegram + slack (buzz has its tab; plugins
+  // declare with the generic form).
+  const decSec = section('Declare presence',
+    'Declaring a channel writes it into the manifest with the platform secret NIP-44-sealed to this agent — an amendment, so re-ratify after. Telegram: a BotFather token + allowed chat ids (["*"] admits anyone, deliberately). Slack: a Socket-Mode app token AND bot token as JSON {"app_token":"xapp-…","bot_token":"xoxb-…"} + optional allowed channel ids. Plugins installed on this host declare by their name with config JSON.');
+  const dKind = el('select');
+  for (const k of ['telegram', 'slack', 'buzz']) { const o = el('option', null, k); o.value = k; dKind.append(o); }
+  const dCred = el('input', 'grow'); dCred.type = 'password'; dCred.placeholder = 'platform secret (token / JSON) — sealed to the agent';
+  const dConf = el('input', 'grow'); dConf.placeholder = 'config JSON (e.g. {"allowed_chats":["123"]} or {"relay":"wss://…"})';
+  const dGo = el('button', 'btn solid', 'DECLARE');
+  const dSt = el('span', 'meta', '');
+  const dRow = el('div', 'row'); dRow.append(dKind, dCred, dConf, dGo, dSt);
+  decSec.append(dRow);
+  c.append(decSec);
+  dGo.onclick = async () => {
+    let config = {};
+    if (dConf.value.trim()) {
+      try { config = JSON.parse(dConf.value); } catch { dSt.textContent = 'config is not valid JSON'; return; }
+    }
+    dSt.textContent = 'sealing + declaring…';
+    const r = await j(api('/presence'), {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ kind: dKind.value, credential: dCred.value || null, config }),
+    });
+    dCred.value = '';
+    dSt.textContent = r.ok ? `declared ${r.declared} — re-ratify in the Manifest tab` : 'refused: ' + r.error;
+    if (r.ok) loadRoster();
+  };
 }
 
 // ------------------------------------------------------------ run
@@ -681,53 +716,24 @@ async function renderBuzz(c) {
   };
 
   const lisSec = section('Mention listener',
-    'The agent as a teammate: watches every channel and answers @mentions through the governed run path — ratification required, channel text framed as untrusted DATA, budget-capped, every mention logged. Replies carry no p-tag so two listening agents can never trigger each other into a loop. Declare presence.buzz in the manifest and activate the agent (Overview) for supervised presence: started automatically, restarted if it dies, stopped on deactivation. The buttons below are the manual override.');
+    'Supervised presence: declare presence.buzz in the manifest (or Overview → Declare presence), re-ratify, and ACTIVATE the agent — the supervisor runs this channel alongside any others (telegram, slack, plugins) under one lease. Live status and manual per-channel stop live in Overview → Presence channels.');
   const supNote = el('div', 'kv');
   lisSec.append(supNote);
-  const trigIn = el('input'); trigIn.placeholder = 'trigger (default @name)';
-  const startBtn = el('button', 'btn solid', 'START');
-  const stopBtn = el('button', 'btn danger', 'STOP');
-  const lSt = el('span', 'meta', '');
-  const lRow = el('div', 'row'); lRow.append(trigIn, startBtn, stopBtn, lSt);
   const lLines = el('pre'); lLines.style.display = 'none';
-  lisSec.append(lRow, lLines);
+  lisSec.append(lLines);
   c.append(lisSec);
-
   const pollListener = async () => {
     const r = await j(api('/listener'));
     if (!r.ok) return;
-    supNote.replaceChildren(el('span', 'k', 'supervision'), el('span', 'v',
-      r.supervisor_note ? ('blocked — ' + r.supervisor_note) :
-      r.declared_relay
-        ? (r.active ? `presence.buzz → ${r.declared_relay} · agent ACTIVE — supervisor keeps this running` : `presence.buzz → ${r.declared_relay} · agent INACTIVE — activate in Overview to start`)
-        : 'no presence.buzz declared — manual control only'));
-    if (r.running) {
-      lSt.textContent = `running on ${r.relay} · trigger ${r.trigger}`;
-      lLines.style.display = 'block';
-      lLines.textContent = (r.lines || []).join('\n') || '(no activity yet)';
-    } else {
-      lSt.textContent = 'not running';
-      if (r.lines && r.lines.length) { lLines.style.display = 'block'; lLines.textContent = r.lines.join('\n'); }
-    }
-    startBtn.disabled = !!r.running;
-    stopBtn.disabled = !r.running;
+    const ch = (r.channels || {}).buzz;
+    supNote.replaceChildren(el('span', 'k', 'buzz channel'), el('span', 'v',
+      !((r.declared || []).includes('buzz')) ? 'not declared — nothing to supervise'
+        : ch && ch.running ? 'running'
+        : (ch && ch.note) || 'not running (activate the agent; supervisor starts it)'));
+    if (ch && (ch.lines || []).length) { lLines.style.display = 'block'; lLines.textContent = ch.lines.join('\n'); }
   };
   pollListener();
   listenerPoll = setInterval(pollListener, 3000);
-  startBtn.onclick = async () => {
-    lSt.textContent = 'starting…';
-    const r = await j(api('/listener'), {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ relay: rv(), trigger: trigIn.value.trim() || null }),
-    });
-    if (!r.ok) lSt.textContent = 'refused: ' + r.error;
-    pollListener(); loadStatus(); loadRoster();
-  };
-  stopBtn.onclick = async () => {
-    const r = await j(api('/listener'), { method: 'DELETE' });
-    lSt.textContent = r.ok ? 'stop signalled (≤15s)' : 'failed: ' + r.error;
-    pollListener(); loadStatus(); loadRoster();
-  };
 }
 
 // ------------------------------------------------------------ connectors

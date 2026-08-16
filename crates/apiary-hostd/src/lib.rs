@@ -40,7 +40,7 @@ pub struct AppState {
     /// local processes cannot drive the embedded daemon.
     pub token: Option<String>,
     /// Managed Buzz mention listeners, one per agent.
-    pub listeners: std::sync::Mutex<std::collections::HashMap<String, ops::ListenerHandle>>,
+    pub listeners: std::sync::Mutex<std::collections::HashMap<String, ops::AgentPresence>>,
     /// In-flight OAuth grants, keyed by the `state` parameter.
     pub pending_oauth: std::sync::Mutex<std::collections::HashMap<String, ops::PendingOauth>>,
     /// Last supervisor outcome per agent (contested lease, failed start…),
@@ -121,11 +121,14 @@ pub fn build_router(state: App) -> Router {
             "/api/agents/{npub}/connectors/{kind}",
             axum::routing::delete(ops::connector_revoke),
         )
+        .route("/api/agents/{npub}/presence", post(ops::presence_declare))
+        .route(
+            "/api/agents/{npub}/presence/{kind}",
+            axum::routing::delete(ops::presence_revoke),
+        )
         .route(
             "/api/agents/{npub}/listener",
-            get(ops::listener_status)
-                .post(ops::listener_start)
-                .delete(ops::listener_stop),
+            get(ops::listener_status).delete(ops::listener_stop),
         )
         .with_state(state)
 }
@@ -250,7 +253,7 @@ async fn list_agents(
             "ratified": ratified(&dir, &npub, &raw, &m),
             "log_entries": entries,
             "active": ops::is_active(&dir),
-            "buzz_declared": m.presence.buzz.is_some(),
+            "declared_channels": m.presence.channels.keys().cloned().collect::<Vec<_>>(),
         }));
     }
     Json(json!({"ok": true, "agents": agents})).into_response()
