@@ -6,8 +6,12 @@
 //! Same treatment as the `embed` slot: manifest-declared, host-provided
 //! engine, gracefully absent (no slot → the run says a voice message
 //! arrived that it cannot hear). Bindings, in order of preference:
+//! - `apple-speech`: the macOS 26 fast path — Apple's on-device
+//!   SpeechTranscriber via the `services/apple-speech` sidecar (~7× faster
+//!   than whisper base.en on the same clip, no model download). Mac hosts
+//!   only; audio never leaves the host.
 //! - `whisper-cpp`: local subprocess, audio never leaves the host. The
-//!   portable baseline; `model` is a ggml file name or path.
+//!   portable baseline (any Linux/macOS host); `model` is a ggml name/path.
 //! - `openai`: `/audio/transcriptions` (Whisper API); `requires.base_url`
 //!   redirects to any compatible endpoint. Cloud — opt in per manifest.
 //! - `mock`: tests.
@@ -59,6 +63,16 @@ pub fn bind_transcriber(
         .and_then(|v| v.as_str())
         .map(String::from);
     match slot.provider.as_str() {
+        "apple-speech" => Some(Box::new(AppleSpeech::new(
+            slot.requires
+                .get("command")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            slot.requires
+                .get("locale")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        ))),
         "whisper-cpp" => Some(Box::new(WhisperCpp::new(
             slot.model.clone().unwrap_or_else(|| "base.en".into()),
             slot.requires
@@ -294,6 +308,131 @@ impl Transcriber for WhisperCpp {
     }
 }
 
+// --------------------------------------------------------------- apple-speech
+
+/// The `services/apple-speech` sidecar: one JSON request line on stdin,
+/// one JSON result line on stdout. Pure equipment — it gets audio bytes
+/// and nothing else. Resolved from `requires.command`, then
+/// `$APIARY_APPLE_SPEECH`, then conventional install locations.
+pub struct AppleSpeech {
+    command: Option<String>,
+    locale: Option<String>,
+}
+
+impl AppleSpeech {
+    pub fn new(command: Option<String>, locale: Option<String>) -> Self {
+        Self { command, locale }
+    }
+
+    pub fn binary(&self) -> Result<PathBuf, crate::Error> {
+        // An explicit command is a statement, not a hint: if it's wrong,
+        // say so rather than quietly using some other binary.
+        if let Some(c) = &self.command {
+            let p = PathBuf::from(c);
+            return if p.is_file() {
+                Ok(p)
+            } else {
+                Err(crate::Error::Provider(format!(
+                    "apple-speech: requires.command '{c}' not found"
+                )))
+            };
+        }
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Ok(c) = std::env::var("APIARY_APPLE_SPEECH") {
+            candidates.push(PathBuf::from(c));
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            candidates.push(PathBuf::from(home).join(".apiary/bin/apple-speech"));
+        }
+        candidates.push(PathBuf::from("/usr/local/bin/apple-speech"));
+        candidates.push(PathBuf::from("/opt/homebrew/bin/apple-speech"));
+        candidates.into_iter().find(|p| p.is_file()).ok_or_else(|| {
+            crate::Error::Provider(
+                "apple-speech sidecar not found (build services/apple-speech with \
+                     `swift build -c release` and put the binary at ~/.apiary/bin/apple-speech, \
+                     or set requires.command / APIARY_APPLE_SPEECH)"
+                    .into(),
+            )
+        })
+    }
+
+    fn call(&self, req: &serde_json::Value) -> Result<serde_json::Value, crate::Error> {
+        use std::io::Write;
+        let bin = self.binary()?;
+        let mut child = Command::new(&bin)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", std::env::var("HOME").unwrap_or_default())
+            .env("TMPDIR", std::env::var("TMPDIR").unwrap_or_default())
+            .spawn()
+            .map_err(|e| crate::Error::Provider(format!("apple-speech spawn: {e}")))?;
+        {
+            let mut stdin = child.stdin.take().expect("piped");
+            stdin
+                .write_all(req.to_string().as_bytes())
+                .and_then(|_| stdin.write_all(b"\n"))
+                .map_err(|e| crate::Error::Provider(format!("apple-speech stdin: {e}")))?;
+        }
+        let out = child
+            .wait_with_output()
+            .map_err(|e| crate::Error::Provider(format!("apple-speech wait: {e}")))?;
+        let line = String::from_utf8_lossy(&out.stdout);
+        let line = line.lines().last().unwrap_or("").trim();
+        if line.is_empty() {
+            return Err(crate::Error::Provider(format!(
+                "apple-speech produced no result (exit {}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        let v: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| crate::Error::Provider(format!("apple-speech parse: {e}: {line}")))?;
+        if v["ok"].as_bool() != Some(true) {
+            return Err(crate::Error::Provider(format!(
+                "apple-speech: {}",
+                v["error"].as_str().unwrap_or("unknown error")
+            )));
+        }
+        Ok(v)
+    }
+}
+
+impl Transcriber for AppleSpeech {
+    fn id(&self) -> String {
+        "apple-speech/SpeechTranscriber".into()
+    }
+
+    fn transcribe(&self, audio: &[u8], media_type: &str) -> Result<Transcript, crate::Error> {
+        use base64::Engine;
+        let mut req = serde_json::json!({
+            "op": "transcribe",
+            "audio_b64": base64::engine::general_purpose::STANDARD.encode(audio),
+            "media_type": media_type,
+        });
+        if let Some(l) = &self.locale {
+            req["locale"] = serde_json::json!(l);
+        }
+        let v = self.call(&req)?;
+        let duration = v["duration_secs"].as_f64().map(|d| d as f32);
+        if let Some(d) = duration {
+            if d > MAX_AUDIO_SECS {
+                return Err(crate::Error::Provider(format!(
+                    "audio is {d:.0}s — over the {MAX_AUDIO_SECS:.0}s transcription ceiling"
+                )));
+            }
+        }
+        Ok(Transcript {
+            text: v["text"].as_str().unwrap_or_default().trim().to_string(),
+            engine: v["engine"].as_str().unwrap_or("apple-speech").to_string(),
+            language: v["language"].as_str().map(String::from),
+            duration_secs: duration,
+        })
+    }
+}
+
 // --------------------------------------------------------------------- openai
 
 pub struct OpenAiTranscriber {
@@ -406,6 +545,14 @@ governance:
         let out = t.transcribe(b"abc", "audio/ogg").unwrap();
         assert!(out.text.contains("3 bytes"));
         assert_eq!(t.id(), "mock/transcriber");
+    }
+
+    #[test]
+    fn apple_speech_bad_command_is_a_loud_error() {
+        // An explicit command that doesn't exist fails at spawn, clearly.
+        let a = AppleSpeech::new(Some("/nonexistent/apple-speech".into()), None);
+        let err = a.transcribe(b"", "audio/ogg").unwrap_err().to_string();
+        assert!(err.contains("not found") || err.contains("spawn"), "{err}");
     }
 
     #[test]
