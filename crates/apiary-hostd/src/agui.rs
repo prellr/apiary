@@ -29,6 +29,44 @@ pub struct RunBody {
     class: Option<String>,
     #[serde(default)]
     data_class: Option<String>,
+    /// Operator-supplied media (a companion's clipboard image, a screen
+    /// grab): same shape as channel attachments, same host caps.
+    #[serde(default)]
+    attachments: Vec<RunAttachment>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct RunAttachment {
+    #[serde(default = "default_kind")]
+    kind: String,
+    media_type: String,
+    base64: String,
+    #[serde(default)]
+    duration_secs: Option<f32>,
+}
+
+fn default_kind() -> String {
+    "image".into()
+}
+
+fn to_attachments(v: Vec<RunAttachment>) -> Vec<apiary_runtime::presence::Attachment> {
+    use apiary_runtime::presence::{Attachment, MAX_ATTACHMENTS, MAX_ATTACHMENT_BYTES};
+    v.into_iter()
+        .filter(|a| (a.base64.len() as u64) * 3 / 4 <= MAX_ATTACHMENT_BYTES)
+        .filter_map(|a| match a.kind.as_str() {
+            "image" => Some(Attachment::Image {
+                media_type: a.media_type,
+                base64: a.base64,
+            }),
+            "audio" => Some(Attachment::Audio {
+                media_type: a.media_type,
+                base64: a.base64,
+                duration_secs: a.duration_secs,
+            }),
+            _ => None,
+        })
+        .take(MAX_ATTACHMENTS)
+        .collect()
 }
 
 fn agui(name: &str, mut fields: serde_json::Value) -> SseEvent {
@@ -101,7 +139,7 @@ pub async fn run_stream(
     ));
 
     let ctx = TaskContext {
-        attachments: Vec::new(),
+        attachments: to_attachments(body.attachments),
         task_class: body.class.clone(),
         data_class: body.data_class.clone(),
     };

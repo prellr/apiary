@@ -26,6 +26,7 @@ fn main() {
     let home = std::env::var_os("APIARY_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(default_home);
+    let home_for_discovery = home.clone();
     // 32 random bytes, hex — a fresh nostr secret key is exactly that, and
     // the keygen path is already audited. Never stored, never logged.
     let token = apiary_core::identity::generate()
@@ -74,6 +75,15 @@ fn main() {
         });
     });
 
+    // Local discovery for companions (apiary-voice etc.): where this
+    // desktop's daemon is and the token that admits a caller. 0600 in the
+    // Apiary home — the same trust boundary as the keystore beside it —
+    // and removed on clean exit. A companion that can read this file is
+    // the same user who unlocked the keystore.
+    let discovery = state_home_discovery_path(&home_for_discovery);
+    write_discovery(&discovery, port, &token);
+    let discovery_for_exit = discovery.clone();
+
     let url = format!("http://127.0.0.1:{port}/?token={token}");
     tauri::Builder::default()
         .setup(move |app| {
@@ -90,4 +100,25 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("apiary desktop");
+    let _ = std::fs::remove_file(discovery_for_exit);
+}
+
+fn state_home_discovery_path(home: &std::path::Path) -> PathBuf {
+    home.join("desktop.json")
+}
+
+fn write_discovery(path: &std::path::Path, port: u16, token: &str) {
+    let body = serde_json::json!({
+        "url": format!("http://127.0.0.1:{port}"),
+        "token": token,
+        "pid": std::process::id(),
+    });
+    let _ = std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")));
+    if std::fs::write(path, body.to_string()).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
 }
