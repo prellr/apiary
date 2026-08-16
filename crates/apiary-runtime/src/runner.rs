@@ -107,18 +107,34 @@ pub fn run_task_observed(
         }
     };
 
+    // Every fallible step between reserve and settle must release the
+    // reservation on failure — a leaked claim squats on the day's budget
+    // until the TTL (a keyless provider bind once blocked a channel for
+    // 10 minutes per mention this way).
+    macro_rules! prep {
+        ($e:expr) => {
+            match $e {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = ledger.settle(reservation, 0, 0);
+                    return Err(e.into());
+                }
+            }
+        };
+    }
+
     // 2. Route — floors clamp, host decides, model is never consulted.
-    let slot_name = crate::routing::resolve(manifest, ctx)?;
-    let slot = manifest
+    let slot_name = prep!(crate::routing::resolve(manifest, ctx));
+    let slot = prep!(manifest
         .inference
         .iter()
         .find(|s| s.name == slot_name)
-        .ok_or_else(|| crate::Error::Routing(format!("slot '{slot_name}' not in pool")))?;
+        .ok_or_else(|| crate::Error::Routing(format!("slot '{slot_name}' not in pool"))));
     let model = slot.model.clone().unwrap_or_else(|| "claude-opus-5".into());
 
     // 3. JIT-decrypt the slot credential, if the agent owns one.
     let credential = match &slot.credential {
-        Some(blob) => Some(custody.open(agent, blob)?),
+        Some(blob) => Some(prep!(custody.open(agent, blob))),
         None => None,
     };
     let base_url = slot
@@ -126,7 +142,7 @@ pub fn run_task_observed(
         .get("base_url")
         .and_then(|v| v.as_str())
         .map(String::from);
-    let provider = bind(&slot.provider, credential, base_url)?;
+    let provider = prep!(bind(&slot.provider, credential, base_url));
 
     emit(RunEvent::Started {
         slot: slot_name.clone(),
@@ -136,12 +152,12 @@ pub fn run_task_observed(
     // 4. Hydrate the working set: constitution + recency tail + semantic
     //    retrieval, all framed with provenance (memory is DATA, never
     //    instructions — SPEC §12.4, Phase 1 scope).
-    let system = build_working_set(manifest, agent_dir, &log, task)?;
+    let system = prep!(build_working_set(manifest, agent_dir, &log, task));
 
     // 5. Bind connectors (default-deny: an empty manifest list means no
     //    capabilities exist) and infer. Every dispatch is logged BEFORE the
     //    result returns to the model — the track record sees each action.
-    let connectors = crate::connector::bind_connectors(manifest, custody, agent)?;
+    let connectors = prep!(crate::connector::bind_connectors(manifest, custody, agent));
     // Input counts against the ceiling: refuse before dispatch when the
     // working set alone would consume the reservation.
     let input_estimate = crate::inference::estimate_tokens(&system)
@@ -150,7 +166,8 @@ pub fn run_task_observed(
     if input_estimate >= reservation.amount {
         let _ = ledger.settle(reservation, 0, 0);
         return Err(crate::Error::Budget(format!(
-            "working set (~{input_estimate} tokens) exceeds the remaining budget              reservation ({}); a human raises the floor, not the agent",
+            "working set (~{input_estimate} tokens) exceeds the remaining budget \
+             reservation ({}); a human raises the floor, not the agent",
             reservation.amount
         )));
     }
@@ -533,6 +550,21 @@ governance:
         ));
         std::fs::create_dir_all(&dir).unwrap();
         (manifest, dir, custody, handle)
+    }
+
+    #[test]
+    fn failed_prep_releases_the_reservation() {
+        let (mut manifest, dir, custody, handle) = setup();
+        // An unbindable provider fails AFTER reserve, BEFORE inference.
+        manifest.inference[0].provider = "no-such-provider".into();
+        let ctx = TaskContext::default();
+        assert!(run_task(&manifest, &dir, &custody, &handle, "hi", &ctx, &mut |_| {}).is_err());
+        let ledger = crate::spend::SpendLedger::open(&dir);
+        assert!(
+            ledger.today().unwrap().reservations.is_empty(),
+            "prep failure must settle its reservation, not squat until the TTL"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
