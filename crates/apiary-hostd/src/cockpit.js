@@ -978,7 +978,7 @@ function renderFound(c) {
   const fPurpose = el('textarea'); fPurpose.rows = 3; fPurpose.placeholder = 'purpose — what is this agent for?';
   const fSuspend = el('input', 'grow'); fSuspend.placeholder = 'human suspend key (npub or hex) — your key';
   const fDraft = el('input'); fDraft.type = 'checkbox'; fDraft.style.width = 'auto';
-  const draftLabel = el('label', null, ' draft with model'); draftLabel.prepend(fDraft);
+  const draftLabel = el('label', null, ' let a model write the draft constitution'); draftLabel.prepend(fDraft);
   const go = el('button', 'btn solid', 'FOUND');
   const st = el('span', 'meta', '');
   const r1 = el('div', 'row'); r1.append(fName);
@@ -987,7 +987,9 @@ function renderFound(c) {
   sec.append(r1, help('A label for humans; the identity is the generated keypair.'),
     fPurpose, help('Seeds the draft constitution.'),
     r3, help('Suspension authority never rests with the agent’s own key — at least one human governor is required.'),
-    r4, help('Model-drafted or template, the draft is a hypothesis: review it in the Manifest tab, then ratify.'));
+    r4, help('Checked: Claude reads the purpose and tailors the draft (inference slots, routing, budgets); an invalid draft falls back to the template. ' +
+      'Unchecked: the stock template — one Anthropic slot, no connectors, local memory, 100k tokens/day. ' +
+      'Either way the draft is a hypothesis: review it in the Manifest tab, then ratify.'));
   c.append(sec);
   go.onclick = async () => {
     st.textContent = 'founding… (keygen + NIP-49 encryption; slow by design)';
