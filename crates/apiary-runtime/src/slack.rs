@@ -169,8 +169,45 @@ impl SlackRules {
             author: user.to_string(),
             text,
             reply_ref: thread_ts,
+            images: Vec::new(), // filled by the adapter after extract
         })
     }
+}
+
+/// Download image files from a Slack event (url_private + bot bearer),
+/// size-capped; failures skip the file, never the mention.
+fn fetch_slack_images(
+    http: &reqwest::blocking::Client,
+    bot_token: &str,
+    event: &Value,
+) -> Vec<crate::inference::ImageInput> {
+    const MAX_BYTES: u64 = 5 * 1024 * 1024;
+    let mut out = Vec::new();
+    for f in event["files"].as_array().cloned().unwrap_or_default() {
+        let mime = f["mimetype"].as_str().unwrap_or_default().to_string();
+        if !mime.starts_with("image/") || f["size"].as_u64().unwrap_or(0) > MAX_BYTES {
+            continue;
+        }
+        let Some(url) = f["url_private"].as_str() else {
+            continue;
+        };
+        let Ok(resp) = http.get(url).bearer_auth(bot_token).send() else {
+            continue;
+        };
+        let Ok(bytes) = resp.bytes() else { continue };
+        if bytes.len() as u64 > MAX_BYTES {
+            continue;
+        }
+        use base64::Engine;
+        out.push(crate::inference::ImageInput {
+            media_type: mime,
+            base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        });
+        if out.len() >= 4 {
+            break;
+        }
+    }
+    out
 }
 
 impl crate::presence::ChannelAdapter for SlackAdapter {
@@ -246,7 +283,12 @@ impl crate::presence::ChannelAdapter for SlackAdapter {
                         json!({"envelope_id": envelope_id}).to_string().into(),
                     ));
                 }
-                Ok(self.rules.extract(&v["payload"]))
+                let mut mention = self.rules.extract(&v["payload"]);
+                if let Some(m) = mention.as_mut() {
+                    m.images =
+                        fetch_slack_images(&self.http, &self.bot_token, &v["payload"]["event"]);
+                }
+                Ok(mention)
             }
             _ => Ok(None), // hello etc.
         }

@@ -75,13 +75,46 @@ impl TelegramAdapter {
         self.allowed_chats.iter().any(|c| c == "*" || c == chat_id)
     }
 
+    /// Download a Telegram photo (largest size) as a base64 image input.
+    /// Size-capped: an oversized file is skipped, not fatal.
+    fn fetch_photo(&self, msg: &Value) -> Option<crate::inference::ImageInput> {
+        const MAX_BYTES: u64 = 5 * 1024 * 1024;
+        let file_id = msg["photo"].as_array()?.last()?["file_id"].as_str()?;
+        let f = self.call("getFile", json!({"file_id": file_id})).ok()?;
+        if f["result"]["file_size"].as_u64().unwrap_or(0) > MAX_BYTES {
+            return None;
+        }
+        let path = f["result"]["file_path"].as_str()?;
+        let bytes = self
+            .client
+            .get(format!(
+                "https://api.telegram.org/file/bot{}/{path}",
+                self.token
+            ))
+            .send()
+            .ok()?
+            .bytes()
+            .ok()?;
+        if bytes.len() as u64 > MAX_BYTES {
+            return None;
+        }
+        use base64::Engine;
+        Some(crate::inference::ImageInput {
+            media_type: "image/jpeg".into(), // Telegram photos are JPEG
+            base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        })
+    }
+
     /// Trigger rules: DMs always; groups on @botname or a reply to the bot.
     fn triggers(&self, msg: &Value) -> bool {
         let chat_type = msg["chat"]["type"].as_str().unwrap_or_default();
         if chat_type == "private" {
             return true;
         }
-        let text = msg["text"].as_str().unwrap_or_default();
+        let text = msg["text"]
+            .as_str()
+            .or_else(|| msg["caption"].as_str())
+            .unwrap_or_default();
         if !self.bot_username.is_empty()
             && text
                 .to_lowercase()
@@ -129,9 +162,16 @@ impl crate::presence::ChannelAdapter for TelegramAdapter {
                 self.offset = self.offset.max(id + 1);
             }
             let msg = &u["message"];
-            let Some(text) = msg["text"].as_str() else {
+            // Text, a captioned photo, or a bare photo all engage.
+            let has_photo = msg["photo"].is_array();
+            let text = msg["text"]
+                .as_str()
+                .or_else(|| msg["caption"].as_str())
+                .unwrap_or_default()
+                .to_string();
+            if text.is_empty() && !has_photo {
                 continue;
-            };
+            }
             let chat_id = match msg["chat"]["id"].as_i64() {
                 Some(id) => id.to_string(),
                 None => continue,
@@ -144,11 +184,22 @@ impl crate::presence::ChannelAdapter for TelegramAdapter {
                 .map(String::from)
                 .unwrap_or_else(|| msg["from"]["id"].as_i64().unwrap_or(0).to_string());
             let reply_ref = msg["message_id"].as_i64().unwrap_or(0).to_string();
+            let images = if has_photo {
+                self.fetch_photo(msg).into_iter().collect()
+            } else {
+                Vec::new()
+            };
+            let text = if text.is_empty() {
+                "(an image, with no caption)".to_string()
+            } else {
+                text
+            };
             return Ok(Some(crate::presence::Mention {
                 channel: chat_id,
                 author,
-                text: text.to_string(),
+                text,
                 reply_ref,
+                images,
             }));
         }
         Ok(None) // quiet poll = tick
@@ -203,6 +254,18 @@ mod tests {
         assert!(a.triggers(&json!({
             "chat": {"type": "group"}, "text": "yes",
             "reply_to_message": {"from": {"username": "scout_bot"}}
+        })));
+    }
+
+    #[test]
+    fn captioned_photos_trigger_like_text() {
+        let a = adapter();
+        // A bare photo in a DM engages; in a group it needs a caption mention.
+        assert!(a.triggers(&json!({"chat": {"type": "private"}, "photo": [{}]})));
+        assert!(!a.triggers(&json!({"chat": {"type": "group"}, "photo": [{}]})));
+        assert!(a.triggers(&json!({
+            "chat": {"type": "group"}, "photo": [{}],
+            "caption": "what is this @scout_bot?"
         })));
     }
 

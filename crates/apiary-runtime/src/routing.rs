@@ -9,6 +9,9 @@ use apiary_core::manifest::{Manifest, RoutingRule};
 
 #[derive(Debug, Clone, Default)]
 pub struct TaskContext {
+    /// Images attached to the task (platform photos etc.), passed through
+    /// to vision-capable providers.
+    pub images: Vec<crate::inference::ImageInput>,
     /// e.g. "reasoning", "chat", "classification"
     pub task_class: Option<String>,
     /// e.g. "sensitive"
@@ -104,6 +107,7 @@ governance:
             &TaskContext {
                 task_class: Some("reasoning".into()),
                 data_class: Some("sensitive".into()),
+                images: Vec::new(),
             },
         )
         .unwrap();
@@ -118,7 +122,8 @@ governance:
                 &m,
                 &TaskContext {
                     task_class: Some("reasoning".into()),
-                    data_class: None
+                    data_class: None,
+                    images: Vec::new(),
                 }
             )
             .unwrap(),

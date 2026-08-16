@@ -540,6 +540,10 @@ impl crate::presence::ChannelAdapter for BuzzAdapter<'_> {
                     // The mention's created_at rides along for the causal
                     // timestamp floor on the reply.
                     reply_ref: event.created_at.as_secs().to_string(),
+                    // Nostr embeds images as URLs in content; fetching
+                    // arbitrary URLs is a policy decision, deliberately
+                    // not a silent default. Text-only for now.
+                    images: Vec::new(),
                 }))
             }
             Ok(None) => Ok(None),

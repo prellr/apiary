@@ -101,6 +101,7 @@ pub async fn run_stream(
     ));
 
     let ctx = TaskContext {
+        images: Vec::new(),
         task_class: body.class.clone(),
         data_class: body.data_class.clone(),
     };

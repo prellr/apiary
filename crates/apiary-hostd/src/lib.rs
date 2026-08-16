@@ -689,7 +689,7 @@ async fn draft_manifest_with_model(
              Purpose of this agent: {purpose}\n\nDraft the manifest YAML."
         );
         let completion = provider
-            .complete("claude-opus-5", system, &prompt, 8192)
+            .complete("claude-opus-5", system, &prompt, &[], 8192)
             .map_err(|e| e.to_string())?;
         if completion.outcome != "ok" {
             return Err(format!("draft stopped: {}", completion.outcome));

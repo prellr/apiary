@@ -256,11 +256,26 @@ impl crate::presence::ChannelAdapter for PluginAdapter {
         let Some(m) = mentions.first() else {
             return Ok(None); // tick
         };
+        let images = m["images"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|i| {
+                        Some(crate::inference::ImageInput {
+                            media_type: i["media_type"].as_str()?.to_string(),
+                            base64: i["base64"].as_str()?.to_string(),
+                        })
+                    })
+                    .take(4)
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(Some(crate::presence::Mention {
             channel: m["channel"].as_str().unwrap_or_default().to_string(),
             author: m["author"].as_str().unwrap_or_default().to_string(),
             text: m["text"].as_str().unwrap_or_default().to_string(),
             reply_ref: m["ref"].as_str().unwrap_or_default().to_string(),
+            images,
         }))
     }
 

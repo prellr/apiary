@@ -16,6 +16,52 @@ pub struct Completion {
     pub output_tokens: u64,
 }
 
+/// An image attached to the task — base64 payload plus media type.
+/// Providers with vision include it in the user content; providers
+/// without simply cannot see it (the framing text says images were
+/// attached, so the model can say so honestly).
+#[derive(Debug, Clone)]
+pub struct ImageInput {
+    pub media_type: String,
+    pub base64: String,
+}
+
+/// Flat per-image token estimate for budget pre-checks (a ~1MP photo
+/// costs on the order of 1.3–1.6k input tokens on vision models).
+pub const IMAGE_TOKEN_ESTIMATE: u64 = 1600;
+
+/// Anthropic-shape user content: image blocks then the text.
+fn anthropic_user_content(prompt: &str, images: &[ImageInput]) -> serde_json::Value {
+    if images.is_empty() {
+        return json!(prompt);
+    }
+    let mut blocks: Vec<serde_json::Value> = images
+        .iter()
+        .map(|i| {
+            json!({"type": "image", "source": {
+                "type": "base64", "media_type": i.media_type, "data": i.base64}})
+        })
+        .collect();
+    blocks.push(json!({"type": "text", "text": prompt}));
+    json!(blocks)
+}
+
+/// OpenAI-dialect user content: data-URL image parts then the text.
+fn openai_user_content(prompt: &str, images: &[ImageInput]) -> serde_json::Value {
+    if images.is_empty() {
+        return json!(prompt);
+    }
+    let mut parts: Vec<serde_json::Value> = images
+        .iter()
+        .map(|i| {
+            json!({"type": "image_url", "image_url": {
+                "url": format!("data:{};base64,{}", i.media_type, i.base64)}})
+        })
+        .collect();
+    parts.push(json!({"type": "text", "text": prompt}));
+    json!(parts)
+}
+
 /// Dispatch callback: (tool_name, args) → result string. The HOST owns this —
 /// it checks caps, logs the call, and executes through custody. The model's
 /// tool_use blocks are requests into it, never direct capability.
@@ -30,6 +76,7 @@ pub trait Provider {
         model: &str,
         system: &str,
         prompt: &str,
+        images: &[ImageInput],
         max_tokens: u64,
     ) -> Result<Completion, crate::Error>;
 
@@ -37,16 +84,18 @@ pub trait Provider {
     /// is clamped to what remains, and the loop stops (outcome
     /// "budget-exhausted") rather than overrunning. Providers without tool
     /// support fall back to a plain completion and flag it.
+    #[allow(clippy::too_many_arguments)] // the run's full surface, deliberately explicit
     fn complete_with_tools(
         &self,
         model: &str,
         system: &str,
         prompt: &str,
+        images: &[ImageInput],
         tools: &[crate::connector::ToolDef],
         _dispatch: ToolDispatch,
         budget_tokens: u64,
     ) -> Result<Completion, crate::Error> {
-        let mut c = self.complete(model, system, prompt, budget_tokens)?;
+        let mut c = self.complete(model, system, prompt, images, budget_tokens)?;
         if !tools.is_empty() {
             c.outcome = format!("{} (provider has no tool support; tools unused)", c.outcome);
         }
@@ -151,13 +200,14 @@ impl Provider for AnthropicProvider {
         model: &str,
         system: &str,
         prompt: &str,
+        images: &[ImageInput],
         max_tokens: u64,
     ) -> Result<Completion, crate::Error> {
         let payload = self.request(&json!({
             "model": model,
             "max_tokens": max_tokens.clamp(1, 16000),
             "system": system,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [{"role": "user", "content": anthropic_user_content(prompt, images)}],
         }))?;
         // Check stop_reason before reading content — refusals return 200
         // with empty or partial content.
@@ -181,12 +231,15 @@ impl Provider for AnthropicProvider {
         model: &str,
         system: &str,
         prompt: &str,
+        images: &[ImageInput],
         tools: &[crate::connector::ToolDef],
         dispatch: ToolDispatch,
         budget_tokens: u64,
     ) -> Result<Completion, crate::Error> {
         const MAX_ITERATIONS: usize = 8;
-        let base_estimate = estimate_tokens(system) + estimate_tokens(prompt);
+        let base_estimate = estimate_tokens(system)
+            + estimate_tokens(prompt)
+            + images.len() as u64 * IMAGE_TOKEN_ESTIMATE;
         let tool_defs: Vec<serde_json::Value> = tools
             .iter()
             .map(|t| {
@@ -197,7 +250,8 @@ impl Provider for AnthropicProvider {
                 })
             })
             .collect();
-        let mut messages = vec![json!({"role": "user", "content": prompt})];
+        let mut messages =
+            vec![json!({"role": "user", "content": anthropic_user_content(prompt, images)})];
         let (mut in_total, mut out_total) = (0u64, 0u64);
         let mut served_model = model.to_string();
 
@@ -307,8 +361,12 @@ impl Provider for OllamaProvider {
         model: &str,
         system: &str,
         prompt: &str,
+        _images: &[ImageInput],
         max_tokens: u64,
     ) -> Result<Completion, crate::Error> {
+        // Native ollama API here is text-only; use an openai slot with
+        // base_url http://localhost:11434/v1 and a vision model for local
+        // image understanding.
         let client = reqwest::blocking::Client::new();
         let resp = client
             .post(format!("{}/api/generate", self.base_url))
@@ -343,10 +401,16 @@ impl Provider for MockProvider {
         model: &str,
         _system: &str,
         prompt: &str,
+        images: &[ImageInput],
         _max_tokens: u64,
     ) -> Result<Completion, crate::Error> {
+        let tag = if images.is_empty() {
+            String::new()
+        } else {
+            format!(" [+{} images]", images.len())
+        };
         Ok(Completion {
-            text: format!("[mock:{model}] {prompt}"),
+            text: format!("[mock:{model}]{tag} {prompt}"),
             model: model.to_string(),
             outcome: "ok".into(),
             input_tokens: prompt.len() as u64 / 4,
@@ -366,9 +430,10 @@ impl Provider for MockToolProvider {
         model: &str,
         system: &str,
         prompt: &str,
+        _images: &[ImageInput],
         max_tokens: u64,
     ) -> Result<Completion, crate::Error> {
-        MockProvider.complete(model, system, prompt, max_tokens)
+        MockProvider.complete(model, system, prompt, _images, max_tokens)
     }
 
     fn complete_with_tools(
@@ -376,6 +441,7 @@ impl Provider for MockToolProvider {
         model: &str,
         _system: &str,
         prompt: &str,
+        _images: &[ImageInput],
         tools: &[crate::connector::ToolDef],
         dispatch: ToolDispatch,
         _budget_tokens: u64,
@@ -558,12 +624,13 @@ impl Provider for OpenAiCompatProvider {
         model: &str,
         system: &str,
         prompt: &str,
+        images: &[ImageInput],
         max_tokens: u64,
     ) -> Result<Completion, crate::Error> {
         let mut payload = self.payload_base(model, max_tokens);
         payload["messages"] = json!([
             {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": openai_user_content(prompt, images)},
         ]);
         let body = self.request(&payload)?;
         let (input_tokens, output_tokens) = openai_usage(&body);
@@ -585,6 +652,7 @@ impl Provider for OpenAiCompatProvider {
         model: &str,
         system: &str,
         prompt: &str,
+        images: &[ImageInput],
         tools: &[crate::connector::ToolDef],
         dispatch: ToolDispatch,
         budget_tokens: u64,
@@ -603,10 +671,12 @@ impl Provider for OpenAiCompatProvider {
                 })
             })
             .collect();
-        let base_estimate = estimate_tokens(system) + estimate_tokens(prompt);
+        let base_estimate = estimate_tokens(system)
+            + estimate_tokens(prompt)
+            + images.len() as u64 * IMAGE_TOKEN_ESTIMATE;
         let mut messages = vec![
             json!({"role": "system", "content": system}),
-            json!({"role": "user", "content": prompt}),
+            json!({"role": "user", "content": openai_user_content(prompt, images)}),
         ];
         let (mut in_total, mut out_total) = (0u64, 0u64);
         let mut served_model = model.to_string();
@@ -689,6 +759,23 @@ impl Provider for OpenAiCompatProvider {
 #[cfg(test)]
 mod openai_tests {
     use super::*;
+
+    #[test]
+    fn image_content_shapes_per_dialect() {
+        let img = [ImageInput {
+            media_type: "image/jpeg".into(),
+            base64: "QUJD".into(),
+        }];
+        // No images → plain string content, byte-identical to the old wire shape.
+        assert_eq!(anthropic_user_content("hi", &[]), json!("hi"));
+        assert_eq!(openai_user_content("hi", &[]), json!("hi"));
+        let a = anthropic_user_content("what is this?", &img);
+        assert_eq!(a[0]["source"]["media_type"], "image/jpeg");
+        assert_eq!(a[1]["text"], "what is this?");
+        let o = openai_user_content("what is this?", &img);
+        assert_eq!(o[0]["image_url"]["url"], "data:image/jpeg;base64,QUJD");
+        assert_eq!(o[1]["text"], "what is this?");
+    }
 
     #[test]
     fn strict_openai_uses_max_completion_tokens() {

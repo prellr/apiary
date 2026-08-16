@@ -144,8 +144,9 @@ pub fn run_task_observed(
     let connectors = crate::connector::bind_connectors(manifest, custody, agent)?;
     // Input counts against the ceiling: refuse before dispatch when the
     // working set alone would consume the reservation.
-    let input_estimate =
-        crate::inference::estimate_tokens(&system) + crate::inference::estimate_tokens(task);
+    let input_estimate = crate::inference::estimate_tokens(&system)
+        + crate::inference::estimate_tokens(task)
+        + ctx.images.len() as u64 * crate::inference::IMAGE_TOKEN_ESTIMATE;
     if input_estimate >= reservation.amount {
         let _ = ledger.settle(reservation, 0, 0);
         return Err(crate::Error::Budget(format!(
@@ -155,7 +156,13 @@ pub fn run_task_observed(
     }
     let run = || -> Result<crate::inference::Completion, crate::Error> {
         Ok(if connectors.is_empty() {
-            provider.complete(&model, &system, task, reservation.amount - input_estimate)?
+            provider.complete(
+                &model,
+                &system,
+                task,
+                &ctx.images,
+                reservation.amount - input_estimate,
+            )?
         } else {
             let tool_defs: Vec<crate::connector::ToolDef> =
                 connectors.iter().map(|c| c.def()).collect();
@@ -201,6 +208,7 @@ pub fn run_task_observed(
                 &model,
                 &system,
                 task,
+                &ctx.images,
                 &tool_defs,
                 &mut dispatch,
                 reservation.amount,
