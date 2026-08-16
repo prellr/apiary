@@ -117,8 +117,14 @@ model runs). What exists today:
   operations — founding, importing, the connector library, lock/unlock —
   independently of any agent's governors
 
+- **Relay pool**: one supervised worker per relay URL shared by the
+  whole process — leases, publication, recovery, and connectors ride
+  persistent connections with capped-backoff reconnect and idle
+  keepalive, instead of a connection per operation. Pool health is in
+  `/api/status`.
+
 Remaining roadmap: NIP-46 remote-signer custody, OS sandbox for ACP
-subprocesses, per-event relay connections → a pooled client.
+subprocesses, relay delivery of sealed handoffs, log checkpointing.
 
 ## Quick start
 

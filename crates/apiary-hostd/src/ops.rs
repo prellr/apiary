@@ -144,6 +144,7 @@ pub async fn status(
         "listeners": listeners,
         "anthropic_key_present": std::env::var("ANTHROPIC_API_KEY").is_ok()
             || std::env::var("ANTHROPIC_AUTH_TOKEN").is_ok(),
+        "relay_pool": apiary_runtime::relay::stats(),
     }))
     .into_response()
 }
