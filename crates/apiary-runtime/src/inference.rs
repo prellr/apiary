@@ -478,7 +478,7 @@ pub struct OpenAiCompatProvider {
 
 impl OpenAiCompatProvider {
     pub fn new(key: Zeroizing<String>, base_url: Option<String>, label: &'static str) -> Self {
-        let (default_base, strict) = match label {
+        let (default_base, _strict) = match label {
             "xai" => ("https://api.x.ai/v1", false),
             _ => ("https://api.openai.com/v1", true),
         };
