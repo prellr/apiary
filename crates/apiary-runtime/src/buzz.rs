@@ -543,7 +543,7 @@ impl crate::presence::ChannelAdapter for BuzzAdapter<'_> {
                     // Nostr embeds images as URLs in content; fetching
                     // arbitrary URLs is a policy decision, deliberately
                     // not a silent default. Text-only for now.
-                    images: Vec::new(),
+                    attachments: Vec::new(),
                 }))
             }
             Ok(None) => Ok(None),

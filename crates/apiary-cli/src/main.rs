@@ -979,7 +979,7 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
             }
 
             let ctx = apiary_runtime::routing::TaskContext {
-                images: Vec::new(),
+                attachments: Vec::new(),
                 task_class: class.clone(),
                 data_class: data_class.clone(),
             };

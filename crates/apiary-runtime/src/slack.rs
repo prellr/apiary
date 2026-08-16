@@ -169,7 +169,7 @@ impl SlackRules {
             author: user.to_string(),
             text,
             reply_ref: thread_ts,
-            images: Vec::new(), // filled by the adapter after extract
+            attachments: Vec::new(), // filled by the adapter after extract
         })
     }
 }
@@ -180,8 +180,8 @@ fn fetch_slack_images(
     http: &reqwest::blocking::Client,
     bot_token: &str,
     event: &Value,
-) -> Vec<crate::inference::ImageInput> {
-    const MAX_BYTES: u64 = 5 * 1024 * 1024;
+) -> Vec<crate::presence::Attachment> {
+    const MAX_BYTES: u64 = crate::presence::MAX_ATTACHMENT_BYTES;
     let mut out = Vec::new();
     for f in event["files"].as_array().cloned().unwrap_or_default() {
         let mime = f["mimetype"].as_str().unwrap_or_default().to_string();
@@ -199,11 +199,11 @@ fn fetch_slack_images(
             continue;
         }
         use base64::Engine;
-        out.push(crate::inference::ImageInput {
+        out.push(crate::presence::Attachment::Image {
             media_type: mime,
             base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
         });
-        if out.len() >= 4 {
+        if out.len() >= crate::presence::MAX_ATTACHMENTS {
             break;
         }
     }
@@ -285,7 +285,7 @@ impl crate::presence::ChannelAdapter for SlackAdapter {
                 }
                 let mut mention = self.rules.extract(&v["payload"]);
                 if let Some(m) = mention.as_mut() {
-                    m.images =
+                    m.attachments =
                         fetch_slack_images(&self.http, &self.bot_token, &v["payload"]["event"]);
                 }
                 Ok(mention)

@@ -9,9 +9,10 @@ use apiary_core::manifest::{Manifest, RoutingRule};
 
 #[derive(Debug, Clone, Default)]
 pub struct TaskContext {
-    /// Images attached to the task (platform photos etc.), passed through
-    /// to vision-capable providers.
-    pub images: Vec<crate::inference::ImageInput>,
+    /// What the task carries besides text (platform photos, voice notes).
+    /// The runner shows images to vision providers; audio is transcribed
+    /// first (transcribe slot) and never reaches a text provider as audio.
+    pub attachments: Vec<crate::presence::Attachment>,
     /// e.g. "reasoning", "chat", "classification"
     pub task_class: Option<String>,
     /// e.g. "sensitive"
@@ -107,7 +108,7 @@ governance:
             &TaskContext {
                 task_class: Some("reasoning".into()),
                 data_class: Some("sensitive".into()),
-                images: Vec::new(),
+                attachments: Vec::new(),
             },
         )
         .unwrap();
@@ -123,7 +124,7 @@ governance:
                 &TaskContext {
                     task_class: Some("reasoning".into()),
                     data_class: None,
-                    images: Vec::new(),
+                    attachments: Vec::new(),
                 }
             )
             .unwrap(),

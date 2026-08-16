@@ -256,26 +256,12 @@ impl crate::presence::ChannelAdapter for PluginAdapter {
         let Some(m) = mentions.first() else {
             return Ok(None); // tick
         };
-        let images = m["images"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|i| {
-                        Some(crate::inference::ImageInput {
-                            media_type: i["media_type"].as_str()?.to_string(),
-                            base64: i["base64"].as_str()?.to_string(),
-                        })
-                    })
-                    .take(4)
-                    .collect()
-            })
-            .unwrap_or_default();
         Ok(Some(crate::presence::Mention {
             channel: m["channel"].as_str().unwrap_or_default().to_string(),
             author: m["author"].as_str().unwrap_or_default().to_string(),
             text: m["text"].as_str().unwrap_or_default().to_string(),
             reply_ref: m["ref"].as_str().unwrap_or_default().to_string(),
-            images,
+            attachments: parse_attachments(m),
         }))
     }
 
@@ -295,5 +281,83 @@ impl crate::presence::ChannelAdapter for PluginAdapter {
             .as_str()
             .unwrap_or_default()
             .to_string())
+    }
+}
+
+/// Optional `attachments: [{kind, media_type, base64, duration_secs?}]` on
+/// a plugin mention. `images: [{media_type, base64}]` is accepted as an
+/// alias (the pre-attachments spelling) for one release. Unknown kinds are
+/// dropped, never fatal; the host cap applies.
+fn parse_attachments(m: &Value) -> Vec<crate::presence::Attachment> {
+    use crate::presence::Attachment;
+    let mut out = Vec::new();
+    for a in m["attachments"].as_array().into_iter().flatten() {
+        let (Some(media_type), Some(base64)) = (a["media_type"].as_str(), a["base64"].as_str())
+        else {
+            continue;
+        };
+        let att = match a["kind"].as_str().unwrap_or("image") {
+            "image" => Attachment::Image {
+                media_type: media_type.into(),
+                base64: base64.into(),
+            },
+            "audio" => Attachment::Audio {
+                media_type: media_type.into(),
+                base64: base64.into(),
+                duration_secs: a["duration_secs"].as_f64().map(|d| d as f32),
+            },
+            _ => continue,
+        };
+        out.push(att);
+    }
+    for i in m["images"].as_array().into_iter().flatten() {
+        if let (Some(media_type), Some(base64)) = (i["media_type"].as_str(), i["base64"].as_str()) {
+            out.push(Attachment::Image {
+                media_type: media_type.into(),
+                base64: base64.into(),
+            });
+        }
+    }
+    out.truncate(crate::presence::MAX_ATTACHMENTS);
+    out
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+    use crate::presence::Attachment;
+
+    #[test]
+    fn parses_attachments_and_legacy_images_alias() {
+        let m = json!({
+            "attachments": [
+                {"kind": "image", "media_type": "image/png", "base64": "AA"},
+                {"kind": "audio", "media_type": "audio/ogg", "base64": "BB", "duration_secs": 4.5},
+                {"kind": "hologram", "media_type": "x/y", "base64": "CC"},
+                {"kind": "image", "media_type": "image/png"}
+            ],
+            "images": [{"media_type": "image/jpeg", "base64": "DD"}]
+        });
+        let got = parse_attachments(&m);
+        assert_eq!(got.len(), 3, "unknown kind + malformed dropped; alias kept");
+        assert!(
+            matches!(&got[0], Attachment::Image { media_type, .. } if media_type == "image/png")
+        );
+        assert!(
+            matches!(&got[1], Attachment::Audio { duration_secs: Some(d), .. } if (*d - 4.5).abs() < 1e-6)
+        );
+        assert!(matches!(&got[2], Attachment::Image { base64, .. } if base64 == "DD"));
+        assert!(parse_attachments(&json!({"text": "hi"})).is_empty());
+    }
+
+    #[test]
+    fn framing_names_what_it_cannot_hear() {
+        let note = crate::presence::attachment_framing(&[Attachment::Audio {
+            media_type: "audio/ogg".into(),
+            base64: "x".into(),
+            duration_secs: None,
+        }]);
+        assert!(note.contains("cannot hear"));
+        assert!(crate::presence::attachment_framing(&[]).is_empty());
     }
 }

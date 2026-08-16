@@ -77,8 +77,8 @@ impl TelegramAdapter {
 
     /// Download a Telegram photo (largest size) as a base64 image input.
     /// Size-capped: an oversized file is skipped, not fatal.
-    fn fetch_photo(&self, msg: &Value) -> Option<crate::inference::ImageInput> {
-        const MAX_BYTES: u64 = 5 * 1024 * 1024;
+    fn fetch_photo(&self, msg: &Value) -> Option<crate::presence::Attachment> {
+        const MAX_BYTES: u64 = crate::presence::MAX_ATTACHMENT_BYTES;
         let file_id = msg["photo"].as_array()?.last()?["file_id"].as_str()?;
         let f = self.call("getFile", json!({"file_id": file_id})).ok()?;
         if f["result"]["file_size"].as_u64().unwrap_or(0) > MAX_BYTES {
@@ -99,7 +99,7 @@ impl TelegramAdapter {
             return None;
         }
         use base64::Engine;
-        Some(crate::inference::ImageInput {
+        Some(crate::presence::Attachment::Image {
             media_type: "image/jpeg".into(), // Telegram photos are JPEG
             base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
         })
@@ -184,7 +184,7 @@ impl crate::presence::ChannelAdapter for TelegramAdapter {
                 .map(String::from)
                 .unwrap_or_else(|| msg["from"]["id"].as_i64().unwrap_or(0).to_string());
             let reply_ref = msg["message_id"].as_i64().unwrap_or(0).to_string();
-            let images = if has_photo {
+            let attachments = if has_photo {
                 self.fetch_photo(msg).into_iter().collect()
             } else {
                 Vec::new()
@@ -199,7 +199,7 @@ impl crate::presence::ChannelAdapter for TelegramAdapter {
                 author,
                 text,
                 reply_ref,
-                images,
+                attachments,
             }));
         }
         Ok(None) // quiet poll = tick

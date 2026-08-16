@@ -49,18 +49,25 @@ spinning.
 `ref` is yours: an opaque string the host echoes back in `reply` so you can
 thread the response (message id, thread ts, whatever your platform needs).
 
-A mention may carry an optional `images` array when the platform message had
-attachments — download them yourself, base64-encode, and cap sensibly (the
-host takes at most 4 and budgets tokens for each):
+A mention may carry an optional `attachments` array when the platform
+message had media — download it yourself, base64-encode, and cap sensibly
+(the host keeps at most 4, 5 MB each, and budgets tokens for each):
 
 ```json
 {"ref":"msg-79","channel":"#general","author":"alice",
  "text":"@agent what plant is this?",
- "images":[{"media_type":"image/jpeg","base64":"/9j/4AAQ…"}]}
+ "attachments":[
+   {"kind":"image","media_type":"image/jpeg","base64":"/9j/4AAQ…"},
+   {"kind":"audio","media_type":"audio/ogg","base64":"T2dnUw…","duration_secs":4.2}
+ ]}
 ```
 
-Omitting the field (or sending `[]`) is always valid — text-only plugins
-need no changes.
+`kind` is `image` or `audio` (unknown kinds are dropped, not fatal). Images
+reach vision-capable models; audio is transcribed host-side when the agent
+declares a `transcribe` slot, and honestly reported as unheard otherwise.
+The older `images: [{media_type, base64}]` spelling is still accepted as an
+alias for one release. Omitting the field (or sending `[]`) is always
+valid — text-only plugins need no changes.
 
 ### `reply` (request)
 
