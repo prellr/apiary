@@ -112,7 +112,10 @@ model runs). What exists today:
   listener started, restarted on death, bounced on manifest amendment,
   stopped on deactivation — and lease-coordinated across hosts
 - NIP-98 signed-request auth for remote use; governor-bound authorization
-  (the signer must be a suspend key of the agent it touches)
+  (the signer must be a suspend key of the agent it touches), and a
+  **host administrator allowlist** (`--admin <npub>`) gating host-scoped
+  operations — founding, importing, the connector library, lock/unlock —
+  independently of any agent's governors
 
 Remaining roadmap: NIP-46 remote-signer custody, OS sandbox for ACP
 subprocesses, per-event relay connections → a pooled client.

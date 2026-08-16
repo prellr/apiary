@@ -669,9 +669,21 @@ impl Connector for VaultWrite {
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| crate::Error::Provider("path is required".into()))?;
-        if !rel.ends_with(".md") || rel.contains("..") {
+        // Ordered defenses (review finding: symlink escapes + create-
+        // before-check): reject absolute paths and traversal LEXICALLY
+        // first, verify the deepest EXISTING ancestor canonicalizes into
+        // the jail BEFORE creating anything, re-verify the parent after
+        // creation, and refuse to write through a symlink target.
+        let rel_path = std::path::Path::new(rel);
+        if rel_path.is_absolute()
+            || !rel.ends_with(".md")
+            || rel_path
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
             return Err(crate::Error::Provider(
-                "path must be a vault-relative .md file without traversal".into(),
+                "path must be a plain vault-relative .md file (no traversal, no absolute paths)"
+                    .into(),
             ));
         }
         let content = args
@@ -680,11 +692,28 @@ impl Connector for VaultWrite {
             .ok_or_else(|| crate::Error::Provider("content is required".into()))?;
         let append = args.get("append").and_then(|v| v.as_bool()).unwrap_or(true);
         let (name, root) = vault_root(&self.vaults, args.get("vault").and_then(|v| v.as_str()))?;
-        // New files can't canonicalize; jail the PARENT instead.
-        let target = root.join(rel);
+        let target = root.join(rel_path);
         let parent = target
             .parent()
             .ok_or_else(|| crate::Error::Provider("bad path".into()))?;
+        // Deepest existing ancestor must live in the jail BEFORE mkdir —
+        // a symlinked intermediate directory would otherwise carry the
+        // new directories (and the file) outside the vault.
+        let mut probe = parent.to_path_buf();
+        while !probe.exists() {
+            probe = match probe.parent() {
+                Some(p) => p.to_path_buf(),
+                None => return Err(crate::Error::Provider("bad path".into())),
+            };
+        }
+        let canon_probe = probe
+            .canonicalize()
+            .map_err(|e| crate::Error::Provider(e.to_string()))?;
+        if !canon_probe.starts_with(root) {
+            return Err(crate::Error::Provider(format!(
+                "'{rel}' escapes the vault — refused"
+            )));
+        }
         std::fs::create_dir_all(parent).map_err(|e| crate::Error::Provider(e.to_string()))?;
         let canon_parent = parent
             .canonicalize()
@@ -694,8 +723,19 @@ impl Connector for VaultWrite {
                 "'{rel}' escapes the vault — refused"
             )));
         }
+        // Never write THROUGH a symlink: an existing evil.md → /etc/…
+        // must not receive the append/overwrite.
+        let existed = match std::fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(crate::Error::Provider(format!(
+                    "'{rel}' is a symlink — refused"
+                )))
+            }
+            Ok(_) => true,
+            Err(_) => false,
+        };
         use std::io::Write;
-        if append && target.exists() {
+        if append && existed {
             let mut f = std::fs::OpenOptions::new()
                 .append(true)
                 .open(&target)
@@ -705,6 +745,9 @@ impl Connector for VaultWrite {
             std::fs::write(&target, content).map_err(|e| crate::Error::Provider(e.to_string()))?;
         }
         let _ = self.kind;
-        Ok(json!({"vault": name, "path": rel, "written": true, "appended": append && target.exists()}).to_string())
+        Ok(
+            json!({"vault": name, "path": rel, "written": true, "appended": append && existed})
+                .to_string(),
+        )
     }
 }

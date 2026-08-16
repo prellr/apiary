@@ -126,6 +126,35 @@ impl EpisodicLog {
         body: &EntryBody,
         extra_tags: Vec<Tag>,
     ) -> Result<Event, crate::Error> {
+        // The chain invariant (every entry references the previous) demands
+        // that tail-read → sign → append be one critical section: two
+        // presence channels appending concurrently would otherwise fork
+        // the chain forever. Process-safe flock, same discipline as the
+        // spend ledger.
+        let lock_path = self.path.with_extension("lock");
+        let mut lock_opts = OpenOptions::new();
+        lock_opts.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            lock_opts.mode(0o600);
+        }
+        let lock = lock_opts.open(&lock_path)?;
+        fs2::FileExt::lock_exclusive(&lock)
+            .map_err(|e| crate::Error::Log(format!("log lock: {e}")))?;
+        let result = self.append_locked(custody, signer, tier, body, extra_tags);
+        let _ = fs2::FileExt::unlock(&lock);
+        result
+    }
+
+    fn append_locked(
+        &self,
+        custody: &Custody,
+        signer: &AgentHandle,
+        tier: Tier,
+        body: &EntryBody,
+        extra_tags: Vec<Tag>,
+    ) -> Result<Event, crate::Error> {
         let prev = self.tail(1)?.pop();
         let content = serde_json::to_string(body)?;
         let mut builder = EventBuilder::new(Kind::Custom(LOG_ENTRY_KIND), content)

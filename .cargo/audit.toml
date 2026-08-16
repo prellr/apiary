@@ -1,0 +1,9 @@
+# cargo-audit policy.
+#
+# RUSTSEC-2024-0429 (glib < 0.20 UB): transitively pinned by Tauri v2's
+# GTK3 stack, which is LINUX-ONLY — this project currently ships macOS
+# desktop builds and headless daemons, where the affected code is never
+# compiled in. Revisit when Tauri moves to the GTK4/glib >= 0.20 stack;
+# do NOT ship Linux desktop builds while this ignore stands.
+[advisories]
+ignore = ["RUSTSEC-2024-0429"]

@@ -26,6 +26,11 @@ struct Args {
     /// (default: http://<bind>). Must match what clients see exactly.
     #[arg(long)]
     origin: Option<String>,
+    /// Host administrator npubs (nip98 mode): required for host-scoped
+    /// operations — founding, importing, connector library, lock/unlock.
+    /// Repeatable. Without any, those operations refuse in nip98 mode.
+    #[arg(long = "admin")]
+    admins: Vec<String>,
 }
 
 fn default_home() -> PathBuf {
@@ -50,6 +55,15 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    let admins = args
+        .admins
+        .iter()
+        .map(|a| apiary_core::identity::parse_npub(a))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|e| {
+            eprintln!("error: --admin: {e}");
+            std::process::exit(2);
+        });
     let state = Arc::new(AppState {
         home: args.home.clone(),
         passphrase: std::sync::RwLock::new(args.passphrase.clone()),
@@ -62,6 +76,7 @@ async fn main() {
         listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
         pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
         supervisor_notes: std::sync::Mutex::new(std::collections::HashMap::new()),
+        admins,
     });
     apiary_hostd::ops::spawn_supervisor(state.clone());
     let app = build_router(state);

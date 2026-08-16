@@ -22,6 +22,8 @@ pub enum Error {
     Custody(String),
     #[error("keystore: {0}")]
     Keystore(String),
+    #[error("log: {0}")]
+    Log(String),
     #[error(transparent)]
     Yaml(#[from] serde_yaml::Error),
     #[error(transparent)]

@@ -133,6 +133,7 @@ dependencies = [
 name = "apiary-core"
 version = "0.1.0"
 dependencies = [
+ "fs2",
  "nostr",
  "serde",
  "serde_json",

@@ -103,6 +103,7 @@ pub fn export_with_passphrase(
     }))
 }
 
+#[derive(Debug)]
 pub struct ImportReport {
     pub npub: String,
     pub name: String,
@@ -302,6 +303,16 @@ pub fn import_with_options(
     let agent_pk = crate::identity::parse_npub(&npub)?;
     let ratified =
         ceremony::is_ratified(&log, &manifest_yaml, &agent_pk, &suspend).unwrap_or(false);
+    // The stated invariant holds at the border: an unratified constitution
+    // does not get installed — no key lands, no state lands. (Runtime
+    // gates would refuse it anyway; the keystore should never hold it.)
+    if !ratified {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(fail(
+            "bundle's manifest is not ratified by its listed suspend keys — refused and rolled back"
+                .into(),
+        ));
+    }
 
     Ok(ImportReport {
         npub,
@@ -483,19 +494,24 @@ mod sealed_tests {
         let keys = crate::identity::generate();
         let npub = crate::identity::to_npub(&keys.public_key()).unwrap();
         ks.store(&keys, pass).unwrap();
-        // Suspension authority never rests with the agent's own key —
-        // the invariant holds even in fixtures.
-        let governor = crate::identity::to_npub(&crate::identity::generate().public_key()).unwrap();
+        // Suspension authority never rests with the agent's own key — and
+        // imports refuse unratified bundles, so the fixture runs the full
+        // founding ceremony.
+        let governor_keys = crate::identity::generate();
+        let governor = crate::identity::to_npub(&governor_keys.public_key()).unwrap();
         let adir = ks.agent_dir(&npub);
-        std::fs::write(
-            adir.join("manifest.yaml"),
-            format!(
-                "manifest_version: 1\nidentity:\n  npub: {npub}\nmemory:\n  log: local\n  \
-                 index: local\ngovernance:\n  suspend_keys:\n  - {governor}\n"
-            ),
-        )
-        .unwrap();
+        let manifest_yaml = format!(
+            "manifest_version: 1\nidentity:\n  npub: {npub}\nmemory:\n  log: local\n  \
+             index: local\ngovernance:\n  suspend_keys:\n  - {governor}\n"
+        );
+        std::fs::write(adir.join("manifest.yaml"), &manifest_yaml).unwrap();
         std::fs::write(adir.join("name"), "fixture").unwrap();
+        let mut custody = crate::custody::Custody::new();
+        let agent_handle = custody.admit(keys);
+        let governor_handle = custody.admit(governor_keys);
+        let log = EpisodicLog::open(&adir);
+        ceremony::sign_manifest(&custody, &agent_handle, &log, &manifest_yaml).unwrap();
+        ceremony::ratify(&custody, &governor_handle, &log, &npub, &manifest_yaml).unwrap();
         (ks, npub)
     }
 
@@ -507,9 +523,58 @@ mod sealed_tests {
     }
 
     #[test]
+    fn unratified_bundles_refuse_and_roll_back() {
+        let home = tmp("unrat");
+        let ks = Keystore::open(&home).unwrap();
+        let keys = crate::identity::generate();
+        let npub = crate::identity::to_npub(&keys.public_key()).unwrap();
+        ks.store(&keys, "p").unwrap();
+        let governor = crate::identity::to_npub(&crate::identity::generate().public_key()).unwrap();
+        let adir = ks.agent_dir(&npub);
+        std::fs::write(
+            adir.join("manifest.yaml"),
+            format!(
+                "manifest_version: 1\nidentity:\n  npub: {npub}\nmemory:\n  log: local\n  \
+                 index: local\ngovernance:\n  suspend_keys:\n  - {governor}\n"
+            ),
+        )
+        .unwrap();
+        // No ceremony: export succeeds (reads files), import must refuse.
+        let bundle = export(&adir, &npub).unwrap();
+        let rx = tmp("unrat-rx");
+        let rx_ks = Keystore::open(&rx).unwrap();
+        let err = import(&rx_ks, &bundle, "p", "p").unwrap_err().to_string();
+        assert!(err.contains("not ratified"), "{err}");
+        assert!(
+            !rx_ks.agent_dir(&npub).join("manifest.yaml").exists(),
+            "rolled back"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&rx);
+    }
+
+    #[test]
     fn sealed_round_trip_and_refusals() {
         let sender_home = tmp("sender");
         let (ks, npub) = fixture(&sender_home, "sender-pass");
+        // Bisect guard: the fixture's ceremony must verify in place.
+        {
+            let adir = ks.agent_dir(&npub);
+            let raw = std::fs::read_to_string(adir.join("manifest.yaml")).unwrap();
+            let m = Manifest::from_yaml(&raw).unwrap();
+            let suspend: Vec<PublicKey> = m
+                .governance
+                .suspend_keys
+                .iter()
+                .filter_map(|k| crate::identity::parse_npub(k).ok())
+                .collect();
+            let pk = crate::identity::parse_npub(&npub).unwrap();
+            let log = EpisodicLog::open(&adir);
+            assert!(
+                ceremony::is_ratified(&log, &raw, &pk, &suspend).unwrap(),
+                "fixture ceremony did not ratify in place"
+            );
+        }
         let recipient = crate::identity::generate();
         let envelope = seal(
             &ks.agent_dir(&npub),

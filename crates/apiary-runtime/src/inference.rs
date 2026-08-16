@@ -54,6 +54,12 @@ pub trait Provider {
     }
 }
 
+/// Conservative token estimate for budget pre-checks: ~3 chars per token
+/// errs on the refusing side for English prose and JSON alike.
+pub fn estimate_tokens(text: &str) -> u64 {
+    (text.len() as u64) / 3 + 1
+}
+
 /// Anthropic Messages API over raw HTTP.
 ///
 /// Auth is either an API key (`x-api-key`) or an OAuth bearer token
@@ -180,6 +186,7 @@ impl Provider for AnthropicProvider {
         budget_tokens: u64,
     ) -> Result<Completion, crate::Error> {
         const MAX_ITERATIONS: usize = 8;
+        let base_estimate = estimate_tokens(system) + estimate_tokens(prompt);
         let tool_defs: Vec<serde_json::Value> = tools
             .iter()
             .map(|t| {
@@ -195,9 +202,17 @@ impl Provider for AnthropicProvider {
         let mut served_model = model.to_string();
 
         for _ in 0..MAX_ITERATIONS {
-            // Hard ceiling: never request more than the budget's remainder.
+            // Hard ceiling means INPUT counts too: estimate the next
+            // call's prompt (system + the growing message history) and
+            // refuse BEFORE dispatch when it alone would eat the
+            // remainder — max_tokens only caps output, and a long tool
+            // loop grows input every turn.
             let spent = in_total + out_total;
-            let remaining = budget_tokens.saturating_sub(spent);
+            let next_input = base_estimate
+                + estimate_tokens(&serde_json::to_string(&messages).unwrap_or_default());
+            let remaining = budget_tokens
+                .saturating_sub(spent)
+                .saturating_sub(next_input);
             if remaining == 0 {
                 return Ok(Completion {
                     text: String::new(),

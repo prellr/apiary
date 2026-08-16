@@ -137,9 +137,20 @@ pub fn run_task_observed(
     //    capabilities exist) and infer. Every dispatch is logged BEFORE the
     //    result returns to the model — the track record sees each action.
     let connectors = crate::connector::bind_connectors(manifest, custody, agent)?;
+    // Input counts against the ceiling: refuse before dispatch when the
+    // working set alone would consume the reservation.
+    let input_estimate =
+        crate::inference::estimate_tokens(&system) + crate::inference::estimate_tokens(task);
+    if input_estimate >= reservation.amount {
+        let _ = ledger.settle(reservation, 0, 0);
+        return Err(crate::Error::Budget(format!(
+            "working set (~{input_estimate} tokens) exceeds the remaining budget              reservation ({}); a human raises the floor, not the agent",
+            reservation.amount
+        )));
+    }
     let run = || -> Result<crate::inference::Completion, crate::Error> {
         Ok(if connectors.is_empty() {
-            provider.complete(&model, &system, task, reservation.amount)?
+            provider.complete(&model, &system, task, reservation.amount - input_estimate)?
         } else {
             let tool_defs: Vec<crate::connector::ToolDef> =
                 connectors.iter().map(|c| c.def()).collect();
@@ -223,11 +234,32 @@ pub fn run_task_observed(
             })),
         },
     )?;
-    ledger.settle(
+    let (_, overran) = ledger.settle(
         reservation,
         completion.input_tokens,
         completion.output_tokens,
     )?;
+    if overran {
+        // Real usage exceeded the reservation (estimates are estimates).
+        // The ledger recorded the truth — the overrun is visible in the
+        // signed record and the shortfall comes out of the next reserve.
+        log.append(
+            custody,
+            agent,
+            Tier::Self_,
+            &EntryBody {
+                action: "budget.overrun".into(),
+                model: Some(completion.model.clone()),
+                cost: None,
+                harness: Some("native".into()),
+                outcome: "recorded".into(),
+                detail: Some(json!({
+                    "reserved": reservation.amount,
+                    "used": completion.input_tokens + completion.output_tokens,
+                })),
+            },
+        )?;
+    }
 
     emit(RunEvent::Finished {
         outcome: completion.outcome.clone(),
@@ -463,7 +495,7 @@ governance:
   suspend_keys:
     - {human}
   budgets:
-    tokens_per_day: 100
+    tokens_per_day: 600
 "#
         ))
         .unwrap();
@@ -489,9 +521,12 @@ governance:
         let log = EpisodicLog::open(&dir);
         assert_eq!(log.verify().unwrap(), 1);
 
-        // Burn through the 100-token/day budget (mock spends ~16+ per run).
+        // Burn the 600-token/day budget down: the mock spends ~16 per run,
+        // and the INPUT-estimate guard (security round 2) refuses once the
+        // remainder can no longer cover the working set itself (~370
+        // estimated tokens) — the ceiling now counts input, not just output.
         let mut refused = false;
-        for _ in 0..12 {
+        for _ in 0..20 {
             if run_task(&manifest, &dir, &custody, &handle, "again", &ctx).is_err() {
                 refused = true;
                 break;

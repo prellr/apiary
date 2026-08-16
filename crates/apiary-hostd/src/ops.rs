@@ -166,7 +166,11 @@ pub async fn unlock(
         .path_and_query()
         .map(|p| p.to_string())
         .unwrap_or_else(|| uri.path().to_string());
-    if let Err(e) = nip98::check(&state, &headers, "POST", &pq, Some(&raw_body)) {
+    let signer = match nip98::check(&state, &headers, "POST", &pq, Some(&raw_body)) {
+        Ok(sig) => sig,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = nip98::authorize_admin(&state, signer) {
         return e.into_response();
     }
     let body: UnlockBody = match serde_json::from_slice(&raw_body) {
@@ -215,7 +219,11 @@ pub async fn lock(
         .path_and_query()
         .map(|p| p.to_string())
         .unwrap_or_else(|| uri.path().to_string());
-    if let Err(e) = nip98::check(&state, &headers, "POST", &pq, None) {
+    let signer = match nip98::check(&state, &headers, "POST", &pq, None) {
+        Ok(sig) => sig,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = nip98::authorize_admin(&state, signer) {
         return e.into_response();
     }
     if let Ok(mut g) = state.passphrase.write() {
@@ -1085,7 +1093,11 @@ pub async fn connectors_put(
         .path_and_query()
         .map(|p| p.to_string())
         .unwrap_or_else(|| uri.path().to_string());
-    if let Err(e) = nip98::check(&state, &headers, "PUT", &pq, Some(&raw_body)) {
+    let signer = match nip98::check(&state, &headers, "PUT", &pq, Some(&raw_body)) {
+        Ok(sig) => sig,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = nip98::authorize_admin(&state, signer) {
         return e.into_response();
     }
     let body: LibraryBody = match serde_json::from_slice(&raw_body) {
@@ -1563,15 +1575,37 @@ pub struct CallbackQuery {
     error_description: Option<String>,
 }
 
-fn callback_page(title: &str, detail: &str) -> axum::response::Html<String> {
-    // Static text only — title/detail are our own strings, never echoes of
-    // request input.
-    axum::response::Html(format!(
-        "<!doctype html><meta charset=utf-8><title>Apiary</title>\
-         <body style=\"background:#14120e;color:#e8e0cf;font:16px ui-monospace,monospace;\
-         display:flex;align-items:center;justify-content:center;height:100vh\">\
-         <div style=\"max-width:60ch\"><h2 style=\"color:#e8b04b\">{title}</h2><p>{detail}</p></div>"
-    ))
+/// HTML-escape untrusted text for the callback page. The authorization
+/// server (and its error strings) are NOT ours — a malicious AS returning
+/// markup with a valid state must render as text, never execute.
+fn html_escape(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '&' => "&amp;".to_string(),
+            '<' => "&lt;".to_string(),
+            '>' => "&gt;".to_string(),
+            '"' => "&quot;".to_string(),
+            '\'' => "&#39;".to_string(),
+            c => c.to_string(),
+        })
+        .collect()
+}
+
+fn callback_page(title: &str, detail: &str) -> impl IntoResponse {
+    let title = html_escape(title);
+    let detail = html_escape(detail);
+    (
+        [(
+            "content-security-policy",
+            "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'",
+        )],
+        axum::response::Html(format!(
+            "<!doctype html><meta charset=utf-8><title>Apiary</title>\
+             <body style=\"background:#14120e;color:#e8e0cf;font:16px ui-monospace,monospace;\
+             display:flex;align-items:center;justify-content:center;height:100vh\">\
+             <div style=\"max-width:60ch\"><h2 style=\"color:#e8b04b\">{title}</h2><p>{detail}</p></div>"
+        )),
+    )
 }
 
 /// The browser lands here after consent. Public route (no host token — the
@@ -1834,6 +1868,22 @@ pub async fn lease_takeover(
 
 // ---------------------------------------------------------------- portability
 
+/// Filesystem-safe slug for export filenames: the host-local name is
+/// user-controlled text, never a path. Anything outside [A-Za-z0-9_-]
+/// drops; empty falls back to the npub prefix.
+fn export_slug(name: &str, npub: &str) -> String {
+    let slug: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(40)
+        .collect();
+    if slug.is_empty() {
+        npub.chars().take(16).collect()
+    } else {
+        slug
+    }
+}
+
 /// Export the agent to a bundle file under <home>/exports/. The key inside
 /// stays NIP-49-locked; the passphrase travels human-to-human.
 #[derive(serde::Deserialize, Default)]
@@ -1903,7 +1953,7 @@ pub async fn export_agent(
             .to_string();
         let file = exports.join(format!(
             "{}-{}.apiary-sealed.json",
-            if name.is_empty() { &npub[..16] } else { &name },
+            export_slug(&name, &npub),
             now_secs()
         ));
         if let Err(e) = std::fs::write(
@@ -1967,7 +2017,7 @@ pub async fn export_agent(
     }
     let file = exports.join(format!(
         "{}-{}.apiary.json",
-        if name.is_empty() { &npub[..16] } else { &name },
+        export_slug(&name, &npub),
         now_secs()
     ));
     let pretty = serde_json::to_string_pretty(&bundle).unwrap_or_default();
@@ -2018,7 +2068,11 @@ pub async fn import_agent(
         .path_and_query()
         .map(|p| p.to_string())
         .unwrap_or_else(|| uri.path().to_string());
-    if let Err(e) = nip98::check(&state, &headers, "POST", &pq, Some(&raw_body)) {
+    let signer = match nip98::check(&state, &headers, "POST", &pq, Some(&raw_body)) {
+        Ok(sig) => sig,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = nip98::authorize_admin(&state, signer) {
         return e.into_response();
     }
     let body: ImportBody = match serde_json::from_slice(&raw_body) {

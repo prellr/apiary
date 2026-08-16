@@ -37,6 +37,7 @@ pub struct ReservationRecord {
 
 /// A claim on today's remaining capacity. Settle it with actual usage (or
 /// zero on failure); unsettled reservations expire after the TTL.
+#[derive(Clone, Copy)]
 pub struct Reservation {
     pub id: u64,
     pub amount: u64,
@@ -170,13 +171,18 @@ impl SpendLedger {
     }
 
     /// Settle a reservation with actual usage (zero on failure is fine).
+    /// Returns the day plus an OVERRUN flag when real usage exceeded the
+    /// reservation — always recorded (the ledger is truth, and the API
+    /// call already happened); callers surface it in the signed log, and
+    /// the shortfall reduces the next reservation automatically.
     pub fn settle(
         &self,
         reservation: Reservation,
         input_tokens: u64,
         output_tokens: u64,
-    ) -> Result<DaySpend, crate::Error> {
-        self.with_locked(move |s| {
+    ) -> Result<(DaySpend, bool), crate::Error> {
+        let overran = input_tokens + output_tokens > reservation.amount;
+        let day = self.with_locked(move |s| {
             s.reservations.retain(|r| r.id != reservation.id);
             s.input_tokens += input_tokens;
             s.output_tokens += output_tokens;
@@ -186,7 +192,8 @@ impl SpendLedger {
                 output_tokens: s.output_tokens,
                 reservations: s.reservations.clone(),
             })
-        })
+        })?;
+        Ok((day, overran))
     }
 }
 

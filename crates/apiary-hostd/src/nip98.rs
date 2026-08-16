@@ -137,6 +137,35 @@ pub fn authorize_governor(
     }
 }
 
+/// Host-scoped authorization: in nip98 mode the signer must be a listed
+/// HOST ADMIN — being a valid nostr key (or even some agent's governor)
+/// grants nothing over the host itself. Open mode remains local trust.
+pub fn authorize_admin(
+    state: &AppState,
+    signer: Option<PublicKey>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if state.auth == AuthMode::Open {
+        return Ok(());
+    }
+    if state.admins.is_empty() {
+        return Err(crate::err(
+            StatusCode::FORBIDDEN,
+            "host-scoped operations need a host administrator — start the daemon with --admin <npub>",
+        ));
+    }
+    match signer {
+        Some(pk) if state.admins.contains(&pk) => Ok(()),
+        Some(_) => Err(crate::err(
+            StatusCode::FORBIDDEN,
+            "signer is not a host administrator",
+        )),
+        None => Err(crate::err(
+            StatusCode::UNAUTHORIZED,
+            "authentication required",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +180,7 @@ mod tests {
             token: None,
             listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
             pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
+            admins: Vec::new(),
             supervisor_notes: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }

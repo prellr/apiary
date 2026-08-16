@@ -35,6 +35,14 @@ pub struct AppState {
     pub auth: AuthMode,
     /// Canonical origin for exact NIP-98 URL matching.
     pub origin: String,
+    /// HOST administrators (nip98 mode): only these keys may perform
+    /// host-scoped operations — founding/importing agents, editing the
+    /// connector library, locking/unlocking. Per-agent operations stay
+    /// governor-bound to that agent's suspend keys; this list is the
+    /// authority over the HOST itself (its keystore slots, its inference
+    /// credentials, its configuration). Empty in nip98 mode = host-scoped
+    /// operations refuse, loudly.
+    pub admins: Vec<nostr::prelude::PublicKey>,
     /// Per-launch bearer token (desktop mode). When set, EVERY request must
     /// present it — the desktop webview gets it in its boot URL, so other
     /// local processes cannot drive the embedded daemon.
@@ -547,6 +555,9 @@ async fn found_agent(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
+    if let Err(e) = nip98::authorize_admin(&state, signer) {
+        return e.into_response();
+    }
     let body: FoundBody = match serde_json::from_slice(&raw_body) {
         Ok(b) => b,
         Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),

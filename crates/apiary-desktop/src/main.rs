@@ -53,6 +53,9 @@ fn main() {
         listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
         pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
         supervisor_notes: std::sync::Mutex::new(std::collections::HashMap::new()),
+        // Desktop runs open-mode behind its per-launch token; the token
+        // IS the admin boundary there.
+        admins: Vec::new(),
     });
 
     std::thread::spawn(move || {

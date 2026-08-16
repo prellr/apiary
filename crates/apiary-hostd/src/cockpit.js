@@ -828,7 +828,7 @@ async function renderConnectors(c) {
 // ------------------------------------------------------------ host library (host-scoped, all agents)
 
 async function renderLibrary(c) {
-  c.append(help('HOST-SCOPED: this library belongs to the host, not to any one agent. Entries are named connector configurations (kind + caps — never secrets) stored in connectors.yaml under the state directory. Grant them to individual agents from an agent’s Connectors tab; each grant is a ratified manifest amendment for that agent alone.'));
+  c.append(help('Host-scoped: named connector configurations (kind + caps — never secrets), shared by all agents. Grant from an agent’s Connectors tab; each grant is a ratified amendment for that agent alone.'));
   const lib = await j('/api/connectors');
   if (!lib.ok) { c.append(el('div', 'ev err', 'error: ' + lib.error)); return; }
 
@@ -843,13 +843,13 @@ async function renderLibrary(c) {
   }
 
   const lSec = section('Entries',
-    'Kinds this host can bind: ' + (lib.host_binds || []).join(', ') + '. An entry granted to an agent travels in that agent’s manifest — a destination host only needs to bind the kind.');
+    'Kinds this host binds: ' + (lib.host_binds || []).join(', ') + '.');
   const entries = (lib.library || []).slice();
   const list = el('div');
   const lStatus = el('span', 'meta', '');
   const drawList = () => {
     list.replaceChildren();
-    if (!entries.length) list.append(kv('library', 'empty'));
+    if (!entries.length) list.append(el('div', 'meta', 'no entries yet — add your first below'));
     entries.forEach((e, i) => {
       const row = el('div', 'row');
       const holders = grantsByKind[e.kind] || [];
@@ -870,9 +870,17 @@ async function renderLibrary(c) {
   const nCaps = el('input', 'grow'); nCaps.placeholder = 'caps JSON (e.g. {"relays":["wss://nos.lol"]})';
   const nGo = el('button', 'btn', 'ADD TO LIBRARY');
   const nRow = el('div', 'row'); nRow.append(nName, nKind, nCaps, nGo, lStatus);
-  lSec.append(list, nRow,
-    help('caps are the human-owned behavioral limits enforced host-side at every call — e.g. nostr-publish requires caps.relays (a publish allowlist); mcp requires caps.allowed_tools (the server offers whatever it likes, the manifest decides). Removing an entry here does NOT revoke existing grants — those live in agent manifests and are revoked per-agent.'));
-  lSec.append(help('mcp stdio example caps: {"transport":"stdio","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/data"],"allowed_tools":["read_text_file","list_directory"]} — remote: {"transport":"http","url":"https://mcp.example.com/mcp","allowed_tools":["search"],"oauth_client_id":"…"}.'));
+  lSec.append(list, nRow);
+  const ref = el('details');
+  ref.append(el('summary', null, 'caps reference & examples'));
+  const refBody = el('div');
+  refBody.append(help('caps are human-owned limits enforced host-side at every call. Removing a library entry does not revoke grants — those live in agent manifests.'));
+  refBody.append(kv('nostr-publish', '{"relays":["wss://nos.lol"]} — publish allowlist'));
+  refBody.append(kv('mcp (stdio)', '{"transport":"stdio","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/data"],"allowed_tools":["read_text_file"]}'));
+  refBody.append(kv('mcp (remote)', '{"transport":"http","url":"https://…/mcp","allowed_tools":["search"],"oauth_client_id":"…"}'));
+  refBody.append(kv('obsidian / markdown-vault', '{"vaults":[{"name":"kb","path":"~/repos/winery-kb/kb"}],"write":false}'));
+  ref.append(refBody);
+  lSec.append(ref);
   c.append(lSec);
   const saveLib = async () => {
     const r = await j('/api/connectors', {
