@@ -312,13 +312,27 @@ pub(crate) fn build_working_set(
     }
 
     // Semantic retrieval: what recency missed, when an embedder is bound.
+    // Retrieval is ENRICHMENT, never a dependency: an unreachable embedder
+    // (ollama down, model missing) degrades the run to recency-only memory
+    // instead of killing it — an agent must keep answering when its recall
+    // aid is offline, and the degradation is stated in the working set so
+    // the record shows it.
     let mut relevant_lines = Vec::new();
     if let Some(embedder) = crate::index::bind_embedder(manifest) {
         let idx = crate::index::SemanticIndex::open(agent_dir);
-        idx.update(log, embedder.as_ref())?;
-        idx.update_vaults(&manifest.memory.vaults, embedder.as_ref())?;
-        for hit in idx.query(embedder.as_ref(), task, 4, &tail_ids)? {
-            relevant_lines.push(format!("- {}", hit.text));
+        let retrieved: Result<(), crate::Error> = (|| {
+            idx.update(log, embedder.as_ref())?;
+            idx.update_vaults(&manifest.memory.vaults, embedder.as_ref())?;
+            for hit in idx.query(embedder.as_ref(), task, 4, &tail_ids)? {
+                relevant_lines.push(format!("- {}", hit.text));
+            }
+            Ok(())
+        })();
+        if let Err(e) = retrieved {
+            relevant_lines.clear();
+            relevant_lines.push(format!(
+                "- (semantic retrieval unavailable this run: {e} — recency tail only)"
+            ));
         }
     }
 
