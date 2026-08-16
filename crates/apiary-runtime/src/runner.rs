@@ -558,7 +558,7 @@ governance:
         // An unbindable provider fails AFTER reserve, BEFORE inference.
         manifest.inference[0].provider = "no-such-provider".into();
         let ctx = TaskContext::default();
-        assert!(run_task(&manifest, &dir, &custody, &handle, "hi", &ctx, &mut |_| {}).is_err());
+        assert!(run_task(&manifest, &dir, &custody, &handle, "hi", &ctx).is_err());
         let ledger = crate::spend::SpendLedger::open(&dir);
         assert!(
             ledger.today().unwrap().reservations.is_empty(),
