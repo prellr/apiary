@@ -147,6 +147,8 @@ function entryLine(bold, rest, metaLines) {
 
 async function render() {
   if (listenerPoll) { clearInterval(listenerPoll); listenerPoll = null; }
+  // Agent tabs only make sense when looking at an agent.
+  document.querySelector('nav').style.display = (hostView || !sel) ? 'none' : 'flex';
   const c = document.getElementById('content');
   c.replaceChildren();
   if (hostView) return renderLibrary(c);
