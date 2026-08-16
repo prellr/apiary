@@ -5,7 +5,7 @@
 'use strict';
 
 let sel = null, tab = 'overview', agents = [], hostStatus = {};
-let hostView = false;
+let hostView = null; // null | 'library' | 'found' | 'import'
 let listenerPoll = null;
 
 // Desktop mode hands the per-launch token in the boot URL; every API call
@@ -123,13 +123,13 @@ async function loadRoster() {
     nm.append(el('span', 'badge ' + (a.active ? 'live' : 'unrat'), a.active ? 'active' : 'inactive'));
     if (running.has(a.npub)) nm.append(el('span', 'badge live', 'listening'));
     card.append(nm, el('div', 'np', a.npub), el('div', 'np', a.log_entries + ' log entries'));
-    card.onclick = () => { hostView = false; sel = a.npub; render(); loadRoster(); };
+    card.onclick = () => { hostView = null; sel = a.npub; render(); loadRoster(); };
     root.append(card);
   }
 }
 
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
-  hostView = false;
+  hostView = null;
   tab = b.dataset.tab;
   document.querySelectorAll('nav button').forEach(x => x.classList.toggle('sel', x === b));
   render();
@@ -151,7 +151,9 @@ async function render() {
   document.querySelector('nav').style.display = (hostView || !sel) ? 'none' : 'flex';
   const c = document.getElementById('content');
   c.replaceChildren();
-  if (hostView) return renderLibrary(c);
+  if (hostView === 'library') return renderLibrary(c);
+  if (hostView === 'found') return renderFound(c);
+  if (hostView === 'import') return renderImport(c);
   if (!sel) { c.append(el('div', 'empty', 'select an agent — or open the host connector library from the sidebar')); return; }
   if (tab === 'overview') return renderOverview(c);
   if (tab === 'run') return renderRun(c);
@@ -946,57 +948,88 @@ function renderCreds(c) {
 // ------------------------------------------------------------ founding
 
 document.getElementById('libtoggle').onclick = () => {
-  hostView = true;
+  hostView = 'library';
+  document.querySelectorAll('nav button').forEach(x => x.classList.remove('sel'));
+  render();
+};
+document.getElementById('foundtoggle').onclick = () => {
+  hostView = 'found';
+  document.querySelectorAll('nav button').forEach(x => x.classList.remove('sel'));
+  render();
+};
+document.getElementById('importtoggle').onclick = () => {
+  hostView = 'import';
   document.querySelectorAll('nav button').forEach(x => x.classList.remove('sel'));
   render();
 };
 
-document.getElementById('foundtoggle').onclick = () => {
-  const f = document.getElementById('foundform');
-  f.style.display = f.style.display === 'block' ? 'none' : 'block';
-};
+// ------------------------------------------------------------ found (pane)
 
-document.getElementById('importtoggle').onclick = () => {
-  const f = document.getElementById('importform');
-  f.style.display = f.style.display === 'block' ? 'none' : 'block';
-};
+function renderFound(c) {
+  const sec = section('Found a new agent',
+    'Founding generates a fresh keypair and drafts a constitution for human review. Founding is the moment of maximum ignorance — drafts start minimal and conservative, and nothing runs until you ratify.');
+  const fName = el('input'); fName.placeholder = 'name (e.g. scribe)';
+  const fPurpose = el('textarea'); fPurpose.rows = 3; fPurpose.placeholder = 'purpose — what is this agent for?';
+  const fSuspend = el('input', 'grow'); fSuspend.placeholder = 'human suspend key (npub or hex) — your key';
+  const fDraft = el('input'); fDraft.type = 'checkbox'; fDraft.style.width = 'auto';
+  const draftLabel = el('label', null, ' draft with model'); draftLabel.prepend(fDraft);
+  const go = el('button', 'btn solid', 'FOUND');
+  const st = el('span', 'meta', '');
+  const r1 = el('div', 'row'); r1.append(fName);
+  const r3 = el('div', 'row'); r3.append(fSuspend);
+  const r4 = el('div', 'row'); r4.append(draftLabel, go, st);
+  sec.append(r1, help('A label for humans; the identity is the generated keypair.'),
+    fPurpose, help('Seeds the draft constitution.'),
+    r3, help('Suspension authority never rests with the agent’s own key — at least one human governor is required.'),
+    r4, help('Model-drafted or template, the draft is a hypothesis: review it in the Manifest tab, then ratify.'));
+  c.append(sec);
+  go.onclick = async () => {
+    st.textContent = 'founding… (keygen + NIP-49 encryption; slow by design)';
+    const r = await j('/api/agents/found', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: fName.value.trim(),
+        purpose: fPurpose.value.trim(),
+        suspend_keys: [fSuspend.value.trim()],
+        draft_with: fDraft.checked ? 'anthropic' : null,
+      }),
+    });
+    if (!r.ok) { st.textContent = 'refused: ' + r.error; return; }
+    st.textContent = `founded — drafted by ${r.drafted_by}`;
+    hostView = null; sel = r.npub; tab = 'manifest';
+    document.querySelectorAll('nav button').forEach(x => x.classList.toggle('sel', x.dataset.tab === 'manifest'));
+    await loadRoster(); render();
+  };
+}
 
-document.getElementById('importgo').onclick = async () => {
-  const st = document.getElementById('i-status');
-  st.style.display = 'block';
-  let bundle;
-  try { bundle = JSON.parse(document.getElementById('i-bundle').value); }
-  catch { st.textContent = 'not valid JSON'; return; }
-  st.textContent = 'verifying and importing… (key decrypt is deliberately slow)';
-  const r = await j('/api/agents/import', {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ bundle, bundle_passphrase: document.getElementById('i-pass').value || null }),
-  });
-  st.textContent = r.ok
-    ? `imported ${r.name || r.npub.slice(0, 12)} · ${r.log_entries} log entries · ${r.index_rows} index rows${r.index_dropped ? ` (${r.index_dropped} dropped: disagreed with the signed log)` : ''} · ${r.ratified ? 'ratified' : 'NOT ratified'} — arrives inactive`
-    : 'refused: ' + r.error;
-  if (r.ok) { document.getElementById('i-bundle').value = ''; loadRoster(); }
-};
+// ------------------------------------------------------------ import (pane)
 
-document.getElementById('foundgo').onclick = async () => {
-  const st = document.getElementById('f-status');
-  st.style.display = 'block';
-  st.textContent = 'founding…';
-  const r = await j('/api/agents/found', {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      name: document.getElementById('f-name').value.trim(),
-      purpose: document.getElementById('f-purpose').value.trim(),
-      suspend_keys: [document.getElementById('f-suspend').value.trim()],
-      draft_with: document.getElementById('f-draft').checked ? 'anthropic' : null,
-    }),
-  });
-  if (!r.ok) { st.textContent = 'refused: ' + r.error; return; }
-  st.textContent = `founded ${r.npub.slice(0, 16)}… drafted by ${r.drafted_by} — review, then ratify`;
-  sel = r.npub; tab = 'manifest';
-  document.querySelectorAll('nav button').forEach(x => x.classList.toggle('sel', x.dataset.tab === 'manifest'));
-  await loadRoster(); render();
-};
+function renderImport(c) {
+  const sec = section('Import an agent',
+    'Paste an export bundle (or a sealed kind-4602 envelope). Everything verifies before anything lands: the key must decrypt, the manifest must match it, every log signature and the chain must hold, and the constitution must be ratified. The key is re-encrypted under THIS keystore’s passphrase; the agent arrives INACTIVE and the lease referees any host overlap.');
+  const bundle = el('textarea'); bundle.rows = 8; bundle.placeholder = 'paste .apiary.json bundle or sealed envelope';
+  const pass = el('input', 'grow'); pass.type = 'password';
+  pass.placeholder = 'bundle passphrase (if handoff-locked; sealed envelopes need none)';
+  const go = el('button', 'btn solid', 'IMPORT');
+  const st = el('div', 'meta', '');
+  const row = el('div', 'row'); row.append(pass, go);
+  sec.append(bundle, row, st);
+  c.append(sec);
+  go.onclick = async () => {
+    let parsed;
+    try { parsed = JSON.parse(bundle.value); }
+    catch { st.textContent = 'not valid JSON'; return; }
+    st.textContent = 'verifying and importing… (key decrypt is deliberately slow)';
+    const r = await j('/api/agents/import', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ bundle: parsed, bundle_passphrase: pass.value || null }),
+    });
+    st.textContent = r.ok
+      ? `imported ${r.name || r.npub.slice(0, 12)} · ${r.log_entries} log entries · ${r.index_rows} index rows${r.index_dropped ? ` (${r.index_dropped} dropped: disagreed with the signed log)` : ''} · ${r.ratified ? 'ratified' : 'NOT ratified'} — arrives inactive`
+      : 'refused: ' + r.error;
+    if (r.ok) { bundle.value = ''; loadRoster(); }
+  };
+}
 
-loadStatus().then(loadRoster);
+loadStatus().then(loadRoster).then(render);
 setInterval(loadStatus, 15000);

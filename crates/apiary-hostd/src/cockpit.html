@@ -84,9 +84,6 @@
   .row select, .row input, .section input, .section select, .section textarea { background:var(--bg); border:1px solid var(--line); border-radius:6px; color:var(--text); padding:7px 10px; font:inherit; }
   .section textarea { width:100%; resize:vertical; }
   .grow { flex:1; min-width:160px; }
-  #foundform { border:1px solid var(--line); border-radius:6px; padding:14px; margin:8px; background:var(--panel); display:none; }
-  #foundform input, #foundform textarea { width:100%; margin:2px 0 4px; background:var(--bg); border:1px solid var(--line); border-radius:6px; color:var(--text); padding:8px; font:inherit; }
-  #foundform .help { margin:0 0 8px; }
   details { margin:8px 0; }
   summary { color:var(--amber); cursor:pointer; font-size:12px; }
   .chan { padding:6px 10px; border:1px solid var(--line); border-radius:6px; margin:4px 0; cursor:pointer; font-size:12px; }
@@ -124,25 +121,6 @@
     <div style="padding:8px 8px 0"><button class="btn" style="width:100%" id="foundtoggle">+ found a new agent</button></div>
     <div style="padding:6px 8px 0"><button class="btn" style="width:100%" id="libtoggle">⚙ host connector library</button></div>
     <div style="padding:6px 8px 0"><button class="btn" style="width:100%" id="importtoggle">⇩ import agent</button></div>
-    <div id="importform" style="display:none; border:1px solid var(--line); border-radius:6px; padding:14px; margin:8px; background:var(--panel);">
-      <textarea id="i-bundle" rows="5" placeholder="paste an .apiary.json export bundle" style="width:100%; background:var(--bg); border:1px solid var(--line); border-radius:6px; color:var(--text); padding:8px; font:inherit;"></textarea>
-      <input id="i-pass" type="password" placeholder="bundle passphrase (if handoff-locked; else uses this keystore's)" style="width:100%; margin-top:6px; background:var(--bg); border:1px solid var(--line); border-radius:6px; color:var(--text); padding:8px; font:inherit;">
-      <div class="help">Verified end to end before anything lands: the bundle passphrase must open the traveling key, the manifest must match it, every log signature and the chain must hold, and the constitution must be ratified. The key is re-encrypted under THIS keystore's passphrase on arrival.</div>
-      <div class="row"><button class="btn solid" id="importgo">IMPORT</button></div>
-      <div id="i-status" class="empty" style="padding:4px;display:none"></div>
-    </div>
-    <div id="foundform">
-      <input id="f-name" placeholder="name (e.g. scribe)">
-      <div class="help">A label for humans; the identity is the generated keypair.</div>
-      <textarea id="f-purpose" rows="3" placeholder="purpose — what is this agent for?"></textarea>
-      <div class="help">Seeds the draft constitution. Founding is the moment of maximum ignorance — drafts start conservative.</div>
-      <input id="f-suspend" placeholder="human suspend key (npub or hex)">
-      <div class="help">Your key. Suspension authority never rests with the agent's own key, so at least one human governor is required.</div>
-      <div class="row"><label><input type="checkbox" id="f-draft" style="width:auto"> draft with model</label>
-      <button class="btn solid" id="foundgo">FOUND</button></div>
-      <div class="help">Model-drafted or template, the draft is only a hypothesis: nothing runs until a human ratifies it.</div>
-      <div id="f-status" class="empty" style="padding:4px;display:none"></div>
-    </div>
     <div id="roster"><div class="empty">loading…</div></div>
   </div>
   <div id="panel">
