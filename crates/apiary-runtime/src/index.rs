@@ -226,61 +226,6 @@ impl SemanticIndex {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use apiary_core::custody::Custody;
-    use apiary_core::log::Tier;
-    use nostr::prelude::*;
-
-    #[test]
-    fn hash_embedder_ranks_similar_text_higher() {
-        let e = HashEmbedder;
-        let a = e.embed("publish a note about bees and honey").unwrap();
-        let b = e.embed("publish a note about bees").unwrap();
-        let c = e.embed("rotate the database credentials").unwrap();
-        let dot = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| p * q).sum::<f32>();
-        assert!(dot(&a, &b) > dot(&a, &c));
-    }
-
-    #[test]
-    fn index_updates_incrementally_and_retrieves_relevant() {
-        let dir = std::env::temp_dir().join(format!("apiary-idx-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut custody = Custody::new();
-        let h = custody.admit(Keys::generate());
-        let log = EpisodicLog::open(&dir);
-        let mk = |task: &str| apiary_core::log::EntryBody {
-            action: "run.task".into(),
-            model: None,
-            cost: None,
-            harness: None,
-            outcome: "ok".into(),
-            detail: Some(serde_json::json!({ "task": task })),
-        };
-        log.append(&custody, &h, Tier::Self_, &mk("publish a note about bees"))
-            .unwrap();
-        log.append(
-            &custody,
-            &h,
-            Tier::Self_,
-            &mk("rotate the database credentials"),
-        )
-        .unwrap();
-
-        let idx = SemanticIndex::open(&dir);
-        let e = HashEmbedder;
-        assert_eq!(idx.update(&log, &e).unwrap(), 2);
-        assert_eq!(idx.update(&log, &e).unwrap(), 0); // incremental: nothing new
-
-        let hits = idx
-            .query(&e, "tell me about bees and honey", 1, &BTreeSet::new())
-            .unwrap();
-        assert!(hits[0].text.contains("bees"), "{}", hits[0].text);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-}
-
 impl SemanticIndex {
     /// Embed the manifest's vaults into the index: heading-aware chunks,
     /// staleness-tracked by a content fingerprint in the row id
@@ -355,5 +300,60 @@ impl SemanticIndex {
             }
         }
         Ok(added)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apiary_core::custody::Custody;
+    use apiary_core::log::Tier;
+    use nostr::prelude::*;
+
+    #[test]
+    fn hash_embedder_ranks_similar_text_higher() {
+        let e = HashEmbedder;
+        let a = e.embed("publish a note about bees and honey").unwrap();
+        let b = e.embed("publish a note about bees").unwrap();
+        let c = e.embed("rotate the database credentials").unwrap();
+        let dot = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| p * q).sum::<f32>();
+        assert!(dot(&a, &b) > dot(&a, &c));
+    }
+
+    #[test]
+    fn index_updates_incrementally_and_retrieves_relevant() {
+        let dir = std::env::temp_dir().join(format!("apiary-idx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut custody = Custody::new();
+        let h = custody.admit(Keys::generate());
+        let log = EpisodicLog::open(&dir);
+        let mk = |task: &str| apiary_core::log::EntryBody {
+            action: "run.task".into(),
+            model: None,
+            cost: None,
+            harness: None,
+            outcome: "ok".into(),
+            detail: Some(serde_json::json!({ "task": task })),
+        };
+        log.append(&custody, &h, Tier::Self_, &mk("publish a note about bees"))
+            .unwrap();
+        log.append(
+            &custody,
+            &h,
+            Tier::Self_,
+            &mk("rotate the database credentials"),
+        )
+        .unwrap();
+
+        let idx = SemanticIndex::open(&dir);
+        let e = HashEmbedder;
+        assert_eq!(idx.update(&log, &e).unwrap(), 2);
+        assert_eq!(idx.update(&log, &e).unwrap(), 0); // incremental: nothing new
+
+        let hits = idx
+            .query(&e, "tell me about bees and honey", 1, &BTreeSet::new())
+            .unwrap();
+        assert!(hits[0].text.contains("bees"), "{}", hits[0].text);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
