@@ -529,7 +529,7 @@ async function renderManifest(c) {
   const g = el('div');
   const rows = [
     ['identity.npub', 'the agent’s public key — immutable; the host refuses an amendment that changes it'],
-    ['inference[]', 'the model pool: named slots {name, provider, model}. Providers: anthropic (API key from host env), ollama (local), mock (tests). An "embed" slot powers the semantic index.'],
+    ['inference[]', 'the model pool: named slots {name, provider, model, credential?, requires?}. Providers: anthropic, openai, xai (OpenAI dialect; requires.base_url reaches any compatible endpoint — keyless when local), ollama, mock. Per-slot credentials are NIP-44-sealed. An "embed" slot powers the semantic index.'],
     ['routing.default', 'slot used when no rule matches'],
     ['routing.rules[]', 'per-task-class slot choices, e.g. {class: reasoning, use: workhorse}'],
     ['routing.floors[]', 'human-owned clamps, e.g. {data_class: sensitive, require_provider: ollama} — routing may be stricter than a floor, never looser'],

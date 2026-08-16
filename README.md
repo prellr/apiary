@@ -31,8 +31,12 @@ model runs). What exists today:
 
 **The runtime** (`apiary-runtime`)
 
-- Inference pool: Anthropic (raw Messages API), Ollama, mock — slots, not
-  identity; routing = floors clamp → rules → default, resolved host-side
+- Inference pool: Anthropic (raw Messages API), **OpenAI and xAI** (one
+  OpenAI-compatible implementation with function calling; `requires.
+  base_url` reaches Groq/Together/llama.cpp/LM Studio/ollama-`/v1`,
+  keyless when local), Ollama, mock — slots, not identity; per-slot
+  sealed credentials; routing = floors clamp → rules → default,
+  resolved host-side
 - Spend authority: `tokens_per_day` as a hard ceiling via atomic
   reservations taken before every model call
 - Governed run loop: budget → route → hydrate memory (semantic index +

@@ -408,6 +408,7 @@ impl Provider for MockToolProvider {
 pub fn bind(
     provider_name: &str,
     credential: Option<Zeroizing<String>>,
+    base_url: Option<String>,
 ) -> Result<Box<dyn Provider>, crate::Error> {
     match provider_name {
         "anthropic" => {
@@ -423,11 +424,297 @@ pub fn bind(
             };
             Ok(Box::new(provider))
         }
+        "openai" | "xai" => {
+            let label: &'static str = if provider_name == "xai" { "xai" } else { "openai" };
+            let provider = match credential {
+                Some(secret) => OpenAiCompatProvider::new(secret, base_url, label),
+                None => match OpenAiCompatProvider::from_env(label, base_url.clone()) {
+                    Some(p) => p,
+                    // Local/self-hosted compatible endpoints (llama.cpp,
+                    // LM Studio, ollama /v1) ignore auth — a custom
+                    // base_url without a key gets a placeholder bearer
+                    // instead of a refusal. Hosted APIs still require one.
+                    None if base_url.is_some() => OpenAiCompatProvider::new(
+                        Zeroizing::new("local".into()),
+                        base_url,
+                        label,
+                    ),
+                    None => {
+                        return Err(crate::Error::Provider(format!(
+                            "{label} slot has no sealed credential and no {} in the environment",
+                            if label == "xai" { "XAI_API_KEY" } else { "OPENAI_API_KEY" }
+                        )))
+                    }
+                },
+            };
+            Ok(Box::new(provider))
+        }
         "ollama" => Ok(Box::new(OllamaProvider::default())),
         "mock" => Ok(Box::new(MockProvider)),
         "mock-tool" => Ok(Box::new(MockToolProvider)),
         other => Err(crate::Error::Provider(format!(
-            "unknown provider '{other}' (host binds: anthropic, ollama, mock, mock-tool)"
+            "unknown provider '{other}' (host binds: anthropic, openai, xai, ollama, mock, mock-tool)"
         ))),
+    }
+}
+
+/// OpenAI-compatible chat completions — ONE implementation for the whole
+/// dialect: OpenAI itself, xAI (Grok), Groq, Together, Mistral, DeepSeek,
+/// and every local server speaking it (llama.cpp, LM Studio, vLLM,
+/// Ollama's /v1). Provider names `openai` and `xai` pick sensible
+/// defaults; a slot's `requires.base_url` points anywhere compatible.
+///
+/// Tool use maps our connectors onto their function-calling format, with
+/// the same budget discipline as the Anthropic loop: input is estimated
+/// and counted BEFORE every call, output capped by what remains.
+pub struct OpenAiCompatProvider {
+    key: Zeroizing<String>,
+    base_url: String,
+    /// "openai" prefers max_completion_tokens (o-series reject
+    /// max_tokens); the rest of the dialect still speaks max_tokens.
+    strict_openai: bool,
+    label: &'static str,
+}
+
+impl OpenAiCompatProvider {
+    pub fn new(key: Zeroizing<String>, base_url: Option<String>, label: &'static str) -> Self {
+        let (default_base, strict) = match label {
+            "xai" => ("https://api.x.ai/v1", false),
+            _ => ("https://api.openai.com/v1", true),
+        };
+        let base_url = base_url.unwrap_or_else(|| default_base.to_string());
+        Self {
+            key,
+            strict_openai: label == "openai" && base_url.starts_with("https://api.openai.com"),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            label,
+        }
+    }
+
+    pub fn from_env(label: &'static str, base_url: Option<String>) -> Option<Self> {
+        let var = match label {
+            "xai" => "XAI_API_KEY",
+            _ => "OPENAI_API_KEY",
+        };
+        std::env::var(var)
+            .ok()
+            .map(|k| Self::new(Zeroizing::new(k), base_url, label))
+    }
+
+    fn request(&self, payload: &serde_json::Value) -> Result<serde_json::Value, crate::Error> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(180))
+            .build()
+            .map_err(|e| crate::Error::Provider(e.to_string()))?;
+        let resp = client
+            .post(format!("{}/chat/completions", self.base_url))
+            .bearer_auth(self.key.as_str())
+            .json(payload)
+            .send()
+            .map_err(|e| crate::Error::Provider(format!("{}: {e}", self.label)))?;
+        let status = resp.status();
+        let body: serde_json::Value = resp
+            .json()
+            .map_err(|e| crate::Error::Provider(format!("{}: body: {e}", self.label)))?;
+        if !status.is_success() {
+            return Err(crate::Error::Provider(format!(
+                "{} refused ({status}): {}",
+                self.label,
+                body["error"]["message"].as_str().unwrap_or("unknown")
+            )));
+        }
+        Ok(body)
+    }
+
+    fn payload_base(&self, model: &str, max_out: u64) -> serde_json::Value {
+        let mut p = json!({"model": model});
+        let capped = max_out.clamp(1, 16000);
+        if self.strict_openai {
+            p["max_completion_tokens"] = json!(capped);
+        } else {
+            p["max_tokens"] = json!(capped);
+        }
+        p
+    }
+}
+
+fn openai_usage(body: &serde_json::Value) -> (u64, u64) {
+    (
+        body["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+        body["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+    )
+}
+
+fn openai_outcome(finish: &str) -> String {
+    match finish {
+        "stop" => "ok".into(),
+        other => other.into(),
+    }
+}
+
+impl Provider for OpenAiCompatProvider {
+    fn complete(
+        &self,
+        model: &str,
+        system: &str,
+        prompt: &str,
+        max_tokens: u64,
+    ) -> Result<Completion, crate::Error> {
+        let mut payload = self.payload_base(model, max_tokens);
+        payload["messages"] = json!([
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ]);
+        let body = self.request(&payload)?;
+        let (input_tokens, output_tokens) = openai_usage(&body);
+        let choice = &body["choices"][0];
+        Ok(Completion {
+            text: choice["message"]["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+            model: body["model"].as_str().unwrap_or(model).to_string(),
+            outcome: openai_outcome(choice["finish_reason"].as_str().unwrap_or("unknown")),
+            input_tokens,
+            output_tokens,
+        })
+    }
+
+    fn complete_with_tools(
+        &self,
+        model: &str,
+        system: &str,
+        prompt: &str,
+        tools: &[crate::connector::ToolDef],
+        dispatch: ToolDispatch,
+        budget_tokens: u64,
+    ) -> Result<Completion, crate::Error> {
+        const MAX_ITERATIONS: usize = 8;
+        let tool_defs: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.input_schema,
+                    },
+                })
+            })
+            .collect();
+        let base_estimate = estimate_tokens(system) + estimate_tokens(prompt);
+        let mut messages = vec![
+            json!({"role": "system", "content": system}),
+            json!({"role": "user", "content": prompt}),
+        ];
+        let (mut in_total, mut out_total) = (0u64, 0u64);
+        let mut served_model = model.to_string();
+
+        for _ in 0..MAX_ITERATIONS {
+            let spent = in_total + out_total;
+            let next_input = base_estimate
+                + estimate_tokens(&serde_json::to_string(&messages).unwrap_or_default());
+            let remaining = budget_tokens
+                .saturating_sub(spent)
+                .saturating_sub(next_input);
+            if remaining == 0 {
+                return Ok(Completion {
+                    text: String::new(),
+                    model: served_model,
+                    outcome: "budget-exhausted".into(),
+                    input_tokens: in_total,
+                    output_tokens: out_total,
+                });
+            }
+            let mut payload = self.payload_base(model, remaining);
+            payload["messages"] = json!(messages);
+            if !tool_defs.is_empty() {
+                payload["tools"] = json!(tool_defs);
+            }
+            let body = self.request(&payload)?;
+            let (i, o) = openai_usage(&body);
+            in_total += i;
+            out_total += o;
+            if let Some(m) = body["model"].as_str() {
+                served_model = m.to_string();
+            }
+            let choice = &body["choices"][0];
+            let finish = choice["finish_reason"].as_str().unwrap_or("unknown");
+            let message = &choice["message"];
+            let tool_calls = message["tool_calls"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+
+            if finish != "tool_calls" || tool_calls.is_empty() {
+                return Ok(Completion {
+                    text: message["content"].as_str().unwrap_or("").to_string(),
+                    model: served_model,
+                    outcome: openai_outcome(finish),
+                    input_tokens: in_total,
+                    output_tokens: out_total,
+                });
+            }
+            // Echo the assistant turn, then answer every call — failures
+            // return as tool results so the model can adapt.
+            messages.push(message.clone());
+            for call in &tool_calls {
+                let id = call["id"].as_str().unwrap_or_default();
+                let name = call["function"]["name"].as_str().unwrap_or_default();
+                let args: serde_json::Value =
+                    serde_json::from_str(call["function"]["arguments"].as_str().unwrap_or("{}"))
+                        .unwrap_or_else(|_| json!({}));
+                let content = match dispatch(name, &args) {
+                    Ok(r) => r,
+                    Err(e) => format!("TOOL ERROR: {e}"),
+                };
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": content,
+                }));
+            }
+        }
+        Ok(Completion {
+            text: String::new(),
+            model: served_model,
+            outcome: "max-iterations".into(),
+            input_tokens: in_total,
+            output_tokens: out_total,
+        })
+    }
+}
+
+#[cfg(test)]
+mod openai_tests {
+    use super::*;
+
+    #[test]
+    fn strict_openai_uses_max_completion_tokens() {
+        let p = OpenAiCompatProvider::new(Zeroizing::new("k".into()), None, "openai");
+        let body = p.payload_base("gpt-5", 500);
+        assert!(body.get("max_completion_tokens").is_some());
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn xai_and_custom_endpoints_use_max_tokens() {
+        let x = OpenAiCompatProvider::new(Zeroizing::new("k".into()), None, "xai");
+        assert!(x.payload_base("grok-4", 500).get("max_tokens").is_some());
+        let local = OpenAiCompatProvider::new(
+            Zeroizing::new("k".into()),
+            Some("http://localhost:11434/v1".into()),
+            "openai",
+        );
+        assert!(local.payload_base("qwen", 500).get("max_tokens").is_some());
+    }
+
+    #[test]
+    fn usage_and_outcome_parse() {
+        let body = serde_json::json!({"usage": {"prompt_tokens": 12, "completion_tokens": 34}});
+        assert_eq!(openai_usage(&body), (12, 34));
+        assert_eq!(openai_outcome("stop"), "ok");
+        assert_eq!(openai_outcome("length"), "length");
     }
 }

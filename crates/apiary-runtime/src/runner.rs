@@ -121,7 +121,12 @@ pub fn run_task_observed(
         Some(blob) => Some(custody.open(agent, blob)?),
         None => None,
     };
-    let provider = bind(&slot.provider, credential)?;
+    let base_url = slot
+        .requires
+        .get("base_url")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let provider = bind(&slot.provider, credential, base_url)?;
 
     emit(RunEvent::Started {
         slot: slot_name.clone(),
