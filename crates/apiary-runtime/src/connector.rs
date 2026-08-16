@@ -83,6 +83,25 @@ pub fn bind_connectors(
             }
         }
     }
+    // Presence-derived tools: a channel the agent LIVES on is also a place
+    // it may speak first. Same sealed token, same allowlist — declaring
+    // presence was the ratified act, so no separate grant exists to forget.
+    if let Some(tg) = manifest.presence.channel("telegram") {
+        if let Some(cred) = &tg.credential {
+            let speaker = crate::speak::speak_slot(manifest).and_then(|slot| {
+                let credential = slot
+                    .credential
+                    .as_ref()
+                    .and_then(|b| custody.open(agent, b).ok());
+                crate::speak::bind_speaker(manifest, credential)
+            });
+            out.push(Box::new(crate::telegram::TelegramSend {
+                credential: cred.clone(),
+                allowed_chats: tg.list_config("allowed_chats"),
+                speaker,
+            }));
+        }
+    }
     Ok(out)
 }
 

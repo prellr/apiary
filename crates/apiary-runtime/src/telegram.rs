@@ -248,71 +248,183 @@ impl crate::presence::ChannelAdapter for TelegramAdapter {
     ) -> Result<String, crate::Error> {
         let chat_id = mention.channel.parse::<i64>().unwrap_or_default();
         let reply_to = mention.reply_ref.parse::<i64>().unwrap_or_default();
-        // Voice reply: sendVoice (OGG/Opus) with the text as caption, so
-        // the words are still there to read and search. Caption cap is
-        // 1024; longer text falls back to a plain message.
-        if let Some(crate::presence::Attachment::Audio {
-            base64: b64,
-            duration_secs,
-            ..
-        }) = &reply.audio
-        {
-            if reply.text.chars().count() <= 1024 {
-                use base64::Engine;
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(b64)
-                    .map_err(|e| crate::Error::Provider(format!("voice reply audio: {e}")))?;
-                let mut form = reqwest::blocking::multipart::Form::new()
-                    .text("chat_id", chat_id.to_string())
-                    .text("reply_to_message_id", reply_to.to_string())
-                    .text("caption", reply.text.clone())
-                    .part(
-                        "voice",
-                        reqwest::blocking::multipart::Part::bytes(bytes)
-                            .file_name("reply.ogg")
-                            .mime_str("audio/ogg")
-                            .map_err(|e| crate::Error::Provider(e.to_string()))?,
-                    );
-                if let Some(d) = duration_secs {
-                    form = form.text("duration", (d.round() as i64).to_string());
-                }
-                let resp: Value = self
-                    .client
-                    .post(format!(
-                        "https://api.telegram.org/bot{}/sendVoice",
-                        self.token
-                    ))
-                    .multipart(form)
-                    .send()
-                    .and_then(|r| r.json())
-                    .map_err(|e| crate::Error::Provider(format!("telegram sendVoice: {e}")))?;
-                if resp["ok"].as_bool() == Some(true) {
-                    return Ok(resp["result"]["message_id"]
-                        .as_i64()
-                        .unwrap_or_default()
-                        .to_string());
-                }
-                // Voice refused (bad codec, size…): the text still goes.
+        send_reply(&self.client, &self.token, chat_id, Some(reply_to), reply)
+    }
+}
+
+/// Deliver a Reply to a chat: voice (sendVoice, text as caption) when
+/// audio is present and the text fits a caption, else sendMessage. A
+/// refused voice upload (codec, size) still delivers the text. Shared by
+/// the presence adapter and the `telegram-send` connector.
+pub(crate) fn send_reply(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    chat_id: i64,
+    reply_to: Option<i64>,
+    reply: &crate::presence::Reply,
+) -> Result<String, crate::Error> {
+    if let Some(crate::presence::Attachment::Audio {
+        base64: b64,
+        duration_secs,
+        ..
+    }) = &reply.audio
+    {
+        if reply.text.chars().count() <= 1024 {
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| crate::Error::Provider(format!("voice reply audio: {e}")))?;
+            let mut form = reqwest::blocking::multipart::Form::new()
+                .text("chat_id", chat_id.to_string())
+                .text("caption", reply.text.clone())
+                .part(
+                    "voice",
+                    reqwest::blocking::multipart::Part::bytes(bytes)
+                        .file_name("reply.ogg")
+                        .mime_str("audio/ogg")
+                        .map_err(|e| crate::Error::Provider(e.to_string()))?,
+                );
+            if let Some(r) = reply_to {
+                form = form.text("reply_to_message_id", r.to_string());
+            }
+            if let Some(d) = duration_secs {
+                form = form.text("duration", (d.round() as i64).to_string());
+            }
+            let resp: Value = client
+                .post(format!("https://api.telegram.org/bot{token}/sendVoice"))
+                .multipart(form)
+                .send()
+                .and_then(|r| r.json())
+                .map_err(|e| crate::Error::Provider(format!("telegram sendVoice: {e}")))?;
+            if resp["ok"].as_bool() == Some(true) {
+                return Ok(resp["result"]["message_id"]
+                    .as_i64()
+                    .unwrap_or_default()
+                    .to_string());
             }
         }
-        let resp = self.call(
-            "sendMessage",
-            json!({
-                "chat_id": chat_id,
-                "text": reply.text,
-                "reply_to_message_id": reply_to,
+    }
+    let mut body = json!({ "chat_id": chat_id, "text": reply.text });
+    if let Some(r) = reply_to {
+        body["reply_to_message_id"] = json!(r);
+    }
+    let resp: Value = client
+        .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
+        .json(&body)
+        .send()
+        .and_then(|r| r.json())
+        .map_err(|e| crate::Error::Provider(format!("telegram sendMessage: {e}")))?;
+    if resp["ok"].as_bool() != Some(true) {
+        return Err(crate::Error::Provider(format!(
+            "telegram sendMessage refused: {}",
+            resp["description"].as_str().unwrap_or("unknown")
+        )));
+    }
+    Ok(resp["result"]["message_id"]
+        .as_i64()
+        .unwrap_or_default()
+        .to_string())
+}
+
+/// Outbound Telegram as a governed TOOL — bound automatically for any
+/// agent with Telegram presence (same sealed token, same `allowed_chats`
+/// gate as inbound; declaring presence is the ratified act). The model
+/// asks; the host checks the allowlist, JIT-opens the token, optionally
+/// voices the text through the `speak` slot, and sends. Every call is a
+/// `tool.call` log entry carrying the destination.
+pub struct TelegramSend {
+    pub credential: apiary_core::manifest::EncryptedBlob,
+    pub allowed_chats: Vec<String>,
+    pub speaker: Option<Box<dyn crate::speak::Speaker>>,
+}
+
+impl crate::connector::Connector for TelegramSend {
+    fn def(&self) -> crate::connector::ToolDef {
+        crate::connector::ToolDef {
+            name: "telegram_send".into(),
+            description: format!(
+                "Send a Telegram message from this agent's bot to a chat it is allowed to \
+                 address (allowed chats: {}). Use for proactive messages, not for replying \
+                 to a mention (replies happen automatically). Set as_voice=true to send it \
+                 as a spoken voice note (the text is included as the caption){}.",
+                self.allowed_chats.join(", "),
+                if self.speaker.is_some() {
+                    ""
+                } else {
+                    " — no speak slot on this host, so as_voice falls back to text"
+                }
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "chat_id": {"type": "string", "description": "Telegram chat id (numeric string)"},
+                    "text": {"type": "string", "description": "Message text (max 4096 chars; 1024 if voice)"},
+                    "as_voice": {"type": "boolean", "description": "Also synthesize and send as a voice note", "default": false}
+                },
+                "required": ["chat_id", "text"]
             }),
-        )?;
-        if resp["ok"].as_bool() != Some(true) {
+        }
+    }
+
+    fn execute(
+        &self,
+        custody: &apiary_core::custody::Custody,
+        agent: &apiary_core::custody::AgentHandle,
+        args: &Value,
+    ) -> Result<String, crate::Error> {
+        let chat = args["chat_id"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| args["chat_id"].as_i64().map(|i| i.to_string()))
+            .ok_or_else(|| crate::Error::Provider("telegram_send: chat_id required".into()))?;
+        if !self.allowed_chats.iter().any(|c| c == "*" || c == &chat) {
             return Err(crate::Error::Provider(format!(
-                "telegram sendMessage refused: {}",
-                resp["description"].as_str().unwrap_or("unknown")
+                "telegram_send: chat {chat} is not in the manifest's allowed_chats — refused"
             )));
         }
-        Ok(resp["result"]["message_id"]
-            .as_i64()
-            .unwrap_or_default()
-            .to_string())
+        let chat_id: i64 = chat
+            .parse()
+            .map_err(|_| crate::Error::Provider("telegram_send: chat_id must be numeric".into()))?;
+        let text = args["text"].as_str().unwrap_or_default().trim().to_string();
+        if text.is_empty() {
+            return Err(crate::Error::Provider(
+                "telegram_send: text required".into(),
+            ));
+        }
+        let text: String = text.chars().take(4096).collect();
+        let want_voice = args["as_voice"].as_bool().unwrap_or(false);
+        let audio = match (&self.speaker, want_voice) {
+            (Some(sp), true) if text.chars().count() <= crate::speak::MAX_SPEAK_CHARS => sp
+                .speak(&text)
+                .and_then(|s| crate::speak::to_ogg_opus(&s))
+                .ok()
+                .map(|s| {
+                    use base64::Engine;
+                    crate::presence::Attachment::Audio {
+                        media_type: s.media_type,
+                        base64: base64::engine::general_purpose::STANDARD.encode(&s.bytes),
+                        duration_secs: s.duration_secs,
+                    }
+                }),
+            _ => None,
+        };
+        let token = custody.open(agent, &self.credential)?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| crate::Error::Provider(format!("telegram client: {e}")))?;
+        let voiced = audio.is_some();
+        let id = send_reply(
+            &client,
+            token.as_str(),
+            chat_id,
+            None,
+            &crate::presence::Reply { text, audio },
+        )?;
+        Ok(format!(
+            "sent to chat {chat} as {} (message_id {id})",
+            if voiced { "voice+caption" } else { "text" }
+        ))
     }
 }
 
@@ -364,6 +476,32 @@ mod tests {
             "chat": {"type": "group"}, "voice": {"file_id": "v"},
             "caption": "@scout_bot listen to this"
         })));
+    }
+
+    #[test]
+    fn send_tool_refuses_chats_outside_the_allowlist_before_touching_the_key() {
+        use crate::connector::Connector;
+        let tool = TelegramSend {
+            credential: apiary_core::manifest::EncryptedBlob {
+                nip44: "not-a-real-blob".into(),
+            },
+            allowed_chats: vec!["100".into()],
+            speaker: None,
+        };
+        let mut custody = apiary_core::custody::Custody::new();
+        let handle = custody.admit(nostr::prelude::Keys::generate());
+        let err = tool
+            .execute(&custody, &handle, &json!({"chat_id": "999", "text": "hi"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("allowed_chats"), "{err}");
+        assert!(tool.def().name == "telegram_send");
+        // Missing text is refused before the key is opened, too.
+        let err = tool
+            .execute(&custody, &handle, &json!({"chat_id": "100", "text": ""}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("text required"), "{err}");
     }
 
     #[test]
