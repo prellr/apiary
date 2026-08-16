@@ -249,6 +249,16 @@ pub fn import_with_options(
         }
         let mut kept = Vec::new();
         for line in index_raw.lines().filter(|l| !l.trim().is_empty()) {
+            // Vault rows derive from HOST-LOCAL files (memory.vaults) —
+            // they neither travel nor count as tampering; the destination
+            // re-indexes its own copy of the vaults.
+            if serde_json::from_str::<Value>(line)
+                .ok()
+                .and_then(|r| r.get("event_id").and_then(|v| v.as_str()).map(String::from))
+                .is_some_and(|id| id.starts_with("vault:"))
+            {
+                continue;
+            }
             let ok = serde_json::from_str::<Value>(line).ok().is_some_and(|row| {
                 row.get("event_id")
                     .and_then(Value::as_str)

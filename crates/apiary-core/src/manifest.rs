@@ -140,6 +140,23 @@ pub struct Memory {
     /// self NIP-44-wrapped, local never).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub log_relays: Vec<String>,
+    /// Markdown knowledge folders (Obsidian vaults, KB repos, plain note
+    /// dirs) chunked into the semantic index — ambient recall alongside
+    /// the agent's own log memories. Host-local paths: vault contents are
+    /// NOT exported or published; a destination host re-indexes its own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vaults: Vec<VaultRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultRef {
+    /// Short name used in index rows and retrieval provenance.
+    pub name: String,
+    pub path: String,
+    /// "markdown" (default) or "obsidian" (frontmatter/tags/wikilinks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 fn default_index() -> String {

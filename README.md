@@ -42,8 +42,17 @@ model runs). What exists today:
   and the operator's task (proven live: a channel mention asking an agent
   to use its connectors gets a polite refusal)
 - Connectors, default-deny: `nostr-publish` (relay-allowlisted), **`mcp`**
-  (see below), each grant a ratified manifest amendment with credentials
-  sealed to that agent alone
+  (see below), and **`obsidian` / `markdown-vault`** — named markdown
+  knowledge folders (Obsidian vaults, checked-out KB repos, plain note
+  dirs) as search/read tools, write only under an explicit cap, every
+  path jailed to its vault root. Each grant is a ratified manifest
+  amendment with credentials sealed to that agent alone
+- Vaults double as **ambient memory**: `memory.vaults` entries are
+  chunked (heading-aware) and embedded into the semantic index, so
+  retrieval surfaces relevant notes into the working set beside the
+  agent's own log memories — as DATA, per the provenance rule. Vault
+  content is host-local: it neither exports nor publishes; a destination
+  host re-indexes its own copy
 - MCP client: revision 2026-07-28 (stateless, per-request `_meta`,
   `server/discover` era probe) with automatic fallback to
   `initialize`-era servers; stdio (scrubbed-env subprocess) and

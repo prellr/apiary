@@ -284,6 +284,7 @@ pub(crate) fn build_working_set(
     if let Some(embedder) = crate::index::bind_embedder(manifest) {
         let idx = crate::index::SemanticIndex::open(agent_dir);
         idx.update(log, embedder.as_ref())?;
+        idx.update_vaults(&manifest.memory.vaults, embedder.as_ref())?;
         for hit in idx.query(embedder.as_ref(), task, 4, &tail_ids)? {
             relevant_lines.push(format!("- {}", hit.text));
         }

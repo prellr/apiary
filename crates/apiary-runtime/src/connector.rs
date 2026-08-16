@@ -32,7 +32,13 @@ pub trait Connector {
 
 /// The connector kinds this host can bind — the one list (README:
 /// "one list per concept"); bind_connectors and the API both read it.
-pub const BOUND_KINDS: &[&str] = &["nostr-publish", "mock-echo", "mcp"];
+pub const BOUND_KINDS: &[&str] = &[
+    "nostr-publish",
+    "mock-echo",
+    "mcp",
+    "obsidian",
+    "markdown-vault",
+];
 
 /// Build the agent's connector set from its manifest. Unknown kinds are an
 /// error, not a skip — a manifest declaring a capability the host can't
@@ -46,6 +52,8 @@ pub fn bind_connectors(
     for entry in &manifest.connectors {
         match entry.kind.as_str() {
             "mcp" => out.extend(bind_mcp(entry, custody, agent)?),
+            "obsidian" => out.extend(bind_vault(entry, true)?),
+            "markdown-vault" => out.extend(bind_vault(entry, false)?),
             "nostr-publish" => {
                 let relays: Vec<String> = entry
                     .caps
@@ -390,4 +398,313 @@ fn refresh_access_token(oauth: &Value) -> Result<String, crate::Error> {
         .and_then(Value::as_str)
         .map(String::from)
         .ok_or_else(|| crate::Error::Provider(format!("oauth refresh refused: {v}")))
+}
+
+// ---------------------------------------------------------------- vaults
+
+/// Bind an `obsidian` / `markdown-vault` connector: named markdown
+/// folders (Obsidian vaults, checked-out KB repos, plain note dirs) as
+/// tools. Caps:
+///
+/// ```yaml
+/// - type: markdown-vault          # or obsidian (adds tags/frontmatter/wikilinks)
+///   caps:
+///     vaults:
+///       - {name: kb, path: /Users/me/repos/winery-kb/kb}
+///       - {name: notes, path: ~/notes}
+///     write: false                # write/append tools exist ONLY when true
+/// ```
+///
+/// Reads are path-jailed to each vault root (traversal and symlink
+/// escapes refused). Note content returned to the model is DATA under the
+/// provenance rule, like every tool result.
+fn bind_vault(
+    entry: &apiary_core::manifest::Connector,
+    obsidian: bool,
+) -> Result<Vec<Box<dyn Connector>>, crate::Error> {
+    let vaults: Vec<(String, std::path::PathBuf)> = entry
+        .caps
+        .get("vaults")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| {
+                    Some((
+                        v.get("name")?.as_str()?.to_string(),
+                        v.get("path")?.as_str()?.to_string(),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, path)| crate::vault::open_root(&path).map(|root| (name, root)))
+        .collect::<Result<_, _>>()?;
+    if vaults.is_empty() {
+        return Err(crate::Error::Provider(
+            "vault connector requires caps.vaults: [{name, path}, …]".into(),
+        ));
+    }
+    let write = entry
+        .caps
+        .get("write")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let kind = if obsidian { "obsidian" } else { "vault" };
+    let vault_names: Vec<String> = vaults.iter().map(|(n, _)| n.clone()).collect();
+    let shared = std::sync::Arc::new(vaults);
+    let mut out: Vec<Box<dyn Connector>> = vec![
+        Box::new(VaultSearch {
+            kind,
+            obsidian,
+            vaults: shared.clone(),
+            names: vault_names.clone(),
+        }),
+        Box::new(VaultRead {
+            kind,
+            obsidian,
+            vaults: shared.clone(),
+            names: vault_names.clone(),
+        }),
+    ];
+    if write {
+        out.push(Box::new(VaultWrite {
+            kind,
+            vaults: shared,
+            names: vault_names,
+        }));
+    }
+    Ok(out)
+}
+
+type Vaults = std::sync::Arc<Vec<(String, std::path::PathBuf)>>;
+
+fn vault_root<'a>(
+    vaults: &'a Vaults,
+    name: Option<&str>,
+) -> Result<&'a (String, std::path::PathBuf), crate::Error> {
+    match name {
+        None if vaults.len() == 1 => Ok(&vaults[0]),
+        None => Err(crate::Error::Provider(format!(
+            "several vaults are granted — name one: {}",
+            vaults
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+        Some(n) => vaults.iter().find(|(name, _)| name == n).ok_or_else(|| {
+            crate::Error::Provider(format!(
+                "no vault named '{n}' (granted: {})",
+                vaults
+                    .iter()
+                    .map(|(n, _)| n.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        }),
+    }
+}
+
+struct VaultSearch {
+    kind: &'static str,
+    obsidian: bool,
+    vaults: Vaults,
+    names: Vec<String>,
+}
+
+impl Connector for VaultSearch {
+    fn def(&self) -> ToolDef {
+        ToolDef {
+            name: format!("{}_search", self.kind),
+            description: format!(
+                "Search the granted markdown knowledge vaults ({}) by title{}, and content. \
+                 Returns matching notes with paths for {}_read.",
+                self.names.join(", "),
+                if self.obsidian { ", tags" } else { "" },
+                self.kind
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "vault": {"type": "string", "description": "vault name (optional when only one is granted)"},
+                },
+                "required": ["query"],
+            }),
+        }
+    }
+
+    fn execute(
+        &self,
+        _custody: &Custody,
+        _agent: &AgentHandle,
+        args: &Value,
+    ) -> Result<String, crate::Error> {
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| crate::Error::Provider("query is required".into()))?;
+        let named = args.get("vault").and_then(|v| v.as_str());
+        let targets: Vec<&(String, std::path::PathBuf)> = match named {
+            Some(_) => vec![vault_root(&self.vaults, named)?],
+            None => self.vaults.iter().collect(),
+        };
+        let mut out = Vec::new();
+        for (name, root) in targets {
+            for hit in crate::vault::search(root, query, self.obsidian, 12)? {
+                out.push(json!({
+                    "vault": name,
+                    "path": hit.rel,
+                    "title": hit.title,
+                    "matched": hit.matched,
+                    "snippet": hit.snippet,
+                }));
+            }
+        }
+        if out.is_empty() {
+            return Ok(format!("no notes match '{query}'"));
+        }
+        Ok(serde_json::to_string(&out)?)
+    }
+}
+
+struct VaultRead {
+    kind: &'static str,
+    obsidian: bool,
+    vaults: Vaults,
+    names: Vec<String>,
+}
+
+impl Connector for VaultRead {
+    fn def(&self) -> ToolDef {
+        ToolDef {
+            name: format!("{}_read", self.kind),
+            description: format!(
+                "Read one note (by vault-relative path) from the granted vaults ({}).{}",
+                self.names.join(", "),
+                if self.obsidian {
+                    " Returns frontmatter tags and outgoing [[wikilinks]] alongside the body."
+                } else {
+                    ""
+                }
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "vault": {"type": "string", "description": "vault name (optional when only one is granted)"},
+                },
+                "required": ["path"],
+            }),
+        }
+    }
+
+    fn execute(
+        &self,
+        _custody: &Custody,
+        _agent: &AgentHandle,
+        args: &Value,
+    ) -> Result<String, crate::Error> {
+        let rel = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| crate::Error::Provider("path is required".into()))?;
+        let (name, root) = vault_root(&self.vaults, args.get("vault").and_then(|v| v.as_str()))?;
+        let content = crate::vault::read_note(root, rel)?;
+        if self.obsidian {
+            let t = crate::vault::tags(&content);
+            let links = crate::vault::wikilinks(&content);
+            let (_, body) = crate::vault::split_frontmatter(&content);
+            Ok(json!({
+                "vault": name,
+                "path": rel,
+                "tags": t,
+                "wikilinks": links,
+                "body": body,
+            })
+            .to_string())
+        } else {
+            Ok(json!({"vault": name, "path": rel, "body": content}).to_string())
+        }
+    }
+}
+
+struct VaultWrite {
+    kind: &'static str,
+    vaults: Vaults,
+    names: Vec<String>,
+}
+
+impl Connector for VaultWrite {
+    fn def(&self) -> ToolDef {
+        ToolDef {
+            name: format!("{}_write", self.kind),
+            description: format!(
+                "Write or append a markdown note in the granted vaults ({}). \
+                 The manifest's write cap authorized this — use it sparingly \
+                 and keep humans' notes intact (prefer append).",
+                self.names.join(", ")
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "vault-relative path ending in .md"},
+                    "content": {"type": "string"},
+                    "append": {"type": "boolean", "description": "append instead of overwrite (default true)"},
+                    "vault": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            }),
+        }
+    }
+
+    fn execute(
+        &self,
+        _custody: &Custody,
+        _agent: &AgentHandle,
+        args: &Value,
+    ) -> Result<String, crate::Error> {
+        let rel = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| crate::Error::Provider("path is required".into()))?;
+        if !rel.ends_with(".md") || rel.contains("..") {
+            return Err(crate::Error::Provider(
+                "path must be a vault-relative .md file without traversal".into(),
+            ));
+        }
+        let content = args
+            .get("content")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| crate::Error::Provider("content is required".into()))?;
+        let append = args.get("append").and_then(|v| v.as_bool()).unwrap_or(true);
+        let (name, root) = vault_root(&self.vaults, args.get("vault").and_then(|v| v.as_str()))?;
+        // New files can't canonicalize; jail the PARENT instead.
+        let target = root.join(rel);
+        let parent = target
+            .parent()
+            .ok_or_else(|| crate::Error::Provider("bad path".into()))?;
+        std::fs::create_dir_all(parent).map_err(|e| crate::Error::Provider(e.to_string()))?;
+        let canon_parent = parent
+            .canonicalize()
+            .map_err(|e| crate::Error::Provider(e.to_string()))?;
+        if !canon_parent.starts_with(root) {
+            return Err(crate::Error::Provider(format!(
+                "'{rel}' escapes the vault — refused"
+            )));
+        }
+        use std::io::Write;
+        if append && target.exists() {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&target)
+                .map_err(|e| crate::Error::Provider(e.to_string()))?;
+            writeln!(f, "\n{content}").map_err(|e| crate::Error::Provider(e.to_string()))?;
+        } else {
+            std::fs::write(&target, content).map_err(|e| crate::Error::Provider(e.to_string()))?;
+        }
+        let _ = self.kind;
+        Ok(json!({"vault": name, "path": rel, "written": true, "appended": append && target.exists()}).to_string())
+    }
 }

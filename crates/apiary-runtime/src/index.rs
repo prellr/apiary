@@ -280,3 +280,80 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+impl SemanticIndex {
+    /// Embed the manifest's vaults into the index: heading-aware chunks,
+    /// staleness-tracked by a content fingerprint in the row id
+    /// (`vault:<name>/<rel>#<n>:<fp>`). Changed or deleted notes get their
+    /// stale rows dropped; the whole vault side rebuilds cheaply because
+    /// derived state is disposable by design.
+    pub fn update_vaults(
+        &self,
+        vaults: &[apiary_core::manifest::VaultRef],
+        embedder: &dyn Embedder,
+    ) -> Result<usize, crate::Error> {
+        if vaults.is_empty() {
+            return Ok(0);
+        }
+        let mut rows = self.rows()?;
+        if rows.iter().any(|r| r.embedder != embedder.id()) {
+            rows.clear();
+            let _ = std::fs::remove_file(&self.path);
+        }
+        // Desired vault rows.
+        let mut desired: Vec<(String, String)> = Vec::new(); // (id, text)
+        for v in vaults {
+            let root = match crate::vault::open_root(&v.path) {
+                Ok(r) => r,
+                Err(_) => continue, // unreachable vault: keep the index's old view? No — drop below.
+            };
+            for note in crate::vault::walk(&root)? {
+                let Ok(content) = crate::vault::read_note(&root, &note.rel) else {
+                    continue;
+                };
+                let fp = crate::vault::fingerprint(&content);
+                for (i, chunk) in crate::vault::chunks(&content, 1200).into_iter().enumerate() {
+                    desired.push((
+                        format!("vault:{}/{}#{i}:{fp}", v.name, note.rel),
+                        format!("[{} note {}] {}", v.name, note.rel, chunk),
+                    ));
+                }
+            }
+        }
+        let desired_ids: BTreeSet<&String> = desired.iter().map(|(id, _)| id).collect();
+        // Drop stale vault rows (changed fingerprint, deleted note, or a
+        // vault removed from the manifest).
+        let before = rows.len();
+        rows.retain(|r| !r.event_id.starts_with("vault:") || desired_ids.contains(&r.event_id));
+        let dropped = before - rows.len();
+        let known: BTreeSet<String> = rows.iter().map(|r| r.event_id.clone()).collect();
+        let mut added = 0;
+        for (id, text) in desired {
+            if known.contains(&id) {
+                continue;
+            }
+            rows.push(IndexRow {
+                event_id: id,
+                embedder: embedder.id(),
+                vector: embedder.embed(&text)?,
+                text,
+            });
+            added += 1;
+        }
+        if dropped > 0 || added > 0 {
+            let mut out = String::new();
+            for r in &rows {
+                out.push_str(&serde_json::to_string(r)?);
+                out.push('\n');
+            }
+            std::fs::write(&self.path, out)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+        Ok(added)
+    }
+}
