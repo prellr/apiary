@@ -743,22 +743,14 @@ async function renderBuzz(c) {
 // ------------------------------------------------------------ connectors
 
 async function renderConnectors(c) {
-  c.append(help('Two layers. The HOST LIBRARY holds named connector configurations (kind + caps, no secrets) — configure once, assign to any agent. A GRANT copies one into this agent’s manifest, sealing any credential to this agent’s key alone. Grants are constitutional: each one changes the manifest hash and needs re-ratification, and each travels with the agent — portability includes capabilities and their sealed credentials. A destination host only needs to bind the kind; a declared kind it cannot bind fails loudly at run start.'));
-  const libHint = el('div', 'row');
-  const libBtn = el('button', 'btn', 'OPEN HOST CONNECTOR LIBRARY');
-  libBtn.onclick = () => { hostView = true; render(); };
-  libHint.append(libBtn, el('span', 'meta', 'definitions are host-scoped, shared by all agents — this tab only grants and revokes for the selected agent'));
-  c.append(libHint);
-  c.append(help('The mcp kind speaks the Model Context Protocol (2026-07-28, with automatic fallback to initialize-era servers). stdio example caps: {"transport":"stdio","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/data"],"allowed_tools":["read_text_file","list_directory"]}. Remote example: {"transport":"http","url":"https://mcp.example.com/mcp","allowed_tools":["search"],"oauth_client_id":"…"} — grant via OAuth below, or paste a bearer token as the secret. allowed_tools is required: the server offers whatever it likes, the manifest decides what the agent may touch.'));
-
   const lib = await j('/api/connectors');
   if (!lib.ok) { c.append(el('div', 'ev err', 'error: ' + lib.error)); return; }
   const d = await j(api('/manifest'));
   if (!d.ok) { c.append(el('div', 'ev err', 'error: ' + d.error)); return; }
 
   // ---- this agent's grants
-  const gSec = section('This agent’s grants',
-    'What the manifest declares now. Revoking is an amendment too — until re-ratified the agent cannot run at all.');
+  const gSec = section('Grants',
+    'A grant copies a host-library entry into this agent’s manifest, sealing any secret to this agent alone. Every grant or revoke is an amendment — re-ratify in the Manifest tab afterward.');
   const grants = (d.manifest.connectors || []);
   if (!grants.length) gSec.append(kv('grants', 'none — the agent can think and speak, not act'));
   for (const g of grants) {
@@ -779,7 +771,7 @@ async function renderConnectors(c) {
     const o = el('option', null, `${e.name} (${e.kind})`);
     o.value = e.name; gSel.append(o);
   }
-  if (!(lib.library || []).length) gSel.append(el('option', null, 'library is empty — add below'));
+  if (!(lib.library || []).length) gSel.append(el('option', null, 'library is empty — open it above to add entries'));
   const gCred = el('input', 'grow'); gCred.type = 'password';
   gCred.placeholder = 'secret to seal to this agent (optional)';
   const gGo = el('button', 'btn solid', 'GRANT');
@@ -902,6 +894,20 @@ async function renderLibrary(c) {
     entries.push({ name: nName.value.trim(), kind: nKind.value, caps });
     await saveLib();
   };
+
+  const libRow = el('div', 'row');
+  const libBtn = el('button', 'btn', 'OPEN HOST CONNECTOR LIBRARY');
+  libBtn.onclick = () => { hostView = 'library'; render(); };
+  libRow.append(libBtn, el('span', 'meta', 'definitions live host-side, shared by all agents — caps examples are in the library’s reference'));
+  c.append(libRow);
+
+  const docs = el('details');
+  docs.append(el('summary', null, 'how connectors work'));
+  const docsBody = el('div');
+  docsBody.append(help('Two layers: the host library holds named configurations (kind + caps, never secrets); grants are per-agent and constitutional — they travel in the manifest, so portability includes capabilities and their sealed credentials. A destination host only needs to bind the kind; a declared kind it cannot bind fails loudly at run start.'));
+  docsBody.append(help('The mcp kind speaks the Model Context Protocol (2026-07-28, automatic fallback to initialize-era servers). For OAuth-protected remote servers, grant an entry carrying oauth_client_id and the browser consent runs at grant time; for token servers, paste the bearer token as the secret. caps.allowed_tools is always required — the server offers whatever it likes, the manifest decides.'));
+  docs.append(docsBody);
+  c.append(docs);
 }
 
 // ------------------------------------------------------------ credentials
