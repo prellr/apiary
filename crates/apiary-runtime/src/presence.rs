@@ -65,6 +65,53 @@ impl Attachment {
     }
 }
 
+/// What goes back. Text is ALWAYS present — voice is a rendering of the
+/// reply, never a replacement for the record (caption, message body, log).
+/// Adapters that cannot deliver audio send the text; nothing is lost.
+#[derive(Debug, Clone)]
+pub struct Reply {
+    pub text: String,
+    /// Synthesized speech of `text` (OGG/Opus preferred on the wire).
+    pub audio: Option<Attachment>,
+}
+
+impl Reply {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            audio: None,
+        }
+    }
+}
+
+/// How a channel answers: `text` | `voice` | `match` (voice when the
+/// mention carried audio, text otherwise — the default). Per-channel
+/// presence config key `reply_as`; `voice`/`match` need a `speak` slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyAs {
+    Text,
+    Voice,
+    Match,
+}
+
+impl ReplyAs {
+    pub fn parse(s: Option<&str>) -> Self {
+        match s.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("voice") => ReplyAs::Voice,
+            Some("text") => ReplyAs::Text,
+            _ => ReplyAs::Match,
+        }
+    }
+    /// Voice this reply? `heard_audio` = the mention carried audio.
+    pub fn wants_voice(self, heard_audio: bool) -> bool {
+        match self {
+            ReplyAs::Text => false,
+            ReplyAs::Voice => true,
+            ReplyAs::Match => heard_audio,
+        }
+    }
+}
+
 /// A platform message that names the agent, normalized.
 #[derive(Debug, Clone)]
 pub struct Mention {
@@ -88,7 +135,7 @@ pub trait ChannelAdapter {
     fn describe(&self) -> String;
     fn next_mention(&mut self, stop: &AtomicBool) -> Result<Option<Mention>, crate::Error>;
     /// Reply in-channel; returns a platform message id for the sink.
-    fn reply(&mut self, mention: &Mention, text: &str) -> Result<String, crate::Error>;
+    fn reply(&mut self, mention: &Mention, reply: &Reply) -> Result<String, crate::Error>;
 }
 
 /// Run one channel until `stop` flips or `on_tick` says stop (Ok(false)).
@@ -174,7 +221,23 @@ pub fn run_presence(
         let outcome = crate::runner::run_task(manifest, agent_dir, custody, handle, &task, &ctx);
         match outcome {
             Ok(out) if !out.completion.text.trim().is_empty() => {
-                let reply: String = out.completion.text.trim().chars().take(4000).collect();
+                let text: String = out.completion.text.trim().chars().take(4000).collect();
+                let heard_audio = mention
+                    .attachments
+                    .iter()
+                    .any(|a| matches!(a, Attachment::Audio { .. }));
+                let reply_as = ReplyAs::parse(
+                    manifest
+                        .presence
+                        .channel(kind)
+                        .and_then(|c| c.str_config("reply_as")),
+                );
+                let audio = if reply_as.wants_voice(heard_audio) {
+                    synthesize_reply(manifest, agent_dir, custody, handle, &text, &mut sink)
+                } else {
+                    None
+                };
+                let reply = Reply { text, audio };
                 match adapter.reply(&mention, &reply) {
                     Ok(id) => sink(format!("{kind}: replied {id}")),
                     Err(e) => sink(format!("{kind}: reply failed: {e}")),
@@ -184,6 +247,95 @@ pub fn run_presence(
             Err(e) => sink(format!(
                 "{kind}: run refused: {e} (mention logged, no reply)"
             )),
+        }
+    }
+}
+
+/// Voice a reply through the `speak` slot, logging the synthesis as its
+/// own entry. Any failure degrades to text (logged, sunk) — a voice hiccup
+/// must never cost the reply itself. Long replies stay text.
+fn synthesize_reply(
+    manifest: &Manifest,
+    agent_dir: &std::path::Path,
+    custody: &Custody,
+    handle: &AgentHandle,
+    text: &str,
+    sink: &mut dyn FnMut(String),
+) -> Option<Attachment> {
+    use apiary_core::log::{EntryBody, EpisodicLog, Tier};
+    if text.chars().count() > crate::speak::MAX_SPEAK_CHARS {
+        sink(format!(
+            "speak: reply is {} chars — over {}; sending text",
+            text.chars().count(),
+            crate::speak::MAX_SPEAK_CHARS
+        ));
+        return None;
+    }
+    let slot = crate::speak::speak_slot(manifest)?;
+    let credential = match slot.credential.as_ref() {
+        Some(blob) => match custody.open(handle, blob) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                sink(format!("speak: credential: {e}; sending text"));
+                return None;
+            }
+        },
+        None => None,
+    };
+    let Some(speaker) = crate::speak::bind_speaker(manifest, credential) else {
+        sink(format!(
+            "speak: provider '{}' has no binding on this host; sending text",
+            slot.provider
+        ));
+        return None;
+    };
+    let started = std::time::Instant::now();
+    let result = speaker
+        .speak(text)
+        .and_then(|s| crate::speak::to_ogg_opus(&s));
+    let log = EpisodicLog::open(agent_dir);
+    let (outcome, detail) = match &result {
+        Ok(s) => (
+            "ok".to_string(),
+            json!({
+                "chars": text.chars().count(), "bytes": s.bytes.len(),
+                "media_type": s.media_type, "duration_secs": s.duration_secs,
+                "ms": started.elapsed().as_millis() as u64,
+                "tokens_est": crate::speak::estimate_speak_tokens(text),
+            }),
+        ),
+        Err(e) => (
+            format!("error: {e}"),
+            json!({ "chars": text.chars().count() }),
+        ),
+    };
+    if let Err(e) = log.append(
+        custody,
+        handle,
+        Tier::Self_,
+        &EntryBody {
+            action: "speak".into(),
+            model: Some(speaker.id()),
+            cost: None,
+            harness: Some("native".into()),
+            outcome,
+            detail: Some(detail),
+        },
+    ) {
+        sink(format!("speak: log append failed: {e}"));
+    }
+    match result {
+        Ok(s) => {
+            use base64::Engine;
+            Some(Attachment::Audio {
+                media_type: s.media_type,
+                base64: base64::engine::general_purpose::STANDARD.encode(&s.bytes),
+                duration_secs: s.duration_secs,
+            })
+        }
+        Err(e) => {
+            sink(format!("speak: {e}; sending text"));
+            None
         }
     }
 }
@@ -214,4 +366,21 @@ pub fn attachment_framing(attachments: &[Attachment]) -> String {
         ));
     }
     note
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reply_as_defaults_to_match_and_parses_loosely() {
+        assert_eq!(ReplyAs::parse(None), ReplyAs::Match);
+        assert_eq!(ReplyAs::parse(Some(" VOICE ")), ReplyAs::Voice);
+        assert_eq!(ReplyAs::parse(Some("text")), ReplyAs::Text);
+        assert_eq!(ReplyAs::parse(Some("nonsense")), ReplyAs::Match);
+        assert!(ReplyAs::Match.wants_voice(true));
+        assert!(!ReplyAs::Match.wants_voice(false));
+        assert!(ReplyAs::Voice.wants_voice(false));
+        assert!(!ReplyAs::Text.wants_voice(true));
+    }
 }

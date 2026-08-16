@@ -575,8 +575,9 @@ impl crate::presence::ChannelAdapter for BuzzAdapter<'_> {
     fn reply(
         &mut self,
         mention: &crate::presence::Mention,
-        text: &str,
+        reply: &crate::presence::Reply,
     ) -> Result<String, crate::Error> {
+        let text = reply.text.as_str();
         // No p-tag (a p-tag is a trigger — two listening agents would
         // ping-pong forever) + causal floor (clients sort by created_at).
         let after = mention

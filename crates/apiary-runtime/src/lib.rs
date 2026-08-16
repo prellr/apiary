@@ -19,6 +19,7 @@ pub mod relay;
 pub mod routing;
 pub mod runner;
 pub mod slack;
+pub mod speak;
 pub mod spend;
 pub mod telegram;
 pub mod transcribe;

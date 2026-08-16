@@ -36,7 +36,10 @@ fn reference_plugin_round_trip() {
     assert_eq!(mention.channel, "mock-room");
     assert!(mention.text.contains("ping"));
     let id = adapter
-        .reply(&mention, "pong through the governed path")
+        .reply(
+            &mention,
+            &apiary_runtime::presence::Reply::text("pong through the governed path"),
+        )
         .unwrap();
     assert_eq!(id, "mock-reply-1");
     drop(adapter); // graceful shutdown path

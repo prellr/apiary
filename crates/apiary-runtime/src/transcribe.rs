@@ -356,7 +356,7 @@ impl AppleSpeech {
         })
     }
 
-    fn call(&self, req: &serde_json::Value) -> Result<serde_json::Value, crate::Error> {
+    pub(crate) fn call(&self, req: &serde_json::Value) -> Result<serde_json::Value, crate::Error> {
         use std::io::Write;
         let bin = self.binary()?;
         let mut child = Command::new(&bin)

@@ -313,8 +313,11 @@ impl crate::presence::ChannelAdapter for SlackAdapter {
     fn reply(
         &mut self,
         mention: &crate::presence::Mention,
-        text: &str,
+        reply: &crate::presence::Reply,
     ) -> Result<String, crate::Error> {
+        // Text always; voice replies on Slack need files.uploadV2's
+        // three-step upload — deferred, the text carries the reply.
+        let text = &reply.text;
         let resp: Value = self
             .http
             .post("https://slack.com/api/chat.postMessage")

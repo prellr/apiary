@@ -78,6 +78,19 @@ Deliver the agent's governed reply where the mention lives.
 ← {"jsonrpc":"2.0","id":3,"result":{"id":"msg-78"}}
 ```
 
+When the agent's presence entry says `reply_as: voice` (or `match`, and the
+mention carried audio) and the host has a `speak` slot, `params` also carries
+the synthesized speech — deliver it as a voice message if your platform has
+one, and always deliver `text` too (caption or body): the words are the
+record, the audio is a rendering.
+
+```json
+{"ref":"msg-77","text":"hello!",
+ "audio":{"media_type":"audio/ogg","base64":"T2dnUw…","duration_secs":1.8}}
+```
+
+Plugins that ignore `audio` remain correct.
+
 ### `shutdown` (notification)
 
 No id, no response expected: exit promptly. The host escalates to SIGKILL

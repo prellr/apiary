@@ -268,9 +268,20 @@ impl crate::presence::ChannelAdapter for PluginAdapter {
     fn reply(
         &mut self,
         mention: &crate::presence::Mention,
-        text: &str,
+        reply: &crate::presence::Reply,
     ) -> Result<String, crate::Error> {
-        let resp = self.request("reply", json!({"ref": mention.reply_ref, "text": text}))?;
+        let mut params = json!({"ref": mention.reply_ref, "text": reply.text});
+        if let Some(crate::presence::Attachment::Audio {
+            media_type,
+            base64,
+            duration_secs,
+        }) = &reply.audio
+        {
+            params["audio"] = json!({
+                "media_type": media_type, "base64": base64, "duration_secs": duration_secs
+            });
+        }
+        let resp = self.request("reply", params)?;
         if let Some(err) = resp.get("error") {
             return Err(crate::Error::Provider(format!(
                 "plugin '{}' reply refused: {err}",

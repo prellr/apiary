@@ -244,14 +244,63 @@ impl crate::presence::ChannelAdapter for TelegramAdapter {
     fn reply(
         &mut self,
         mention: &crate::presence::Mention,
-        text: &str,
+        reply: &crate::presence::Reply,
     ) -> Result<String, crate::Error> {
+        let chat_id = mention.channel.parse::<i64>().unwrap_or_default();
+        let reply_to = mention.reply_ref.parse::<i64>().unwrap_or_default();
+        // Voice reply: sendVoice (OGG/Opus) with the text as caption, so
+        // the words are still there to read and search. Caption cap is
+        // 1024; longer text falls back to a plain message.
+        if let Some(crate::presence::Attachment::Audio {
+            base64: b64,
+            duration_secs,
+            ..
+        }) = &reply.audio
+        {
+            if reply.text.chars().count() <= 1024 {
+                use base64::Engine;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .map_err(|e| crate::Error::Provider(format!("voice reply audio: {e}")))?;
+                let mut form = reqwest::blocking::multipart::Form::new()
+                    .text("chat_id", chat_id.to_string())
+                    .text("reply_to_message_id", reply_to.to_string())
+                    .text("caption", reply.text.clone())
+                    .part(
+                        "voice",
+                        reqwest::blocking::multipart::Part::bytes(bytes)
+                            .file_name("reply.ogg")
+                            .mime_str("audio/ogg")
+                            .map_err(|e| crate::Error::Provider(e.to_string()))?,
+                    );
+                if let Some(d) = duration_secs {
+                    form = form.text("duration", (d.round() as i64).to_string());
+                }
+                let resp: Value = self
+                    .client
+                    .post(format!(
+                        "https://api.telegram.org/bot{}/sendVoice",
+                        self.token
+                    ))
+                    .multipart(form)
+                    .send()
+                    .and_then(|r| r.json())
+                    .map_err(|e| crate::Error::Provider(format!("telegram sendVoice: {e}")))?;
+                if resp["ok"].as_bool() == Some(true) {
+                    return Ok(resp["result"]["message_id"]
+                        .as_i64()
+                        .unwrap_or_default()
+                        .to_string());
+                }
+                // Voice refused (bad codec, size…): the text still goes.
+            }
+        }
         let resp = self.call(
             "sendMessage",
             json!({
-                "chat_id": mention.channel.parse::<i64>().unwrap_or_default(),
-                "text": text,
-                "reply_to_message_id": mention.reply_ref.parse::<i64>().unwrap_or_default(),
+                "chat_id": chat_id,
+                "text": reply.text,
+                "reply_to_message_id": reply_to,
             }),
         )?;
         if resp["ok"].as_bool() != Some(true) {
