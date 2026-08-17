@@ -237,11 +237,40 @@ fn fire(
         tokens_per_run: r.budget.tokens_per_run,
         ..Default::default()
     };
-    // The task is a ratified STANDING INSTRUCTION; frame the occasion.
+    // The task is a ratified STANDING INSTRUCTION; frame the occasion. When
+    // the routine declares delivery, the run PRODUCES the text and the host
+    // delivers it — otherwise a model holding telegram_send sends the
+    // greeting itself and the delivery sends it again.
+    let delivery_note = if r.deliver.is_empty() {
+        String::new()
+    } else {
+        let targets: Vec<String> = r
+            .deliver
+            .iter()
+            .map(|d| {
+                if let Some(c) = &d.telegram {
+                    format!("Telegram chat {c}")
+                } else if let Some(c) = &d.buzz {
+                    format!("Buzz #{c}")
+                } else if d.nostr.is_some() {
+                    "a public nostr note".into()
+                } else if d.companion {
+                    "the human's voice companion".into()
+                } else {
+                    "?".into()
+                }
+            })
+            .collect();
+        format!(
+            " Your reply text is delivered by the host to {} — write the message itself as your \
+             reply; do NOT send it with a tool.",
+            targets.join(", ")
+        )
+    };
     let task = format!(
         "{}\n\n(This is your routine \"{}\", running on schedule at {} — nobody is watching in \
          real time. Do the task, be concise, and if there is nothing to report say so in one \
-         line.)",
+         line.{delivery_note})",
         r.task.trim(),
         r.name,
         slot.to_rfc3339()
