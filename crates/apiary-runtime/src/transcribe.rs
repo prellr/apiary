@@ -356,6 +356,13 @@ impl AppleSpeech {
         })
     }
 
+    /// Verify the sidecar can start and report its available local engines.
+    /// Used by host diagnostics; it sends no user data and makes no network
+    /// request.
+    pub fn probe(&self) -> Result<serde_json::Value, crate::Error> {
+        self.call(&serde_json::json!({"op": "probe"}))
+    }
+
     pub(crate) fn call(&self, req: &serde_json::Value) -> Result<serde_json::Value, crate::Error> {
         use std::io::Write;
         let bin = self.binary()?;

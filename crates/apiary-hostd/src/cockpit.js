@@ -111,11 +111,11 @@ async function loadStatus() {
   document.getElementById('c-home').title = 'state directory: ' + (hostStatus.home || '?');
   set('c-home', 'State · ' + ((hostStatus.home || '?').split('/').filter(Boolean).pop() || '/'));
   set('c-auth', 'Authentication · ' + (hostStatus.auth || '?') + (hostStatus.token_gated ? ' + token' : ''));
-  set('c-model', hostStatus.anthropic_key_present ? 'Model ready' : 'Model not configured',
+  set('c-model', hostStatus.anthropic_key_present ? 'Drafting model ready' : 'Drafting model unavailable',
       'chip ' + (hostStatus.anthropic_key_present ? 'ok' : ''));
   document.getElementById('c-model').title = hostStatus.anthropic_key_present
-    ? 'ANTHROPIC_API_KEY present in the host environment'
-    : 'no ANTHROPIC_API_KEY in the host environment — anthropic-routed runs and model drafting will refuse';
+    ? 'The host can use ANTHROPIC_API_KEY to draft new agent configurations'
+    : 'No host ANTHROPIC_API_KEY. Agent-owned inference credentials may still be configured and ready.';
   set('c-lock', hostStatus.unlocked ? 'unlocked' : 'LOCKED — click to unlock',
       'chip click ' + (hostStatus.unlocked ? 'ok' : 'bad'));
   // Once unlocked, never ask again: the passphrase prompt disappears and
@@ -238,6 +238,7 @@ async function render() {
   if (tab === 'overview') return renderOverview(c);
   if (tab === 'run') return renderRun(c);
   if (tab === 'log') return renderLog(c);
+  if (tab === 'inference') return renderInference(c);
   if (tab === 'manifest') return renderManifest(c);
   if (tab === 'buzz') return renderBuzz(c);
   if (tab === 'connectors') return renderConnectors(c);
@@ -471,6 +472,8 @@ async function renderOverview(c) {
   const m = d.manifest || {};
   const roster = agents.find(a => a.npub === sel) || {};
   const models = m.inference || [];
+  const taskModels = models.filter(x => inferenceRoleForName(x.name) === 'language');
+  const supportingModels = models.filter(x => inferenceRoleForName(x.name) !== 'language');
   const connectors = m.connectors || [];
   const declared = listener.ok ? (listener.declared || []) : [];
   const routines = m.routines || [];
@@ -495,7 +498,7 @@ async function renderOverview(c) {
   const shortcuts = el('div', 'quick-grid');
   shortcuts.append(quick('Start a task', 'Give this agent a one-time job.', 'run'),
     quick('Manage capabilities', 'Choose what it can read or change.', 'connectors'),
-    quick('Edit configuration', 'Models, limits, memory, and governance.', 'manifest'));
+    quick('Manage inference', 'Models, memory, speech, and routing.', 'inference'));
   c.append(shortcuts);
 
   const active = section('Always-on presence', declared.length
@@ -555,8 +558,9 @@ async function renderOverview(c) {
   listenerPoll = setInterval(async () => drawChannels(await j(api('/listener'))), 4000);
 
   const current = section('Current setup');
-  current.append(kv('Model', models.length ? models.map(x => `${x.provider} / ${x.model}`).join(', ') : 'None configured'),
+  current.append(kv('Task models', taskModels.length ? taskModels.map(x => `${x.name}: ${x.provider} / ${x.model}`).join(', ') : 'None configured'),
     kv('Default route', (m.routing || {}).default || 'Not set'),
+    kv('Memory & voice', supportingModels.length ? supportingModels.map(x => `${inferenceRoleLabel[inferenceRoleForName(x.name)]}: ${x.provider}${x.model ? ' / ' + x.model : ''}`).join(', ') : 'None configured'),
     kv('Capabilities', connectors.length ? connectors.map(x => x.name || x.type).join(', ') : 'None granted'),
     kv('Automations', routines.length ? `${routines.length} configured` : 'None'),
     kv('Memory', `${(m.memory || {}).log || 'local'} log · ${(m.memory || {}).index || 'no index'}`));
@@ -611,6 +615,204 @@ async function renderOverview(c) {
     }
   });
   advanced.append(body); c.append(advanced);
+}
+
+// ------------------------------------------------------ inference setup
+
+const inferenceRoleLabel = {
+  language: 'Task model', embedding: 'Memory embeddings',
+  transcription: 'Speech to text', speech: 'Text to speech',
+};
+
+function inferenceRoleForName(name) {
+  return ({ embed: 'embedding', transcribe: 'transcription', speak: 'speech' })[name] || 'language';
+}
+
+const inferenceProviders = {
+  language: [['anthropic', 'Anthropic'], ['openai', 'OpenAI compatible'], ['xai', 'xAI'], ['ollama', 'Ollama (local)']],
+  embedding: [['ollama', 'Ollama (local)'], ['hash', 'Built-in lexical index']],
+  transcription: [['apple-speech', 'Apple Speech (local)'], ['whisper-cpp', 'whisper.cpp (local)'], ['openai', 'OpenAI compatible']],
+  speech: [['openai', 'OpenAI compatible / Kokoro'], ['apple-speech', 'Apple Speech (local)'], ['macos-say', 'macOS voices']],
+};
+
+function inferenceProviderLabel(provider) {
+  for (const choices of Object.values(inferenceProviders)) {
+    const found = choices.find(([value]) => value === provider);
+    if (found) return found[1];
+  }
+  return provider;
+}
+
+function inferenceEndpoint(slot) {
+  const configured = ((slot.requires || {}).base_url || '').replace(/\/$/, '');
+  if (configured) return configured;
+  if (slot.provider === 'anthropic') return 'api.anthropic.com';
+  if (slot.provider === 'xai') return 'api.x.ai';
+  if (slot.provider === 'openai') return 'api.openai.com';
+  if (slot.provider === 'ollama') return 'localhost:11434';
+  return 'on this device';
+}
+
+function inferenceForm(slot, afterSave) {
+  const form = el('div', 'connection-form');
+  const role = el('select');
+  for (const value of ['language', 'embedding', 'transcription', 'speech']) {
+    const option = el('option', null, inferenceRoleLabel[value]); option.value = value; role.append(option);
+  }
+  role.value = slot ? slot.role : 'language';
+  if (slot) role.disabled = true;
+
+  const name = el('input'); name.value = slot ? slot.name : '';
+  name.placeholder = 'e.g. workhorse or fast';
+  const provider = el('select');
+  const model = el('input'); model.value = (slot && slot.model) || '';
+  model.placeholder = 'Model identifier';
+  const endpoint = el('input'); endpoint.value = (slot && slot.requires && slot.requires.base_url) || '';
+  endpoint.placeholder = 'Optional compatible API base URL';
+  const credential = el('input'); credential.type = 'password'; credential.autocomplete = 'off';
+  credential.placeholder = slot && slot.credential_source === 'sealed to agent' ? 'Leave blank to keep current key' : 'API key, if required';
+  const voice = el('input'); voice.value = (slot && slot.requires && slot.requires.voice) || '';
+  voice.placeholder = 'Voice, e.g. af_heart or alloy';
+  const locale = el('input'); locale.value = (slot && slot.requires && slot.requires.locale) || '';
+  locale.placeholder = 'Locale, e.g. en_US';
+  const makeDefault = el('input'); makeDefault.type = 'checkbox';
+  const makeDefaultLabel = el('label'); makeDefaultLabel.append(makeDefault, document.createTextNode(' Use as the default task model'));
+  const clear = el('input'); clear.type = 'checkbox';
+  const clearLabel = el('label'); clearLabel.append(clear, document.createTextNode(' Remove the stored credential'));
+
+  const refreshProviderChoices = () => {
+    const current = provider.value || (slot && slot.provider);
+    provider.replaceChildren();
+    for (const [value, label] of inferenceProviders[role.value]) {
+      const option = el('option', null, label); option.value = value; provider.append(option);
+    }
+    if ([...provider.options].some(o => o.value === current)) provider.value = current;
+    const fixedName = { embedding: 'embed', transcription: 'transcribe', speech: 'speak' }[role.value];
+    if (fixedName) { name.value = fixedName; name.readOnly = true; }
+    else { if (!slot && ['embed', 'transcribe', 'speak'].includes(name.value)) name.value = ''; name.readOnly = false; }
+    voice.closest('.field').style.display = role.value === 'speech' ? '' : 'none';
+    locale.closest('.field').style.display = role.value === 'transcription' ? '' : 'none';
+    makeDefaultLabel.style.display = role.value === 'language' ? '' : 'none';
+  };
+
+  form.append(field('Role', role), field('Connection name', name, 'Routing refers to this stable name.'),
+    field('Provider', provider), field('Model', model),
+    field('Base URL', endpoint, 'Leave blank for the provider default. Local compatible servers are keyless.'),
+    field('API credential', credential, 'Encrypted to this agent before it is written.'),
+    field('Voice', voice), field('Locale', locale));
+  const flags = el('div', 'wide row'); flags.append(makeDefaultLabel);
+  if (slot && slot.credential_source === 'sealed to agent') flags.append(clearLabel);
+  form.append(flags);
+  const actions = el('div', 'connection-actions');
+  const save = el('button', 'btn solid', slot ? 'Save connection' : 'Add connection');
+  const status = el('span', 'meta', ''); actions.append(save, status);
+  if (slot) {
+    const remove = el('button', 'btn danger', 'Remove'); let armed = false;
+    remove.onclick = async () => {
+      if (!armed) { armed = true; remove.textContent = 'Remove connection'; status.textContent = 'This change will require approval.'; return; }
+      remove.disabled = true;
+      const r = await j(api('/inference/' + encodeURIComponent(slot.name)), { method: 'DELETE' });
+      status.textContent = r.ok ? 'Removed. Review and approve the change.' : 'Could not remove: ' + r.error;
+      if (r.ok) { await loadRoster(); afterSave(); }
+      else remove.disabled = false;
+    };
+    actions.append(remove);
+  }
+  form.append(actions);
+  role.onchange = refreshProviderChoices;
+  provider.value = (slot && slot.provider) || inferenceProviders[role.value][0][0];
+  refreshProviderChoices();
+
+  save.onclick = async () => {
+    if (!name.value.trim()) { status.textContent = 'Give this connection a name.'; name.focus(); return; }
+    const requires = Object.assign({}, (slot && slot.requires) || {});
+    if (endpoint.value.trim()) requires.base_url = endpoint.value.trim(); else delete requires.base_url;
+    if (voice.value.trim()) requires.voice = voice.value.trim(); else delete requires.voice;
+    if (locale.value.trim()) requires.locale = locale.value.trim(); else delete requires.locale;
+    save.disabled = true; status.textContent = credential.value ? 'Encrypting credential…' : 'Saving…';
+    const r = await j(api('/inference'), {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        original_name: slot ? slot.name : null,
+        name: name.value.trim(), provider: provider.value, model: model.value.trim() || null,
+        credential: credential.value || null, clear_credential: clear.checked,
+        requires, set_default: makeDefault.checked,
+      }),
+    });
+    credential.value = ''; save.disabled = false;
+    status.textContent = r.ok ? 'Saved. Review and approve the change.' : 'Could not save: ' + r.error;
+    if (r.ok) { await loadRoster(); afterSave(); }
+  };
+  return form;
+}
+
+function inferenceSource(slot, routing, rerender) {
+  const item = el('article', 'source-item');
+  const head = el('div', 'source-head');
+  const identity = el('div');
+  identity.append(el('div', 'source-name', slot.name), el('div', 'source-role', inferenceRoleLabel[slot.role] || slot.role));
+  const detail = el('div', 'source-detail');
+  detail.append(el('div', null, `${inferenceProviderLabel(slot.provider)}${slot.model ? ' · ' + slot.model : ''}`),
+    el('div', null, `${inferenceEndpoint(slot)} · credential: ${slot.credential_source}`));
+  if (routing.default === slot.name) detail.append(el('div', 'risk', 'Default route for tasks'));
+  const state = el('div', 'source-state');
+  const stateName = (slot.status && slot.status.state) || 'unavailable';
+  state.append(el('span', 'state ' + stateName, stateName === 'ready' ? 'Verified locally' : stateName));
+  state.append(el('div', 'source-detail', (slot.status && slot.status.detail) || 'No diagnostic available'));
+  head.append(identity, detail, state); item.append(head);
+  const edit = el('details'); edit.append(el('summary', null, 'Edit connection'), inferenceForm(slot, rerender));
+  item.append(edit);
+  return item;
+}
+
+async function renderInference(c) {
+  const d = await j(api('/inference'));
+  const head = el('div', 'page-head');
+  head.append(el('div', 'eyebrow', 'Agent-owned connections'),
+    el('h2', 'page-title', 'Inference'),
+    el('p', 'page-lede', 'Choose the engines this agent uses to think, remember, hear, and speak. Credentials are sealed to the agent; local diagnostics never send a paid model request.'));
+  c.append(head);
+  if (!d.ok) { c.append(el('div', 'ev err', 'Could not load inference setup: ' + d.error)); return; }
+  const slots = d.slots || [], routing = d.routing || {};
+  const language = slots.filter(s => s.role === 'language');
+  const support = slots.filter(s => s.role !== 'language');
+  const verified = slots.filter(s => s.status && s.status.state === 'ready').length;
+  c.append((() => { const m = el('div', 'metrics'); m.append(metric('Task models', language.length), metric('Supporting engines', support.length), metric('Verified locally', verified), metric('Default route', routing.default || 'Not set')); return m; })());
+
+  const rerender = () => setTimeout(render, 350);
+  const task = section('Task models', 'Language models receive prompts and may call granted capabilities. “Configured” means a credential is present; Apiary avoids a billable probe.');
+  const taskList = el('div', 'source-list');
+  for (const slot of language) taskList.append(inferenceSource(slot, routing, rerender));
+  if (!language.length) taskList.append(el('div', 'none', 'No task model is configured.'));
+  task.append(taskList);
+  if (language.length) {
+    const select = el('select');
+    for (const slot of language) { const option = el('option', null, slot.name); option.value = slot.name; select.append(option); }
+    select.value = routing.default || '';
+    const save = el('button', 'btn', 'Set default'); const status = el('span', 'meta', '');
+    const line = el('div', 'route-line'); line.append(select, save, status); task.append(line);
+    save.onclick = async () => {
+      save.disabled = true;
+      const r = await j(api('/inference/default'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: select.value }) });
+      save.disabled = false; status.textContent = r.ok ? 'Saved. Approval required.' : 'Could not save: ' + r.error;
+      if (r.ok) { await loadRoster(); rerender(); }
+    };
+  }
+  const add = el('details', 'technical'); add.append(el('summary', null, 'Add an inference connection'), inferenceForm(null, rerender));
+  task.append(add); c.append(task);
+
+  const equipment = section('Memory and voice', 'Supporting engines have reserved roles: embed builds semantic memory, transcribe hears audio, and speak renders voice replies.');
+  const supportList = el('div', 'source-list');
+  for (const slot of support) supportList.append(inferenceSource(slot, routing, rerender));
+  if (!support.length) supportList.append(el('div', 'none', 'No supporting engines are configured.'));
+  equipment.append(supportList); c.append(equipment);
+
+  const policy = section('Routing policy', 'Routing is decided before inference. Human-approved floors win, then task rules, then the default model.');
+  if (!(routing.floors || []).length && !(routing.rules || []).length) policy.append(el('div', 'none', 'No conditional routes. Every task uses the default model.'));
+  for (const rule of routing.floors || []) policy.append(kv('Required floor', `${rule.when} → ${rule.to}`));
+  for (const rule of routing.rules || []) policy.append(kv('Task rule', `${rule.when} → ${rule.to}`));
+  const advanced = el('button', 'btn', 'Edit advanced routing'); advanced.onclick = () => openTab('manifest');
+  policy.append(advanced); c.append(policy);
 }
 
 // ------------------------------------------------------------ run
@@ -772,10 +974,10 @@ async function renderManifest(c) {
   const g = el('div');
   const rows = [
     ['identity.npub', 'the agent’s public key — immutable; the host refuses an amendment that changes it'],
-    ['inference[]', 'the model pool: named slots {name, provider, model, credential?, requires?}. Providers: anthropic, openai, xai (OpenAI dialect; requires.base_url reaches any compatible endpoint — keyless when local), ollama, mock. Per-slot credentials are NIP-44-sealed. An "embed" slot powers the semantic index.'],
+    ['inference[]', 'agent-owned inference connections. Task-model names are routing targets; reserved names embed, transcribe, and speak provide semantic memory and voice equipment. Manage ordinary changes from Inference. Per-slot credentials are NIP-44-sealed.'],
     ['routing.default', 'slot used when no rule matches'],
-    ['routing.rules[]', 'per-task-class slot choices, e.g. {class: reasoning, use: workhorse}'],
-    ['routing.floors[]', 'human-owned clamps, e.g. {data_class: sensitive, require_provider: ollama} — routing may be stricter than a floor, never looser'],
+    ['routing.rules[]', 'conditional slot choices, e.g. {when: task.class == "reasoning", to: workhorse}'],
+    ['routing.floors[]', 'human-owned clamps, e.g. {when: data.class == "sensitive", to: local} — routing may be stricter than a floor, never looser'],
     ['connectors[]', 'what the agent may touch, default-deny. Each entry: {type, caps, credential?}. Managed from Capabilities: host library holds configurations, grants are per-agent amendments with credentials sealed to this agent alone.'],
     ['memory.log', 'default tier for new log entries: public | self | local'],
     ['memory.index', 'semantic index location (local)'],

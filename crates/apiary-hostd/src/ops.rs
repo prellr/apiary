@@ -202,8 +202,8 @@ pub async fn status(
         "agents": agents,
         "owners": owners,
         "listeners": listeners,
-        "anthropic_key_present": std::env::var("ANTHROPIC_API_KEY").is_ok()
-            || std::env::var("ANTHROPIC_AUTH_TOKEN").is_ok(),
+        "anthropic_key_present": nonempty_env("ANTHROPIC_API_KEY")
+            || nonempty_env("ANTHROPIC_AUTH_TOKEN"),
         "relay_pool": apiary_runtime::relay::stats(),
     }))
     .into_response()
@@ -455,6 +455,534 @@ pub async fn spend_status(
             .into_response()
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+// ----------------------------------------------------------- inference setup
+
+fn inference_role(name: &str) -> &'static str {
+    match name {
+        "embed" => "embedding",
+        "transcribe" => "transcription",
+        "speak" => "speech",
+        _ => "language",
+    }
+}
+
+fn valid_inference_provider(role: &str, provider: &str) -> bool {
+    match role {
+        "embedding" => matches!(provider, "ollama" | "hash" | "mock"),
+        "transcription" => matches!(provider, "apple-speech" | "whisper-cpp" | "openai" | "mock"),
+        "speech" => matches!(provider, "apple-speech" | "macos-say" | "openai" | "mock"),
+        _ => matches!(
+            provider,
+            "anthropic" | "openai" | "xai" | "ollama" | "mock" | "mock-tool"
+        ),
+    }
+}
+
+fn loopback_url(raw: &str) -> Option<reqwest::Url> {
+    let url = reqwest::Url::parse(raw).ok()?;
+    match url.host_str()? {
+        "127.0.0.1" | "localhost" | "::1" | "[::1]" => Some(url),
+        _ => None,
+    }
+}
+
+fn nonempty_env(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| !value.is_empty())
+}
+
+fn credential_source(slot: &apiary_core::manifest::InferenceSlot) -> &'static str {
+    if slot.credential.is_some() {
+        return "sealed to agent";
+    }
+    let env = match slot.provider.as_str() {
+        "anthropic" => nonempty_env("ANTHROPIC_API_KEY") || nonempty_env("ANTHROPIC_AUTH_TOKEN"),
+        "openai" => nonempty_env("OPENAI_API_KEY"),
+        "xai" => nonempty_env("XAI_API_KEY"),
+        _ => false,
+    };
+    if env {
+        "host environment"
+    } else {
+        "none"
+    }
+}
+
+fn probe_inference_slot(slot: &apiary_core::manifest::InferenceSlot) -> serde_json::Value {
+    let role = inference_role(&slot.name);
+    let provider = slot.provider.as_str();
+    let credential = credential_source(slot);
+    let base_url = slot.requires.get("base_url").and_then(|v| v.as_str());
+    let configured = credential != "none";
+    let result = |state: &str, detail: String| json!({"state": state, "detail": detail});
+
+    match provider {
+        "ollama" => {
+            let client = match reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => return result("unavailable", e.to_string()),
+            };
+            let response = client.get("http://127.0.0.1:11434/api/tags").send();
+            let Ok(response) = response else {
+                return result(
+                    "unavailable",
+                    "Ollama is not reachable on localhost:11434".into(),
+                );
+            };
+            let payload: serde_json::Value = response.json().unwrap_or_default();
+            let requested = slot.model.as_deref().unwrap_or("");
+            let present = requested.is_empty()
+                || payload["models"].as_array().is_some_and(|models| {
+                    models.iter().any(|m| {
+                        let found = m["name"].as_str().unwrap_or("");
+                        found == requested
+                            || found.strip_suffix(":latest") == Some(requested)
+                            || requested.strip_suffix(":latest") == Some(found)
+                    })
+                });
+            if present {
+                result(
+                    "ready",
+                    format!("Local Ollama model {requested} is installed"),
+                )
+            } else {
+                result(
+                    "unavailable",
+                    format!("Ollama is running, but {requested} is not installed"),
+                )
+            }
+        }
+        "apple-speech" => {
+            let command = slot
+                .requires
+                .get("command")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let engine = apiary_runtime::transcribe::AppleSpeech::new(command, None);
+            match engine.probe() {
+                Ok(probe) => result(
+                    "ready",
+                    format!(
+                        "On-device Apple Speech: {}{}",
+                        if probe["transcribe"].as_bool() == Some(true) {
+                            "transcription"
+                        } else {
+                            "speech"
+                        },
+                        if probe["speak"].as_bool() == Some(true) {
+                            " + synthesis"
+                        } else {
+                            ""
+                        }
+                    ),
+                ),
+                Err(e) => result("unavailable", e.to_string()),
+            }
+        }
+        "macos-say" => {
+            if std::path::Path::new("/usr/bin/say").is_file() {
+                result("ready", "macOS speech synthesis is available".into())
+            } else {
+                result(
+                    "unavailable",
+                    "The macOS say command is not installed".into(),
+                )
+            }
+        }
+        "hash" | "mock" | "mock-tool" => {
+            result("ready", "Built into Apiary; no external connection".into())
+        }
+        "whisper-cpp" => result(
+            "configured",
+            "Local whisper.cpp is checked when audio is received".into(),
+        ),
+        "anthropic" | "xai" => {
+            if configured {
+                result(
+                    "configured",
+                    "Credential is available; no billable test request was sent".into(),
+                )
+            } else {
+                result(
+                    "unavailable",
+                    "Add an API credential for this connection".into(),
+                )
+            }
+        }
+        "openai" => {
+            if let Some(raw) = base_url {
+                if let Some(url) = loopback_url(raw) {
+                    let root = url.as_str().trim_end_matches('/').trim_end_matches("/v1");
+                    let target = if role == "speech" {
+                        format!("{root}/health")
+                    } else {
+                        format!("{root}/v1/models")
+                    };
+                    let response = reqwest::blocking::Client::builder()
+                        .timeout(std::time::Duration::from_secs(2))
+                        .redirect(reqwest::redirect::Policy::none())
+                        .build()
+                        .and_then(|c| c.get(target).send());
+                    return match response {
+                        Ok(r) if r.status().is_success() => {
+                            result("ready", format!("Local compatible endpoint at {raw}"))
+                        }
+                        _ => result("unavailable", format!("Nothing answered at {raw}")),
+                    };
+                }
+            }
+            if configured {
+                result(
+                    "configured",
+                    "Credential is available; no billable test request was sent".into(),
+                )
+            } else {
+                result(
+                    "unavailable",
+                    "Add an API credential or a local base URL".into(),
+                )
+            }
+        }
+        _ => result(
+            "unavailable",
+            format!("Provider '{provider}' is not supported for {role}"),
+        ),
+    }
+}
+
+pub async fn inference_status(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, raw, manifest) = match gate(&state, &headers, "GET", &uri, None, &npub) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    let agent_pk = apiary_core::identity::parse_npub(&npub).ok();
+    let ratified = agent_pk.is_some_and(|pk| {
+        ceremony::is_ratified(&EpisodicLog::open(&dir), &raw, &pk, &suspend_pks(&manifest))
+            .unwrap_or(false)
+    });
+    let slots = manifest.inference.clone();
+    let default = manifest.routing.default.clone();
+    let rules = manifest.routing.rules.clone();
+    let floors = manifest.routing.floors.clone();
+    let probed = tokio::task::spawn_blocking(move || {
+        slots
+            .iter()
+            .map(|slot| {
+                json!({
+                    "name": slot.name,
+                    "role": inference_role(&slot.name),
+                    "provider": slot.provider,
+                    "model": slot.model,
+                    "requires": slot.requires,
+                    "credential_source": credential_source(slot),
+                    "status": probe_inference_slot(slot),
+                })
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "ratified": ratified,
+        "slots": probed,
+        "routing": {"default": default, "rules": rules, "floors": floors},
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct InferenceUpsertBody {
+    #[serde(default)]
+    original_name: Option<String>,
+    name: String,
+    provider: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    credential: Option<String>,
+    #[serde(default)]
+    clear_credential: bool,
+    #[serde(default)]
+    requires: std::collections::BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    set_default: bool,
+}
+
+fn validate_inference_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 40
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
+pub async fn inference_upsert(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (ks, npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    let body: InferenceUpsertBody = match serde_json::from_slice(&raw_body) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let name = body.name.trim().to_string();
+    let provider = body.provider.trim().to_lowercase();
+    if !validate_inference_name(&name) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "connection name must be 1–40 letters, numbers, dashes, or underscores",
+        )
+        .into_response();
+    }
+    let role = inference_role(&name);
+    if !valid_inference_provider(role, &provider) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("provider '{provider}' cannot serve the {role} role"),
+        )
+        .into_response();
+    }
+    let model = body
+        .model
+        .filter(|m| !m.trim().is_empty())
+        .map(|m| m.trim().to_string());
+    if role == "language" && model.is_none() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "task model connections require an explicit model identifier",
+        )
+        .into_response();
+    }
+    let original = body.original_name.as_deref().unwrap_or(&name);
+    let existing = manifest
+        .inference
+        .iter()
+        .find(|s| s.name == original)
+        .cloned();
+    if original != name && manifest.inference.iter().any(|s| s.name == name) {
+        return err(
+            StatusCode::CONFLICT,
+            format!("connection '{name}' already exists"),
+        )
+        .into_response();
+    }
+    let credential = if body.clear_credential {
+        None
+    } else if let Some(secret) = body.credential.filter(|s| !s.trim().is_empty()) {
+        let pass = match require_pass(&state) {
+            Ok(p) => p,
+            Err(e) => return e.into_response(),
+        };
+        let npub2 = npub.clone();
+        match tokio::task::spawn_blocking(move || {
+            let (custody, handle) = admit(&ks, &npub2, &pass)?;
+            custody
+                .seal(&handle, secret.trim())
+                .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+        })
+        .await
+        .unwrap_or_else(|e| Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)))
+        {
+            Ok(blob) => Some(blob),
+            Err(e) => return e.into_response(),
+        }
+    } else {
+        existing
+            .as_ref()
+            .filter(|s| s.provider == provider)
+            .and_then(|s| s.credential.clone())
+    };
+    let slot = apiary_core::manifest::InferenceSlot {
+        name: name.clone(),
+        provider,
+        model,
+        credential,
+        requires: body.requires,
+    };
+    if let Some(index) = manifest.inference.iter().position(|s| s.name == original) {
+        manifest.inference[index] = slot;
+        if original != name {
+            if manifest.routing.default.as_deref() == Some(original) {
+                manifest.routing.default = Some(name.clone());
+            }
+            for rule in manifest
+                .routing
+                .rules
+                .iter_mut()
+                .chain(manifest.routing.floors.iter_mut())
+            {
+                if rule.to == original {
+                    rule.to = name.clone();
+                }
+            }
+        }
+    } else {
+        manifest.inference.push(slot);
+    }
+    if body.set_default {
+        if inference_role(&name) != "language" {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "only a language model can be the default route",
+            )
+            .into_response();
+        }
+        manifest.routing.default = Some(name.clone());
+    }
+    if let Err(e) = manifest.validate() {
+        return err(StatusCode::BAD_REQUEST, e).into_response();
+    }
+    let yaml = match serde_yaml::to_string(&manifest) {
+        Ok(y) => y,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "name": name,
+        "ratified": false,
+        "note": "inference connection saved — review and approve before the agent runs",
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct InferenceDefaultBody {
+    name: String,
+}
+
+pub async fn inference_set_default(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (_ks, _npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    let body: InferenceDefaultBody = match serde_json::from_slice(&raw_body) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    if !manifest
+        .inference
+        .iter()
+        .any(|s| s.name == body.name && inference_role(&s.name) == "language")
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "default must name a language model connection",
+        )
+        .into_response();
+    }
+    manifest.routing.default = Some(body.name.clone());
+    let yaml = match serde_yaml::to_string(&manifest) {
+        Ok(y) => y,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(json!({"ok": true, "default": body.name, "ratified": false})).into_response()
+}
+
+pub async fn inference_delete(
+    State(state): State<App>,
+    AxPath((npub, name)): AxPath<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, _npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "DELETE", &uri, None, &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    if manifest.routing.default.as_deref() == Some(&name)
+        || manifest
+            .routing
+            .rules
+            .iter()
+            .chain(manifest.routing.floors.iter())
+            .any(|r| r.to == name)
+    {
+        return err(
+            StatusCode::CONFLICT,
+            "this connection is still used by routing; choose another default or edit its rules first",
+        )
+        .into_response();
+    }
+    let before = manifest.inference.len();
+    manifest.inference.retain(|s| s.name != name);
+    if manifest.inference.len() == before {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("no inference connection '{name}'"),
+        )
+        .into_response();
+    }
+    let yaml = match serde_yaml::to_string(&manifest) {
+        Ok(y) => y,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(json!({"ok": true, "removed": name, "ratified": false})).into_response()
+}
+
+#[cfg(test)]
+mod inference_setup_tests {
+    use super::*;
+
+    #[test]
+    fn reserved_names_select_supporting_roles() {
+        assert_eq!(inference_role("workhorse"), "language");
+        assert_eq!(inference_role("embed"), "embedding");
+        assert_eq!(inference_role("transcribe"), "transcription");
+        assert_eq!(inference_role("speak"), "speech");
+    }
+
+    #[test]
+    fn provider_matrix_rejects_cross_role_bindings() {
+        assert!(valid_inference_provider("language", "anthropic"));
+        assert!(valid_inference_provider("embedding", "ollama"));
+        assert!(valid_inference_provider("transcription", "apple-speech"));
+        assert!(valid_inference_provider("speech", "macos-say"));
+        assert!(!valid_inference_provider("embedding", "anthropic"));
+        assert!(!valid_inference_provider("language", "apple-speech"));
+    }
+
+    #[test]
+    fn diagnostics_only_probe_exact_loopback_hosts() {
+        assert!(loopback_url("http://127.0.0.1:8880/v1").is_some());
+        assert!(loopback_url("http://localhost:11434").is_some());
+        assert!(loopback_url("http://[::1]:8080/v1").is_some());
+        assert!(loopback_url("https://localhost.example.com/v1").is_none());
+        assert!(loopback_url("https://api.openai.com/v1").is_none());
     }
 }
 

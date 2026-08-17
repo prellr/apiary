@@ -788,6 +788,13 @@ impl Provider for MockToolProvider {
 /// Bind a manifest inference slot to a concrete provider.
 /// `credential` is the already-decrypted secret when the slot carries one
 /// (JIT-decrypted by custody at call time — SPEC §5).
+pub(crate) fn is_loopback_base_url(raw: &str) -> bool {
+    reqwest::Url::parse(raw)
+        .ok()
+        .and_then(|url| url.host_str().map(String::from))
+        .is_some_and(|host| matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1" | "[::1]"))
+}
+
 pub fn bind(
     provider_name: &str,
     credential: Option<Zeroizing<String>>,
@@ -814,10 +821,10 @@ pub fn bind(
                 None => match OpenAiCompatProvider::from_env(label, base_url.clone()) {
                     Some(p) => p,
                     // Local/self-hosted compatible endpoints (llama.cpp,
-                    // LM Studio, ollama /v1) ignore auth — a custom
-                    // base_url without a key gets a placeholder bearer
-                    // instead of a refusal. Hosted APIs still require one.
-                    None if base_url.is_some() => OpenAiCompatProvider::new(
+                    // LM Studio, ollama /v1) ignore auth. Only an exact
+                    // loopback base_url may use the placeholder bearer;
+                    // remote custom endpoints still require a credential.
+                    None if base_url.as_deref().is_some_and(is_loopback_base_url) => OpenAiCompatProvider::new(
                         Zeroizing::new("local".into()),
                         base_url,
                         label,
@@ -1140,6 +1147,15 @@ mod openai_tests {
         let body = p.payload_base("gpt-5", 500);
         assert!(body.get("max_completion_tokens").is_some());
         assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn only_exact_loopback_endpoints_can_be_keyless() {
+        assert!(is_loopback_base_url("http://127.0.0.1:11434/v1"));
+        assert!(is_loopback_base_url("http://localhost:8080/v1"));
+        assert!(is_loopback_base_url("http://[::1]:8080/v1"));
+        assert!(!is_loopback_base_url("https://localhost.example.com/v1"));
+        assert!(!is_loopback_base_url("https://api.openai.com/v1"));
     }
 
     #[test]

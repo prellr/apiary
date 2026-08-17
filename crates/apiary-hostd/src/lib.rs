@@ -123,6 +123,18 @@ pub fn build_router(state: App) -> Router {
         .route("/api/agents/{npub}/run", post(agui::run_stream))
         .route("/api/agents/{npub}/spend", get(ops::spend_status))
         .route(
+            "/api/agents/{npub}/inference",
+            get(ops::inference_status).post(ops::inference_upsert),
+        )
+        .route(
+            "/api/agents/{npub}/inference/default",
+            post(ops::inference_set_default),
+        )
+        .route(
+            "/api/agents/{npub}/inference/{name}",
+            axum::routing::delete(ops::inference_delete),
+        )
+        .route(
             "/api/agents/{npub}/credential/seal",
             post(ops::credential_seal),
         )
