@@ -38,6 +38,7 @@ pub const BOUND_KINDS: &[&str] = &[
     "mcp",
     "obsidian",
     "markdown-vault",
+    "web-search",
     "web-fetch",
     "files",
     "git",
@@ -63,6 +64,10 @@ pub fn bind_connectors_in(
     agent_dir: Option<&std::path::Path>,
 ) -> Result<Vec<Box<dyn Connector>>, crate::Error> {
     let mut out: Vec<Box<dyn Connector>> = Vec::new();
+    let has_explicit_web_fetch = manifest
+        .connectors
+        .iter()
+        .any(|connector| connector.kind == "web-fetch");
     if let Some(dir) = agent_dir {
         out.push(Box::new(crate::proposal::ProposeRoutine {
             agent_dir: dir.to_path_buf(),
@@ -78,6 +83,30 @@ pub fn bind_connectors_in(
             "mcp" => out.extend(bind_mcp(entry, custody, agent)?),
             "obsidian" => out.extend(bind_vault(entry, true)?),
             "markdown-vault" => out.extend(bind_vault(entry, false)?),
+            "web-search" => {
+                out.push(Box::new(bind_web_search(entry)?));
+                // A full-research grant can deliberately include the public page
+                // reader. Do not expose a duplicate web_fetch tool when the
+                // manifest already carries a separately governed fetch grant.
+                if !has_explicit_web_fetch
+                    && entry
+                        .caps
+                        .get("fetch_public_pages")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                {
+                    out.push(Box::new(bind_web_fetch_caps(
+                        true,
+                        Vec::new(),
+                        false,
+                        entry
+                            .caps
+                            .get("fetch_max_bytes")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(262_144),
+                    )?));
+                }
+            }
             "web-fetch" => out.push(Box::new(bind_web_fetch(entry)?)),
             "files" => out.extend(bind_files(entry)?),
             "git" => out.extend(bind_git(entry)?),
@@ -468,7 +497,277 @@ fn refresh_access_token(oauth: &Value) -> Result<String, crate::Error> {
         .ok_or_else(|| crate::Error::Provider(format!("oauth refresh refused: {v}")))
 }
 
-// ---------------------------------------------------------------- web fetch
+// ---------------------------------------------------------------- web search + fetch
+
+/// Search is discovery, not page access. The provider endpoint is hard-coded
+/// so neither the model nor manifest caps can turn a search credential into a
+/// generic authenticated HTTP client. The optional companion `web_fetch` tool
+/// is separately visible in caps as `fetch_public_pages`.
+fn bind_web_search(entry: &apiary_core::manifest::Connector) -> Result<WebSearch, crate::Error> {
+    let credential = entry.credential.clone().ok_or_else(|| {
+        crate::Error::Provider(
+            "web-search requires a Brave Search API key sealed as its credential".into(),
+        )
+    })?;
+    let provider = entry
+        .caps
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("brave");
+    if provider != "brave" {
+        return Err(crate::Error::Provider(format!(
+            "web-search provider '{provider}' is unsupported (supported: brave)"
+        )));
+    }
+    let country = entry
+        .caps
+        .get("country")
+        .and_then(Value::as_str)
+        .unwrap_or("US")
+        .trim()
+        .to_ascii_uppercase();
+    if country.len() != 2 || !country.bytes().all(|c| c.is_ascii_uppercase()) {
+        return Err(crate::Error::Provider(
+            "web-search caps.country must be a two-letter country code".into(),
+        ));
+    }
+    let search_lang = entry
+        .caps
+        .get("search_lang")
+        .and_then(Value::as_str)
+        .unwrap_or("en")
+        .trim()
+        .to_ascii_lowercase();
+    if !(2..=5).contains(&search_lang.len())
+        || !search_lang
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c == b'-')
+    {
+        return Err(crate::Error::Provider(
+            "web-search caps.search_lang must be a short language code".into(),
+        ));
+    }
+    let safesearch = entry
+        .caps
+        .get("safesearch")
+        .and_then(Value::as_str)
+        .unwrap_or("moderate")
+        .to_ascii_lowercase();
+    if !matches!(safesearch.as_str(), "off" | "moderate" | "strict") {
+        return Err(crate::Error::Provider(
+            "web-search caps.safesearch must be off, moderate, or strict".into(),
+        ));
+    }
+    Ok(WebSearch {
+        credential,
+        country,
+        search_lang,
+        safesearch,
+        max_results: entry
+            .caps
+            .get("max_results")
+            .and_then(Value::as_u64)
+            .unwrap_or(10)
+            .clamp(1, 20) as usize,
+    })
+}
+
+struct WebSearch {
+    credential: apiary_core::manifest::EncryptedBlob,
+    country: String,
+    search_lang: String,
+    safesearch: String,
+    max_results: usize,
+}
+
+impl Connector for WebSearch {
+    fn def(&self) -> ToolDef {
+        ToolDef {
+            name: "web_search".into(),
+            description: format!(
+                "Search the public web using Brave's independent index and return structured source results. \
+                 If web_fetch is granted, use it afterward to read promising sources. Up to {} results per query; \
+                 country={}, language={}, SafeSearch={}.",
+                self.max_results, self.country, self.search_lang, self.safesearch
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query (maximum 400 characters and 50 words)"
+                    },
+                    "count": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": self.max_results,
+                        "description": "Number of web results to return"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9,
+                        "description": "Result page offset for follow-up searches"
+                    },
+                    "freshness": {
+                        "type": "string",
+                        "enum": ["pd", "pw", "pm", "py"],
+                        "description": "Optional age filter: past day, week, month, or year"
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn execute(
+        &self,
+        custody: &Custody,
+        agent: &AgentHandle,
+        args: &Value,
+    ) -> Result<String, crate::Error> {
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .ok_or_else(|| crate::Error::Provider("web_search: query is required".into()))?;
+        if query.chars().count() > 400 || query.split_whitespace().count() > 50 {
+            return Err(crate::Error::Provider(
+                "web_search: query exceeds 400 characters or 50 words".into(),
+            ));
+        }
+        let count = args
+            .get("count")
+            .and_then(Value::as_u64)
+            .unwrap_or(self.max_results as u64) as usize;
+        if count == 0 || count > self.max_results {
+            return Err(crate::Error::Provider(format!(
+                "web_search: count must be between 1 and {}",
+                self.max_results
+            )));
+        }
+        let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
+        if offset > 9 {
+            return Err(crate::Error::Provider(
+                "web_search: offset must be between 0 and 9".into(),
+            ));
+        }
+        let freshness = args.get("freshness").and_then(Value::as_str);
+        if freshness.is_some_and(|v| !matches!(v, "pd" | "pw" | "pm" | "py")) {
+            return Err(crate::Error::Provider(
+                "web_search: freshness must be pd, pw, pm, or py".into(),
+            ));
+        }
+
+        let mut url = reqwest::Url::parse("https://api.search.brave.com/res/v1/web/search")
+            .expect("hard-coded Brave endpoint is a valid URL");
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs
+                .append_pair("q", query)
+                .append_pair("count", &count.to_string())
+                .append_pair("offset", &offset.to_string())
+                .append_pair("country", &self.country)
+                .append_pair("search_lang", &self.search_lang)
+                .append_pair("safesearch", &self.safesearch)
+                .append_pair("result_filter", "web")
+                .append_pair("text_decorations", "false");
+            if let Some(value) = freshness {
+                pairs.append_pair("freshness", value);
+            }
+        }
+        let (host, addr) =
+            validate_web_url(&url, false, &["api.search.brave.com".to_string()], false)?;
+        let token = custody.open(agent, &self.credential)?;
+        if token.trim().is_empty() {
+            return Err(crate::Error::Provider(
+                "web_search: sealed API key is empty".into(),
+            ));
+        }
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(concat!("Apiary/", env!("CARGO_PKG_VERSION")))
+            .resolve(&host, addr)
+            .build()
+            .map_err(|e| crate::Error::Provider(format!("web search client: {e}")))?;
+        let mut response = client
+            .get(url)
+            .header("accept", "application/json")
+            .header("x-subscription-token", token.trim())
+            .send()
+            .map_err(|e| crate::Error::Provider(format!("web search failed: {e}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            let message = match status.as_u16() {
+                401 | 403 => "credential was refused",
+                429 => "provider rate limit reached",
+                _ => "provider request failed",
+            };
+            return Err(crate::Error::Provider(format!(
+                "web_search: {message} (HTTP {})",
+                status.as_u16()
+            )));
+        }
+        use std::io::Read;
+        const MAX_SEARCH_RESPONSE: usize = 1_048_576;
+        let mut bytes = Vec::new();
+        response
+            .by_ref()
+            .take((MAX_SEARCH_RESPONSE + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|e| crate::Error::Provider(format!("web search response: {e}")))?;
+        if bytes.len() > MAX_SEARCH_RESPONSE {
+            return Err(crate::Error::Provider(
+                "web_search: provider response exceeded 1 MiB".into(),
+            ));
+        }
+        let payload: Value = serde_json::from_slice(&bytes).map_err(|e| {
+            crate::Error::Provider(format!("web search returned invalid JSON: {e}"))
+        })?;
+        Ok(normalize_brave_results(query, offset, count, &payload).to_string())
+    }
+}
+
+fn bounded_text(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn normalize_brave_results(query: &str, offset: u64, max_results: usize, payload: &Value) -> Value {
+    let results = payload
+        .pointer("/web/results")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let url = item.get("url")?.as_str()?;
+                    let parsed = reqwest::Url::parse(url).ok()?;
+                    if !matches!(parsed.scheme(), "http" | "https") {
+                        return None;
+                    }
+                    let title = item.get("title").and_then(Value::as_str).unwrap_or(url);
+                    Some(json!({
+                        "title": bounded_text(title, 512),
+                        "url": bounded_text(url, 4096),
+                        "description": bounded_text(item.get("description").and_then(Value::as_str).unwrap_or(""), 1500),
+                        "age": item.get("age").and_then(Value::as_str).map(|age| bounded_text(age, 100)),
+                    }))
+                })
+                .take(max_results)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "provider": "brave",
+        "query": query,
+        "offset": offset,
+        "more_results_available": payload.pointer("/query/more_results_available").and_then(Value::as_bool).unwrap_or(false),
+        "results": results,
+    })
+}
 
 /// A deliberately narrow web reader. The manifest names every permitted
 /// domain; DNS is resolved and pinned only after private/special addresses
@@ -507,17 +806,30 @@ fn bind_web_fetch(entry: &apiary_core::manifest::Connector) -> Result<WebFetch, 
         .caps
         .get("max_bytes")
         .and_then(Value::as_u64)
-        .unwrap_or(262_144)
-        .clamp(1_024, 2_097_152) as usize;
-    Ok(WebFetch {
-        domains,
+        .unwrap_or(262_144);
+    bind_web_fetch_caps(
         allow_all_public,
-        allow_subdomains: entry
+        domains,
+        entry
             .caps
             .get("allow_subdomains")
             .and_then(Value::as_bool)
             .unwrap_or(false),
         max_bytes,
+    )
+}
+
+fn bind_web_fetch_caps(
+    allow_all_public: bool,
+    domains: Vec<String>,
+    allow_subdomains: bool,
+    max_bytes: u64,
+) -> Result<WebFetch, crate::Error> {
+    Ok(WebFetch {
+        domains,
+        allow_all_public,
+        allow_subdomains,
+        max_bytes: max_bytes.clamp(1_024, 2_097_152) as usize,
     })
 }
 
@@ -1942,6 +2254,30 @@ mod connector_security_tests {
         assert!(public_ip(IpAddr::V6(
             "2606:4700:4700::1111".parse().unwrap()
         )));
+    }
+
+    #[test]
+    fn brave_results_are_reduced_to_grounding_sources() {
+        let raw = json!({
+            "query": {"more_results_available": true},
+            "web": {"results": [
+                {"title": "Primary source", "url": "https://example.com/report", "description": "The report", "age": "2 hours ago", "irrelevant": {"large": true}},
+                {"title": "Missing URL"},
+                {"url": "https://example.org/second"},
+                {"title": "Unsafe scheme", "url": "javascript:alert(1)"}
+            ]}
+        });
+        let normalized = normalize_brave_results("test query", 2, 10, &raw);
+        assert_eq!(normalized["provider"], "brave");
+        assert_eq!(normalized["query"], "test query");
+        assert_eq!(normalized["offset"], 2);
+        assert_eq!(normalized["more_results_available"], true);
+        let results = normalized["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["title"], "Primary source");
+        assert_eq!(results[0]["url"], "https://example.com/report");
+        assert_eq!(results[1]["title"], "https://example.org/second");
+        assert!(results[0].get("irrelevant").is_none());
     }
 
     #[test]

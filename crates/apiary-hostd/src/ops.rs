@@ -984,6 +984,18 @@ mod inference_setup_tests {
         assert!(loopback_url("https://localhost.example.com/v1").is_none());
         assert!(loopback_url("https://api.openai.com/v1").is_none());
     }
+
+    #[test]
+    fn catalog_distinguishes_search_from_known_url_fetching() {
+        let entries = connector_catalog().as_array().unwrap().clone();
+        let search = entries
+            .iter()
+            .find(|entry| entry["kind"] == "web-search")
+            .unwrap();
+        assert_eq!(search["setup"], "credential");
+        assert_eq!(search["caps"]["fetch_public_pages"], true);
+        assert!(entries.iter().any(|entry| entry["kind"] == "web-fetch"));
+    }
 }
 
 // ---------------------------------------------------------------- log pub
@@ -1736,9 +1748,29 @@ pub struct LibraryEntry {
 fn connector_catalog() -> serde_json::Value {
     json!([
         {
+            "id": "web-search-research",
+            "name": "Full web search & research",
+            "description": "Search Brave's independent web index, then open and inspect public sources with the bundled page reader.",
+            "kind": "web-search",
+            "risk": "read-only public network",
+            "publisher": "Apiary + Brave Search",
+            "source": "https://api-dashboard.search.brave.com/documentation/quickstart",
+            "setup": "credential",
+            "credential_label": "Brave Search API key",
+            "caps": {
+                "provider": "brave",
+                "country": "US",
+                "search_lang": "en",
+                "safesearch": "moderate",
+                "max_results": 10,
+                "fetch_public_pages": true,
+                "fetch_max_bytes": 262144
+            }
+        },
+        {
             "id": "web-research",
-            "name": "Web research",
-            "description": "Read any public HTTPS website. Private networks stay blocked and every redirect is rechecked.",
+            "name": "Web page reader",
+            "description": "Open public HTTPS pages when you already have a URL. Private networks stay blocked and every redirect is rechecked.",
             "kind": "web-fetch",
             "risk": "read-only public network",
             "publisher": "Apiary",

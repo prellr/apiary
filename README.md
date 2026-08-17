@@ -46,7 +46,9 @@ model runs). What exists today:
   and the operator's task (proven live: a channel mention asking an agent
   to use its connectors gets a polite refusal)
 - Connectors, default-deny: `nostr-publish` (relay-allowlisted), **`mcp`**
-  (see below), read-only **`web-fetch`** (all public HTTPS sites by default,
+  (see below), read-only **`web-search`** (structured Brave Search results,
+  sealed per-agent API key, bounded queries/results, and an optional bundled
+  public-page reader), read-only **`web-fetch`** (open known public HTTPS URLs,
   with optional domain restriction and DNS-rebinding/redirect checks), **`files`** (named roots, text-type and
   size limits), read-only **`git`** (status/log/diff/show/search with Git
   hooks and external programs disabled), and **`obsidian` / `markdown-vault`** — named markdown

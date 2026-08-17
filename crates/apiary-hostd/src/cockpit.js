@@ -60,7 +60,8 @@ function field(labelText, control, hint) {
 const connectorKindLabel = {
   obsidian: 'Obsidian vault',
   'markdown-vault': 'Markdown folder',
-  'web-fetch': 'Web research',
+  'web-search': 'Full web search & research',
+  'web-fetch': 'Web page reader',
   files: 'Files and documents',
   git: 'Git repositories',
   mcp: 'MCP server',
@@ -1385,6 +1386,13 @@ async function renderConnectors(c) {
   gGo.onclick = async () => {
     if (!gSel.value) return;
     const entry = (lib.library || []).find(e => e.name === gSel.value);
+    const catalog = (lib.catalog || []).find(item => entry && entry.caps && entry.caps.catalog_id === item.id);
+    const needsCredential = catalog && catalog.setup === 'credential';
+    if (needsCredential && !gCred.value) {
+      gStatus.textContent = `${catalog.credential_label || 'credential'} required`;
+      gCred.focus();
+      return;
+    }
     const wantsOauth = entry && entry.caps && entry.caps.oauth_client_id && !gCred.value;
     if (wantsOauth) {
       gStatus.textContent = 'starting OAuth…';
@@ -1455,6 +1463,12 @@ function connectorDetails(card, kind, caps, onAccess) {
     const row = el('div', 'kv'); row.append(el('span', 'k', 'tools'), tv); card.append(row);
   } else if (kind === 'nostr-publish') {
     card.append(kv('access', 'Write only · publish public notes'), kv('relays', (caps.relays || []).join(', ')));
+  } else if (kind === 'web-search') {
+    card.append(kv('provider', caps.provider === 'brave' || !caps.provider ? 'Brave Search API' : caps.provider),
+      kv('results', `up to ${caps.max_results || 10} per search`),
+      kv('region', `${caps.country || 'US'} · ${caps.search_lang || 'en'}`),
+      kv('SafeSearch', caps.safesearch || 'moderate'),
+      kv('page reader', caps.fetch_public_pages ? 'all public HTTPS pages included' : 'not included'));
   } else if (kind === 'web-fetch') {
     card.append(kv('access', caps.allow_all_public ? 'all public HTTPS websites' : (caps.allowed_domains || []).join(', ')));
     if (!caps.allow_all_public) card.append(kv('subdomains', caps.allow_subdomains ? 'allowed' : 'not allowed'));
@@ -1483,6 +1497,7 @@ function capsSummary(kind, caps) {
     return `${where}${caps.oauth_client_id ? ' · OAuth' : ''} · ${access} · tools: ${tools}`;
   }
   if (kind === 'nostr-publish') return `relays: ${(caps.relays || []).join(', ')}`;
+  if (kind === 'web-search') return `Brave Search · up to ${caps.max_results || 10} results · ${caps.country || 'US'}/${caps.search_lang || 'en'}${caps.fetch_public_pages ? ' · public page reader included' : ''}`;
   if (kind === 'web-fetch') return caps.allow_all_public
     ? 'all public HTTPS websites · private networks blocked'
     : `HTTPS: ${(caps.allowed_domains || []).join(', ') || 'no domains'}`;
@@ -1556,7 +1571,7 @@ async function renderLibrary(c) {
       del.onclick = async () => { entries.splice(i, 1); window.__libFlash = `removed ${e.name} (grants already made are untouched)`; await saveLib(); };
       gBtn.onclick = async () => {
         const npub = sel.value; if (!npub) return;
-        const needsSecret = e.kind === 'mcp' && caps.transport === 'http' && !caps.oauth_client_id;
+        const needsSecret = e.kind === 'web-search' || (e.kind === 'mcp' && caps.transport === 'http' && !caps.oauth_client_id);
         if (needsSecret) { gSt.textContent = 'this one needs an API key sealed to the agent — grant it from the agent’s Capabilities'; return; }
         gBtn.disabled = true; gSt.textContent = 'granting…';
         const r = await j(`/api/agents/${encodeURIComponent(npub)}/connectors`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: e.name }) });
@@ -1579,7 +1594,8 @@ async function renderLibrary(c) {
   nName.oninput = () => { nName.dataset.auto = ''; };
   const nKind = el('select');
   const kindLabels = {
-    'web-fetch': 'Web research (all public websites)',
+    'web-search': 'Full web search & research (Brave)',
+    'web-fetch': 'Web page reader (open known URLs)',
     'files': 'Files and documents (read-only folders)',
     'git': 'Git repositories (read-only)',
     'obsidian': 'Obsidian vault (memory + notes tools)',
@@ -1702,6 +1718,33 @@ async function renderLibrary(c) {
         if (restrict.checked && parsed().some(x => !/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(x))) return 'domains must be host names only (no scheme, port, or path)';
         const size = Number(maxKiB.value);
         return Number.isFinite(size) && size >= 16 && size <= 2048 ? null : 'response limit must be between 16 and 2048 KiB';
+      },
+    };
+  };
+  const webSearchBuilder = () => {
+    fields.replaceChildren();
+    const country = el('input'); country.value = 'US'; country.maxLength = 2; country.placeholder = 'US';
+    const language = el('input'); language.value = 'en'; language.maxLength = 5; language.placeholder = 'en';
+    const maxResults = el('input'); maxResults.type = 'number'; maxResults.min = '1'; maxResults.max = '20'; maxResults.value = '10';
+    const safe = el('select');
+    for (const [value, label] of [['moderate', 'Moderate (recommended)'], ['strict', 'Strict'], ['off', 'Off']]) { const option = el('option', null, label); option.value = value; safe.append(option); }
+    const fetch = el('input'); fetch.type = 'checkbox'; fetch.style.width = 'auto'; fetch.checked = true;
+    const fetchLabel = el('label', null, ' include the public HTTPS page reader for full research'); fetchLabel.prepend(fetch);
+    const localeRow = el('div', 'row'); localeRow.append(field('Result country', country, 'Two-letter country code'), field('Search language', language, 'Language code'));
+    fields.append(
+      help('Adds a real search-engine tool backed by the Brave Search API. The API key is not stored in this library entry; paste it only when granting the connector to an agent, where it is encrypted to that agent.'),
+      localeRow,
+      field('Maximum results per query', maxResults, '1–20; the agent may request fewer'),
+      field('SafeSearch', safe, 'Applied by the provider to every query'),
+      fetchLabel,
+      help('With the page reader enabled, one grant supplies both web_search for discovery and web_fetch for reading sources. Private and special-use networks remain blocked.'));
+    current = {
+      caps: () => ({ provider: 'brave', country: country.value.trim().toUpperCase(), search_lang: language.value.trim().toLowerCase(), safesearch: safe.value, max_results: Number(maxResults.value), fetch_public_pages: fetch.checked, fetch_max_bytes: 262144 }),
+      validate: () => {
+        if (!/^[A-Za-z]{2}$/.test(country.value.trim())) return 'country must be a two-letter code';
+        if (!/^[A-Za-z]{2,3}(?:-[A-Za-z]{2})?$/.test(language.value.trim())) return 'enter a short language code such as en';
+        const count = Number(maxResults.value);
+        return Number.isInteger(count) && count >= 1 && count <= 20 ? null : 'maximum results must be between 1 and 20';
       },
     };
   };
@@ -1835,6 +1878,7 @@ async function renderLibrary(c) {
   const pickBuilder = () => {
     nCaps.value = '';
     ({
+      'web-search': webSearchBuilder,
       'web-fetch': webBuilder,
       'files': filesBuilder,
       'git': gitBuilder,
