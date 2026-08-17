@@ -1201,6 +1201,64 @@ pub struct LibraryEntry {
     pub caps: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
+/// Trusted setup templates, not grants. Catalog entries contain no secret
+/// and do not enter an agent manifest until a human configures, grants, and
+/// approves them. Remote registry discovery can sit behind this curated
+/// layer later without making registry publication a trust decision.
+fn connector_catalog() -> serde_json::Value {
+    json!([
+        {
+            "id": "web-research",
+            "name": "Web research",
+            "description": "Read approved HTTPS sites. Redirects are rechecked and private networks are blocked.",
+            "kind": "web-fetch",
+            "risk": "read-only network",
+            "publisher": "Apiary",
+            "source": "built-in",
+            "setup": "domains",
+            "caps": {"allowed_domains": [], "allow_subdomains": false, "max_bytes": 262144}
+        },
+        {
+            "id": "files-readonly",
+            "name": "Files and documents",
+            "description": "List, search, and read approved text files without exposing the rest of the device.",
+            "kind": "files",
+            "risk": "read-only local",
+            "publisher": "Apiary",
+            "source": "built-in",
+            "setup": "folders",
+            "caps": {"roots": [], "extensions": ["txt","md","json","jsonl","yaml","yml","csv","tsv","log","xml","html","toml"], "max_bytes": 262144}
+        },
+        {
+            "id": "git-readonly",
+            "name": "Git repositories",
+            "description": "Inspect status, history, diffs, revisions, and tracked text in approved repositories.",
+            "kind": "git",
+            "risk": "read-only local",
+            "publisher": "Apiary",
+            "source": "built-in",
+            "setup": "repositories",
+            "caps": {"repos": []}
+        },
+        {
+            "id": "github-readonly",
+            "name": "GitHub",
+            "description": "Read repository contents and search code through GitHub's official remote MCP server.",
+            "kind": "mcp",
+            "risk": "read-only account",
+            "publisher": "GitHub",
+            "source": "https://github.com/github/github-mcp-server",
+            "setup": "credential",
+            "credential_label": "GitHub access token",
+            "caps": {
+                "transport": "http",
+                "url": "https://api.githubcopilot.com/mcp/x/repos/readonly",
+                "allowed_tools": ["get_file_contents", "search_code", "search_repositories"]
+            }
+        }
+    ])
+}
+
 fn library_path(state: &AppState) -> std::path::PathBuf {
     state.home.join("connectors.yaml")
 }
@@ -1236,6 +1294,7 @@ pub async fn connectors_get(
             "ok": true,
             "library": lib.connectors,
             "host_binds": apiary_runtime::connector::BOUND_KINDS,
+            "catalog": connector_catalog(),
         }))
         .into_response(),
         Err(e) => e.into_response(),
@@ -1720,10 +1779,14 @@ fn write_grant(
     credential: Option<apiary_core::manifest::EncryptedBlob>,
 ) -> Result<String, Resp> {
     manifest.connectors.retain(|c| c.kind != entry.kind);
+    let mut caps = entry.caps.clone();
+    // Library-only provenance helps the cockpit explain a curated template,
+    // but is not an agent capability and should not travel in its manifest.
+    caps.remove("catalog_id");
     manifest.connectors.push(apiary_core::manifest::Connector {
         kind: entry.kind.clone(),
         credential,
-        caps: entry.caps.clone(),
+        caps,
     });
     let yaml =
         serde_yaml::to_string(manifest).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;

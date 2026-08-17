@@ -46,7 +46,10 @@ model runs). What exists today:
   and the operator's task (proven live: a channel mention asking an agent
   to use its connectors gets a polite refusal)
 - Connectors, default-deny: `nostr-publish` (relay-allowlisted), **`mcp`**
-  (see below), and **`obsidian` / `markdown-vault`** — named markdown
+  (see below), read-only **`web-fetch`** (HTTPS domain allowlist with
+  DNS-rebinding/redirect checks), **`files`** (named roots, text-type and
+  size limits), read-only **`git`** (status/log/diff/show/search with Git
+  hooks and external programs disabled), and **`obsidian` / `markdown-vault`** — named markdown
   knowledge folders (Obsidian vaults, checked-out KB repos, plain note
   dirs) as search/read tools, write only under an explicit cap, every
   path jailed to its vault root. Each grant is a ratified manifest
@@ -208,7 +211,8 @@ explanations:
   mention listener
 - **Connectors** — this agent's grants and revokes; definitions live in the
   **host connector library** (sidebar, host-scoped, shows which agents hold
-  each entry), including MCP servers and OAuth-granted remotes
+  each entry), with curated setup templates for built-in Web, Files, Git,
+  and GitHub, plus advanced MCP servers and OAuth-granted remotes
 - **Credentials** — NIP-44 seal/open against the agent's key
 - **Header** — host status chips, keystore lock/unlock (passphrase lives in
   memory only), npub⇄hex key tool

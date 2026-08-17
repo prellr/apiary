@@ -57,6 +57,17 @@ function field(labelText, control, hint) {
   return label;
 }
 
+const connectorKindLabel = {
+  obsidian: 'Obsidian vault',
+  'markdown-vault': 'Markdown folder',
+  'web-fetch': 'Web research',
+  files: 'Files and documents',
+  git: 'Git repositories',
+  mcp: 'MCP server',
+  'nostr-publish': 'Nostr publish',
+  'mock-echo': 'Test connector',
+};
+
 // ------------------------------------------------------------ host status
 
 async function loadStatus() {
@@ -1045,12 +1056,11 @@ async function renderConnectors(c) {
     'A grant copies a host-library entry into this agent’s manifest, sealing any secret to this agent alone. Every grant or revoke is an amendment — re-ratify in Configuration afterward.');
   const grants = (d.manifest.connectors || []);
   if (!grants.length) gSec.append(kv('grants', 'none — the agent can think and speak, not act'));
-  const kindLabel = { obsidian: 'Obsidian vault', 'markdown-vault': 'Markdown folder', mcp: 'MCP server', 'nostr-publish': 'Nostr publish', 'mock-echo': 'mock' };
   for (const g of grants) {
     const box = el('div', 'ev');
     const row = el('div', 'row');
     const title = (g.caps && g.caps.library_name) || (g.caps && g.caps.vaults && g.caps.vaults[0] && g.caps.vaults[0].name) || g.type;
-    row.append(el('b', null, title), el('span', 'meta', kindLabel[g.type] || g.type), el('span', 'meta', g.credential ? 'credential sealed to this agent' : 'no credential'));
+    row.append(el('b', null, title), el('span', 'meta', connectorKindLabel[g.type] || g.type), el('span', 'meta', g.credential ? 'credential sealed to this agent' : 'no credential'));
     row.append(el('span', 'grow', ''));
     const rv = el('button', 'btn danger', 'REVOKE');
     row.append(rv);
@@ -1117,6 +1127,14 @@ async function renderConnectors(c) {
   gSec.append(gRow,
     help('The secret (if any) is sealed with NIP-44 to this agent’s key at grant time and lands in the manifest as a blob — never stored anywhere else, unreadable by other agents or hosts.'));
   c.append(gSec);
+  const updateGrantHint = () => {
+    const entry = (lib.library || []).find(e => e.name === gSel.value);
+    const catalog = (lib.catalog || []).find(item => entry && entry.caps && entry.caps.catalog_id === item.id);
+    gCred.placeholder = catalog && catalog.credential_label
+      ? catalog.credential_label + ' — encrypted for this agent'
+      : 'secret to seal to this agent (optional)';
+  };
+  gSel.onchange = updateGrantHint; updateGrantHint();
   gGo.onclick = async () => {
     if (!gSel.value) return;
     const entry = (lib.library || []).find(e => e.name === gSel.value);
@@ -1184,6 +1202,16 @@ function connectorDetails(card, kind, caps, onWrite) {
     const row = el('div', 'kv'); row.append(el('span', 'k', 'tools'), tv); card.append(row);
   } else if (kind === 'nostr-publish') {
     card.append(kv('relays', (caps.relays || []).join(', ')));
+  } else if (kind === 'web-fetch') {
+    card.append(kv('domains', (caps.allowed_domains || []).join(', ')),
+      kv('subdomains', caps.allow_subdomains ? 'allowed' : 'not allowed'),
+      kv('response limit', `${Math.round((caps.max_bytes || 262144) / 1024)} KiB`));
+  } else if (kind === 'files') {
+    for (const root of (caps.roots || [])) card.append(kv(root.name, root.path));
+    card.append(kv('access', 'read-only'), kv('file types', (caps.extensions || []).join(', ')));
+  } else if (kind === 'git') {
+    for (const repo of (caps.repos || [])) card.append(kv(repo.name, repo.path));
+    card.append(kv('access', 'read-only · no hooks or external diff programs'));
   } else {
     card.append(kv('caps', JSON.stringify(caps)));
   }
@@ -1200,6 +1228,9 @@ function capsSummary(kind, caps) {
     return `${where}${caps.oauth_client_id ? ' · OAuth' : ''} · tools: ${tools}`;
   }
   if (kind === 'nostr-publish') return `relays: ${(caps.relays || []).join(', ')}`;
+  if (kind === 'web-fetch') return `HTTPS: ${(caps.allowed_domains || []).join(', ') || 'no domains'}`;
+  if (kind === 'files') return `${(caps.roots || []).map(x => `${x.name} → ${x.path}`).join('; ') || 'no roots'} · read-only`;
+  if (kind === 'git') return `${(caps.repos || []).map(x => `${x.name} → ${x.path}`).join('; ') || 'no repositories'} · read-only`;
   return JSON.stringify(caps);
 }
 
@@ -1220,6 +1251,10 @@ async function renderLibrary(c) {
 
   const lSec = section('Entries',
     'Kinds this host binds: ' + (lib.host_binds || []).join(', ') + '.');
+  const catalogSec = section('Recommended connectors',
+    'Trusted templates with narrow defaults. Adding one creates a library entry only; an agent receives nothing until you grant it and ratify the change.');
+  const catalogList = el('div', 'catalog-list');
+  catalogSec.append(catalogList);
   if (window.__libFlash) {
     const f = el('div', 'ev'); f.style.borderColor = 'var(--amber)';
     f.append(el('b', null, '✓ ' + window.__libFlash));
@@ -1232,11 +1267,10 @@ async function renderLibrary(c) {
   const drawList = () => {
     list.replaceChildren();
     if (!entries.length) { list.append(el('div', 'meta', 'no entries yet — add your first below')); return; }
-    const kindLabel = { obsidian: 'Obsidian vault', 'markdown-vault': 'Markdown folder', mcp: 'MCP server', 'nostr-publish': 'Nostr publish', 'mock-echo': 'mock' };
     entries.forEach((e, i) => {
       const card = el('div', 'ev');
       const head = el('div', 'row');
-      head.append(el('b', null, e.name), el('span', 'meta', kindLabel[e.kind] || e.kind));
+      head.append(el('b', null, e.name), el('span', 'meta', connectorKindLabel[e.kind] || e.kind));
       const holders = grantsByKind[e.kind] || [];
       const spacer = el('span', 'grow', ''); head.append(spacer);
       const del = el('button', 'btn danger', 'REMOVE');
@@ -1285,8 +1319,16 @@ async function renderLibrary(c) {
   nName.title = 'How this entry is listed in the library and picked when granting to an agent';
   nName.oninput = () => { nName.dataset.auto = ''; };
   const nKind = el('select');
-  const kindLabels = { 'obsidian': 'Obsidian vault (memory + notes tools)', 'markdown-vault': 'Markdown folder (memory + notes tools)', 'mcp': 'MCP server (tools; stdio or remote/OAuth)', 'nostr-publish': 'Nostr publish (post notes to relays)', 'mock-echo': 'mock-echo (testing)' };
-  for (const k of (lib.host_binds || [])) { const o = el('option', null, kindLabels[k] || k); o.value = k; nKind.append(o); }
+  const kindLabels = {
+    'web-fetch': 'Web research (approved HTTPS domains)',
+    'files': 'Files and documents (read-only folders)',
+    'git': 'Git repositories (read-only)',
+    'obsidian': 'Obsidian vault (memory + notes tools)',
+    'markdown-vault': 'Markdown folder (memory + notes tools)',
+    'mcp': 'MCP server (tools; stdio or remote/OAuth)',
+    'nostr-publish': 'Nostr publish (post notes to relays)',
+  };
+  for (const k of (lib.host_binds || []).filter(k => k !== 'mock-echo')) { const o = el('option', null, kindLabels[k] || k); o.value = k; nKind.append(o); }
   const kindRow = el('div', 'row'); kindRow.append(nName, nKind);
   const fields = el('div');
   const advanced = el('details');
@@ -1297,10 +1339,11 @@ async function renderLibrary(c) {
   const goRow = el('div', 'row'); goRow.append(nGo, lStatus);
   addSec.append(kindRow, fields, advanced, goRow);
   lSec.append(list);
-  c.append(lSec, addSec);
+  c.append(catalogSec, lSec, addSec);
 
   // Per-kind field builders. Each returns { caps() → object, validate() → error|null }.
   let current = null;
+  let selectedCatalogId = null;
   const vaultBuilder = (obsidian) => {
     fields.replaceChildren();
     const rows = [];
@@ -1341,6 +1384,99 @@ async function renderLibrary(c) {
     current = {
       caps: () => ({ vaults: rows.map(x => ({ name: x.n.value.trim(), path: x.pth.value.trim() })).filter(v => v.name && v.path), write: write.checked }),
       validate: () => rows.some(x => x.n.value.trim() && x.pth.value.trim()) ? null : 'add at least one vault (name + path)',
+    };
+  };
+  const namedRootsBuilder = ({ noun, pathHint, helpText }) => {
+    const rows = [];
+    const box = el('div');
+    const addRoot = (name = '', path = '') => {
+      const row = el('div', 'row');
+      const rootName = el('input'); rootName.placeholder = `${noun} name`; rootName.value = name;
+      const rootPath = el('input', 'grow'); rootPath.placeholder = pathHint; rootPath.value = path;
+      const choose = el('button', 'btn', 'CHOOSE…'); choose.type = 'button';
+      const remove = el('button', 'btn', '−'); remove.type = 'button';
+      choose.onclick = async () => {
+        choose.disabled = true;
+        const picked = await j('/api/host/pick-folder', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+        choose.disabled = false;
+        if (picked.ok && picked.path) {
+          rootPath.value = picked.path;
+          const slug = picked.path.split('/').filter(Boolean).pop().toLowerCase().replace(/[^a-z0-9_-]+/g, '-');
+          if (!rootName.value.trim()) rootName.value = slug;
+          if (!nName.value.trim() || nName.dataset.auto === '1') { nName.value = slug; nName.dataset.auto = '1'; }
+        } else if (picked.unavailable) lStatus.textContent = 'no folder picker on this host (headless) — type the path';
+      };
+      rootName.oninput = () => {
+        if (!nName.value.trim() || nName.dataset.auto === '1') { nName.value = rootName.value.trim(); nName.dataset.auto = '1'; }
+      };
+      row.append(rootName, rootPath, choose, remove); box.append(row);
+      const record = { name: rootName, path: rootPath, row }; rows.push(record);
+      remove.onclick = () => { row.remove(); rows.splice(rows.indexOf(record), 1); };
+    };
+    addRoot();
+    const more = el('button', 'btn', `+ another ${noun}`); more.type = 'button'; more.onclick = () => addRoot();
+    fields.append(help(helpText), box, more);
+    return {
+      values: () => rows.map(x => ({ name: x.name.value.trim(), path: x.path.value.trim() })).filter(x => x.name && x.path),
+      valid: () => rows.some(x => x.name.value.trim() && x.path.value.trim()),
+    };
+  };
+  const webBuilder = () => {
+    fields.replaceChildren();
+    const domains = el('textarea'); domains.rows = 3; domains.placeholder = 'docs.example.com\napi.example.com';
+    const subdomains = el('input'); subdomains.type = 'checkbox'; subdomains.style.width = 'auto';
+    const subdomainsLabel = el('label', null, ' also allow subdomains of each domain'); subdomainsLabel.prepend(subdomains);
+    const maxKiB = el('input'); maxKiB.type = 'number'; maxKiB.min = '16'; maxKiB.max = '2048'; maxKiB.value = '256';
+    const limitRow = el('div', 'row'); limitRow.append(field('Maximum response (KiB)', maxKiB, '16–2048 KiB'));
+    fields.append(
+      help('HTTPS only. Enter host names—not URLs or paths. DNS is resolved and pinned for each request; loopback, private, link-local, and other special-use addresses are refused, including after redirects.'),
+      field('Approved domains', domains, 'One per line or comma-separated. Exact hosts only unless you allow subdomains.'),
+      subdomainsLabel, limitRow);
+    const parsed = () => domains.value.split(/[\s,]+/).map(x => x.trim().toLowerCase()).filter(Boolean);
+    current = {
+      caps: () => ({ allowed_domains: [...new Set(parsed())], allow_subdomains: subdomains.checked, max_bytes: Number(maxKiB.value) * 1024 }),
+      validate: () => {
+        if (!parsed().length) return 'add at least one approved domain';
+        if (parsed().some(x => !/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(x))) return 'domains must be host names only (no scheme, port, or path)';
+        const size = Number(maxKiB.value);
+        return Number.isFinite(size) && size >= 16 && size <= 2048 ? null : 'response limit must be between 16 and 2048 KiB';
+      },
+    };
+  };
+  const filesBuilder = () => {
+    fields.replaceChildren();
+    const roots = namedRootsBuilder({
+      noun: 'folder',
+      pathHint: '/Users/you/Documents/project',
+      helpText: 'The agent can list, search, and read matching text files under only these folders. Symlinks that escape a folder are refused. There are no create, edit, move, or delete tools.',
+    });
+    const extensions = el('input'); extensions.value = 'txt, md, json, jsonl, yaml, yml, csv, tsv, log, xml, html, toml';
+    const maxKiB = el('input'); maxKiB.type = 'number'; maxKiB.min = '16'; maxKiB.max = '1024'; maxKiB.value = '256';
+    const hidden = el('input'); hidden.type = 'checkbox'; hidden.style.width = 'auto';
+    const hiddenLabel = el('label', null, ' include hidden files and folders (usually unsafe)'); hiddenLabel.prepend(hidden);
+    fields.append(field('Allowed file extensions', extensions, 'Comma-separated, without dots.'), field('Maximum file size (KiB)', maxKiB, '16–1024 KiB'), hiddenLabel);
+    const parsedExtensions = () => extensions.value.split(/[\s,]+/).map(x => x.trim().replace(/^\./, '').toLowerCase()).filter(Boolean);
+    current = {
+      caps: () => ({ roots: roots.values(), extensions: [...new Set(parsedExtensions())], max_bytes: Number(maxKiB.value) * 1024, include_hidden: hidden.checked }),
+      validate: () => {
+        if (!roots.valid()) return 'add at least one folder (name + path)';
+        if (!parsedExtensions().length || parsedExtensions().some(x => !/^[a-z0-9][a-z0-9_-]*$/.test(x))) return 'add one or more simple file extensions';
+        const size = Number(maxKiB.value);
+        return Number.isFinite(size) && size >= 16 && size <= 1024 ? null : 'file limit must be between 16 and 1024 KiB';
+      },
+    };
+  };
+  const gitBuilder = () => {
+    fields.replaceChildren();
+    const repos = namedRootsBuilder({
+      noun: 'repository',
+      pathHint: '/Users/you/code/project',
+      helpText: 'Read-only Git inspection: status, log, diff, show, and tracked-text search. Apiary invokes Git directly with hooks, external diff programs, pagers, and global configuration disabled.',
+    });
+    fields.append(help('Each selected folder must already be a Git repository. Working-tree changes can be read but never modified.'));
+    current = {
+      caps: () => ({ repos: repos.values() }),
+      validate: () => repos.valid() ? null : 'add at least one repository (name + path)',
     };
   };
   const mcpBuilder = () => {
@@ -1422,9 +1558,17 @@ async function renderLibrary(c) {
   const mockBuilder = () => { fields.replaceChildren(); fields.append(help('Echoes its input — for tests.')); current = { caps: () => ({}), validate: () => null }; };
   const pickBuilder = () => {
     nCaps.value = '';
-    ({ 'obsidian': () => vaultBuilder(true), 'markdown-vault': () => vaultBuilder(false), 'mcp': mcpBuilder, 'nostr-publish': nostrBuilder }[nKind.value] || mockBuilder)();
+    ({
+      'web-fetch': webBuilder,
+      'files': filesBuilder,
+      'git': gitBuilder,
+      'obsidian': () => vaultBuilder(true),
+      'markdown-vault': () => vaultBuilder(false),
+      'mcp': mcpBuilder,
+      'nostr-publish': nostrBuilder,
+    }[nKind.value] || mockBuilder)();
   };
-  nKind.onchange = pickBuilder;
+  nKind.onchange = () => { selectedCatalogId = null; pickBuilder(); };
   pickBuilder();
 
   const saveLib = async () => {
@@ -1435,7 +1579,46 @@ async function renderLibrary(c) {
     lStatus.textContent = r.ok ? `saved (${r.count} entries)` : 'rejected: ' + r.error;
     if (r.ok) render();
   };
+  const uniqueName = (base) => {
+    const slug = base.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-|-$/g, '') || 'connector';
+    if (!entries.some(e => e.name === slug)) return slug;
+    let suffix = 2;
+    while (entries.some(e => e.name === `${slug}-${suffix}`)) suffix++;
+    return `${slug}-${suffix}`;
+  };
+  const drawCatalog = () => {
+    catalogList.replaceChildren();
+    for (const item of (lib.catalog || [])) {
+      const card = el('article', 'catalog-item');
+      card.append(el('h4', null, item.name), el('p', null, item.description));
+      const meta = el('div', 'catalog-meta');
+      meta.append(el('span', null, item.publisher), el('span', 'risk', item.risk));
+      const row = el('div', 'row'); row.append(meta, el('span', 'grow', ''));
+      const installed = entries.find(e => e.caps && e.caps.catalog_id === item.id);
+      const action = el('button', 'btn', installed ? 'ADDED ✓' : (item.setup === 'credential' ? 'ADD TO LIBRARY' : 'CONFIGURE'));
+      action.disabled = !!installed;
+      row.append(action); card.append(row); catalogList.append(card);
+      action.onclick = async () => {
+        if (item.setup === 'credential') {
+          action.disabled = true; action.textContent = 'ADDING…';
+          const caps = JSON.parse(JSON.stringify(item.caps || {})); caps.catalog_id = item.id;
+          entries.push({ name: uniqueName(item.name), kind: item.kind, caps });
+          window.__libFlash = `added ${item.name} — grant it from an agent’s Capabilities and seal the requested credential there`;
+          await saveLib();
+          return;
+        }
+        selectedCatalogId = item.id;
+        nKind.value = item.kind;
+        nName.value = uniqueName(item.name);
+        nName.dataset.auto = '1';
+        pickBuilder();
+        addSec.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        fields.querySelector('input, textarea, select')?.focus();
+      };
+    }
+  };
   drawList();
+  drawCatalog();
   const flag = (elm, msg) => {
     lStatus.textContent = msg; lStatus.style.color = '#e07070';
     if (elm) { elm.style.outline = '2px solid #e07070'; elm.focus(); setTimeout(() => { elm.style.outline = ''; }, 2500); }
@@ -1453,6 +1636,7 @@ async function renderLibrary(c) {
     if (!nName.value.trim()) { flag(nName, 'name this library entry (top-left field) — e.g. the vault’s name'); return; }
     const name = nName.value.trim().replace(/[^A-Za-z0-9_-]/g, '-');
     if (entries.some(e => e.name === name)) { flag(nName, `“${name}” already exists in the library`); return; }
+    if (selectedCatalogId) caps.catalog_id = selectedCatalogId;
     nGo.disabled = true; nGo.textContent = 'ADDING…';
     entries.push({ name, kind: nKind.value, caps });
     window.__libFlash = `added ${name} (${nKind.value}) — now GRANT it from an agent’s Capabilities, then ratify`;
