@@ -76,6 +76,7 @@ async fn main() {
         listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
         pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
         supervisor_notes: std::sync::Mutex::new(std::collections::HashMap::new()),
+        admitted: std::sync::Mutex::new(std::collections::HashMap::new()),
         admins,
     });
     apiary_hostd::ops::spawn_supervisor(state.clone());

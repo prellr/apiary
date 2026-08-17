@@ -182,6 +182,7 @@ mod tests {
             pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             admins: Vec::new(),
             supervisor_notes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            admitted: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 

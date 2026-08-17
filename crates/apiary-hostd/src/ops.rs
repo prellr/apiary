@@ -227,6 +227,9 @@ pub async fn lock(
     if let Err(e) = nip98::authorize_admin(&state, signer) {
         return e.into_response();
     }
+    if let Ok(mut m) = state.admitted.lock() {
+        m.clear(); // decrypted material goes with the passphrase
+    }
     if let Ok(mut g) = state.passphrase.write() {
         *g = None;
     }

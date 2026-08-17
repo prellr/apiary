@@ -54,6 +54,11 @@ pub struct AppState {
     /// Last supervisor outcome per agent (contested lease, failed start…),
     /// surfaced by the listener status endpoint.
     pub supervisor_notes: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Decrypted agent keys, cached while UNLOCKED so a run does not pay
+    /// NIP-49 scrypt (seconds in debug builds) every time. Same trust
+    /// posture as holding the passphrase, which derives exactly these;
+    /// cleared on lock. Keyed by npub.
+    pub admitted: std::sync::Mutex<std::collections::HashMap<String, nostr::prelude::Keys>>,
 }
 
 impl AppState {
@@ -717,7 +722,21 @@ pub fn admit_agent(
     let pass = state
         .passphrase_clone()
         .ok_or("keystore is locked — unlock with the passphrase first")?;
-    let keys = ks.load(npub, &pass).map_err(|e| e.to_string())?;
+    let cached = state
+        .admitted
+        .lock()
+        .ok()
+        .and_then(|m| m.get(npub).cloned());
+    let keys = match cached {
+        Some(k) => k,
+        None => {
+            let k = ks.load(npub, &pass).map_err(|e| e.to_string())?;
+            if let Ok(mut m) = state.admitted.lock() {
+                m.insert(npub.to_string(), k.clone());
+            }
+            k
+        }
+    };
     let mut custody = Custody::new();
     let handle = custody.admit(keys);
     Ok((custody, handle))
