@@ -1056,6 +1056,12 @@ async function renderLibrary(c) {
 
   const lSec = section('Entries',
     'Kinds this host binds: ' + (lib.host_binds || []).join(', ') + '.');
+  if (window.__libFlash) {
+    const f = el('div', 'ev'); f.style.borderColor = 'var(--amber)';
+    f.append(el('b', null, '✓ ' + window.__libFlash));
+    lSec.append(f);
+    window.__libFlash = null;
+  }
   const entries = (lib.library || []).slice();
   const list = el('div');
   const lStatus = el('span', 'meta', '');
@@ -1080,7 +1086,9 @@ async function renderLibrary(c) {
   // ---- add: a form per kind (JSON is the advanced view, not the way in)
   const addSec = section('Add a connector',
     'Pick a kind and fill in the fields. Nothing here is secret — secrets are sealed to an agent at grant time. Removing a library entry does not revoke grants; those live in agent manifests.');
-  const nName = el('input'); nName.placeholder = 'name (e.g. my-notes)';
+  const nName = el('input'); nName.placeholder = 'library name (e.g. my-notes)';
+  nName.title = 'How this entry is listed in the library and picked when granting to an agent';
+  nName.oninput = () => { nName.dataset.auto = ''; };
   const nKind = el('select');
   const kindLabels = { 'obsidian': 'Obsidian vault (memory + notes tools)', 'markdown-vault': 'Markdown folder (memory + notes tools)', 'mcp': 'MCP server (tools; stdio or remote/OAuth)', 'nostr-publish': 'Nostr publish (post notes to relays)', 'mock-echo': 'mock-echo (testing)' };
   for (const k of (lib.host_binds || [])) { const o = el('option', null, kindLabels[k] || k); o.value = k; nKind.append(o); }
@@ -1114,9 +1122,12 @@ async function renderLibrary(c) {
         choose.disabled = false;
         if (r.ok && r.path) {
           pth.value = r.path;
-          if (!n.value.trim()) n.value = r.path.split('/').filter(Boolean).pop().toLowerCase().replace(/[^a-z0-9_-]+/g, '-');
+          const slug = r.path.split('/').filter(Boolean).pop().toLowerCase().replace(/[^a-z0-9_-]+/g, '-');
+          if (!n.value.trim()) n.value = slug;
+          if (!nName.value.trim()) nName.value = slug; // the library entry name, too
         } else if (r.unavailable) { lStatus.textContent = 'no folder picker on this host (headless) — type the path'; }
       };
+      n.oninput = () => { if (!nName.value.trim() || nName.dataset.auto === '1') { nName.value = n.value.trim(); nName.dataset.auto = '1'; } };
       const rm = el('button', 'btn', '−');
       r.append(n, pth, choose, rm); vaultsBox.append(r); rows.push({ n, pth, r });
       rm.onclick = () => { r.remove(); rows.splice(rows.findIndex(x => x.r === r), 1); };
@@ -1230,18 +1241,28 @@ async function renderLibrary(c) {
     if (r.ok) render();
   };
   drawList();
+  const flag = (elm, msg) => {
+    lStatus.textContent = msg; lStatus.style.color = '#e07070';
+    if (elm) { elm.style.outline = '2px solid #e07070'; elm.focus(); setTimeout(() => { elm.style.outline = ''; }, 2500); }
+  };
   nGo.onclick = async () => {
+    lStatus.style.color = '';
     let caps;
     if (nCaps.value.trim()) {
-      try { caps = JSON.parse(nCaps.value); } catch { lStatus.textContent = 'advanced caps is not valid JSON'; return; }
+      try { caps = JSON.parse(nCaps.value); } catch { flag(nCaps, 'advanced caps is not valid JSON'); return; }
     } else {
       const bad = current.validate();
-      if (bad) { lStatus.textContent = bad; return; }
+      if (bad) { flag(fields.querySelector('input, select'), bad); return; }
       caps = current.caps();
     }
-    if (!nName.value.trim()) { lStatus.textContent = 'give it a name'; return; }
-    entries.push({ name: nName.value.trim().replace(/[^A-Za-z0-9_-]/g, '-'), kind: nKind.value, caps });
+    if (!nName.value.trim()) { flag(nName, 'name this library entry (top-left field) — e.g. the vault’s name'); return; }
+    const name = nName.value.trim().replace(/[^A-Za-z0-9_-]/g, '-');
+    if (entries.some(e => e.name === name)) { flag(nName, `“${name}” already exists in the library`); return; }
+    nGo.disabled = true; nGo.textContent = 'ADDING…';
+    entries.push({ name, kind: nKind.value, caps });
+    window.__libFlash = `added ${name} (${nKind.value}) — now GRANT it from an agent’s Connectors tab, then ratify`;
     await saveLib();
+    nGo.disabled = false; nGo.textContent = 'ADD TO LIBRARY';
   };
 
   const libRow = el('div', 'row');
