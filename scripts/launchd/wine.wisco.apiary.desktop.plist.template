@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>wine.wisco.apiary.desktop</string>
+  <key>ProgramArguments</key><array>
+    <string>/Users/Storage/Apiary/target/release/apiary-desktop</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    <key>HOME</key><string>$HOME</string>
+    <key>APIARY_PASSPHRASE</key><string>YOUR-KEYSTORE-PASSPHRASE</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>$HOME/.apiary/logs/desktop.log</string>
+  <key>StandardErrorPath</key><string>$HOME/.apiary/logs/desktop.log</string>
+</dict></plist>
