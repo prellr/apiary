@@ -155,6 +155,7 @@ async function render() {
   if (hostView === 'found') return renderFound(c);
   if (hostView === 'import') return renderImport(c);
   if (!sel) { c.append(el('div', 'empty', 'select an agent — or open the host connector library from the sidebar')); return; }
+  await ratifyBanner(c);
   if (tab === 'overview') return renderOverview(c);
   if (tab === 'run') return renderRun(c);
   if (tab === 'log') return renderLog(c);
@@ -166,6 +167,41 @@ async function render() {
 }
 
 // ------------------------------------------------------------ overview
+
+// ------------------------------------------------------- ratify banner
+
+/// Amendments (grants, routines, caps, proposals) leave the manifest
+/// UNRATIFIED — nothing runs until a governor countersigns. Say so on
+/// every tab, with the button right there.
+async function ratifyBanner(c) {
+  const a = agents.find(x => x.npub === sel);
+  if (!a || a.ratified) return;
+  const box = el('div', 'ev');
+  box.style.borderColor = '#e0a040';
+  const head = el('div', 'row');
+  head.append(el('b', null, `${a.name || 'this agent'} has an unratified manifest — nothing runs until you ratify`));
+  box.append(head);
+  const row = el('div', 'row');
+  const who = el('select');
+  // Governor keys held in this keystore = agents whose npub is (or contains) a suspend key.
+  const d = await j(api('/manifest'));
+  const keys = (d.ok && d.manifest && d.manifest.governance && d.manifest.governance.suspend_keys) || [];
+  const holders = agents.filter(x => keys.some(k => k.includes(x.npub) || x.npub.includes(k)));
+  let anyKey = false;
+  for (const h of holders) { const o = el('option', null, h.name || h.npub.slice(0, 16)); o.value = h.npub; who.append(o); anyKey = true; }
+  const rat = el('button', 'btn solid', 'RATIFY NOW');
+  const st = el('span', 'meta', anyKey ? 'as:' : 'no keystore-held governor key on this host — use the Manifest tab (external ratification) or the CLI');
+  if (anyKey) row.append(st, who, rat); else row.append(st);
+  box.append(row, help('A grant, a routine, a caps change, an accepted proposal — each is an amendment. Ratifying signs the manifest hash twice (agent, then your key); the supervisor restarts presence and routines under the new constitution.'));
+  c.append(box);
+  rat.onclick = async () => {
+    rat.disabled = true; st.textContent = 'ratifying… (two NIP-49 key loads; slow by design)';
+    const r = await j(api('/ratify'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ as: who.value }) });
+    st.textContent = r.ok ? 'ratified ✓' : 'refused: ' + r.error;
+    rat.disabled = false;
+    if (r.ok) { await loadRoster(); render(); }
+  };
+}
 
 // ------------------------------------------------------ proposal banner
 
