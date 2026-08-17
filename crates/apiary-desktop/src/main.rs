@@ -87,7 +87,20 @@ fn main() {
 
     let url = format!("http://127.0.0.1:{port}/?token={token}");
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
+            // The cockpit's "Choose…" buttons ask the daemon, which asks us
+            // for the native folder dialog (called from a blocking task,
+            // never the main thread).
+            let handle = app.handle().clone();
+            apiary_hostd::ops::set_folder_picker(Box::new(move || {
+                use tauri_plugin_dialog::DialogExt;
+                handle
+                    .dialog()
+                    .file()
+                    .blocking_pick_folder()
+                    .map(|p| p.to_string())
+            }));
             tauri::WebviewWindowBuilder::new(
                 app,
                 "main",

@@ -1051,8 +1051,19 @@ async function renderLibrary(c) {
       const r = el('div', 'row');
       const n = el('input'); n.placeholder = 'vault name (e.g. notes)'; n.value = name;
       const pth = el('input', 'grow'); pth.placeholder = obsidian ? '/Users/you/Obsidian/MyVault' : '/Users/you/repos/some-kb/docs'; pth.value = path;
+      const choose = el('button', 'btn', 'CHOOSE…');
+      choose.title = 'open the system folder picker';
+      choose.onclick = async () => {
+        choose.disabled = true;
+        const r = await j('/api/host/pick-folder', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+        choose.disabled = false;
+        if (r.ok && r.path) {
+          pth.value = r.path;
+          if (!n.value.trim()) n.value = r.path.split('/').filter(Boolean).pop().toLowerCase().replace(/[^a-z0-9_-]+/g, '-');
+        } else if (r.unavailable) { lStatus.textContent = 'no folder picker on this host (headless) — type the path'; }
+      };
       const rm = el('button', 'btn', '−');
-      r.append(n, pth, rm); vaultsBox.append(r); rows.push({ n, pth, r });
+      r.append(n, pth, choose, rm); vaultsBox.append(r); rows.push({ n, pth, r });
       rm.onclick = () => { r.remove(); rows.splice(rows.findIndex(x => x.r === r), 1); };
     };
     addVault();

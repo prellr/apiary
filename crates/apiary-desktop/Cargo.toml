@@ -18,4 +18,5 @@ apiary-hostd = { path = "../apiary-hostd" }
 axum = "0.8"
 serde_json.workspace = true
 tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

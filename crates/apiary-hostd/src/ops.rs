@@ -1108,6 +1108,49 @@ pub struct LibraryBody {
     library: Vec<LibraryEntry>,
 }
 
+/// Native folder picker, provided by the desktop (Tauri dialog) when the
+/// daemon runs inside it. Headless hostd has none — the cockpit falls
+/// back to a typed path.
+pub type FolderPicker = dyn Fn() -> Option<String> + Send + Sync;
+static FOLDER_PICKER: std::sync::OnceLock<Box<FolderPicker>> = std::sync::OnceLock::new();
+pub fn set_folder_picker(f: Box<FolderPicker>) {
+    let _ = FOLDER_PICKER.set(f);
+}
+
+/// POST /api/host/pick-folder — open the system folder dialog and return
+/// the chosen path (admin). {ok:false, unavailable:true} when headless.
+pub async fn pick_folder(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let pq = uri
+        .path_and_query()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| uri.path().to_string());
+    let signer = match nip98::check(&state, &headers, "POST", &pq, Some(&raw_body)) {
+        Ok(sig) => sig,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = nip98::authorize_admin(&state, signer) {
+        return e.into_response();
+    }
+    let Some(picker) = FOLDER_PICKER.get() else {
+        return Json(json!({"ok": false, "unavailable": true, "error": "no native folder picker on this host — type the path"})).into_response();
+    };
+    // Must NOT run on the UI main thread (the dialog blocks it) — a
+    // blocking task is exactly right.
+    let picked = tokio::task::spawn_blocking(move || picker())
+        .await
+        .ok()
+        .flatten();
+    match picked {
+        Some(p) => Json(json!({"ok": true, "path": p})).into_response(),
+        None => Json(json!({"ok": false, "cancelled": true})).into_response(),
+    }
+}
+
 /// POST /api/connectors/discover — probe an MCP configuration and return
 /// its tools, so a human can pick `allowed_tools` from a list instead of
 /// guessing names. Body: {"caps": {...mcp caps...}, "bearer": "…"?}. For
