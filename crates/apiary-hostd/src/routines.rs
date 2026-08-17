@@ -27,13 +27,6 @@ fn running() -> &'static Mutex<std::collections::HashSet<String>> {
     R.get_or_init(|| Mutex::new(Default::default()))
 }
 
-/// Delivered-event sink for the companion (piece 4 wires the SSE bus).
-pub type DeliveredHook = dyn Fn(&str, &str, &str, &serde_json::Value) + Send + Sync;
-static DELIVERED_HOOK: OnceLock<Box<DeliveredHook>> = OnceLock::new();
-pub fn set_delivered_hook(f: Box<DeliveredHook>) {
-    let _ = DELIVERED_HOOK.set(f);
-}
-
 /// One supervisor tick over all agents.
 pub fn reconcile_routines(state: &App) {
     let Ok(ks) = Keystore::open(&state.home) else {
@@ -445,13 +438,22 @@ fn deliver(
         return json!({"nostr": "publish", "event": event.id.to_hex(), "relays": acks});
     }
     if d.companion {
-        // Piece 4: the SSE bus. Until then, honest about it.
-        if let Some(h) = DELIVERED_HOOK.get() {
-            h(npub, routine, text, &json!({"as_voice": d.as_voice}));
-            return json!({"companion": true, "queued": true});
-        }
+        // The live bus: spoken by whichever apiary-voice is subscribed.
+        // Nobody listening → recorded as undelivered (the log still has
+        // the text; a chat target on the same routine still gets its copy).
         let _ = state;
-        return json!({"companion": true, "undelivered": "no companion bus"});
+        let n = crate::events::publish(json!({
+            "type": "routine.delivered",
+            "npub": npub,
+            "routine": routine,
+            "text": text,
+            "as_voice": d.as_voice,
+        }));
+        return if n > 0 {
+            json!({"companion": true, "subscribers": n})
+        } else {
+            json!({"companion": true, "undelivered": "no companion connected"})
+        };
     }
     json!({"error": "no target"})
 }

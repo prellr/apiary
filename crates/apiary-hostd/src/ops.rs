@@ -1141,10 +1141,7 @@ pub async fn pick_folder(
     };
     // Must NOT run on the UI main thread (the dialog blocks it) — a
     // blocking task is exactly right.
-    let picked = tokio::task::spawn_blocking(picker)
-        .await
-        .ok()
-        .flatten();
+    let picked = tokio::task::spawn_blocking(picker).await.ok().flatten();
     match picked {
         Some(p) => Json(json!({"ok": true, "path": p})).into_response(),
         None => Json(json!({"ok": false, "cancelled": true})).into_response(),

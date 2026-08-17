@@ -9,6 +9,7 @@
 //! (SPEC §2), never a second implementation.
 
 pub mod agui;
+pub mod events;
 pub mod nip98;
 pub mod ops;
 pub mod routines;
@@ -91,6 +92,7 @@ pub fn build_router(state: App) -> Router {
         )
         .route("/api/connectors/discover", post(ops::connectors_discover))
         .route("/api/host/pick-folder", post(ops::pick_folder))
+        .route("/api/events", get(events::events))
         .route(
             "/api/agents/{npub}/connectors/{name}/discover",
             post(ops::agent_connector_discover),
