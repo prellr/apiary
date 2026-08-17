@@ -60,3 +60,31 @@ Try it:
 ```bash
 echo '{"op":"probe"}' | ~/.apiary/bin/apple-speech
 ```
+
+## kokoro (any host with Python; ~300 MB resident)
+
+[Kokoro-82M](https://github.com/hexgrad/kokoro) (Apache-2.0) as a local
+text-to-speech server — markedly better voices than the system defaults, at
+82M parameters (M-series GPU via MPS, or CPU). It speaks the OpenAI
+`/v1/audio/speech` shape on 127.0.0.1:8880, so it plugs into the `speak`
+slot's `openai` binding keylessly and apiary-voice can use the same voice.
+
+```bash
+brew install espeak-ng ffmpeg          # phonemizer + opus for Telegram
+services/kokoro/run.sh                 # venv + weights on first run, then serves
+curl -s localhost:8880/health
+```
+
+Manifest:
+
+```yaml
+inference:
+  - name: speak
+    provider: openai                   # OpenAI-shape endpoint…
+    requires:
+      base_url: http://127.0.0.1:8880/v1   # …served locally; keyless
+      voice: af_heart                  # af_* / am_* American, bf_* / bm_* British
+```
+
+The model loads once and stays resident; each reply is one forward pass.
+`GET /v1/audio/voices` lists the 28 English voices.

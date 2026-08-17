@@ -73,20 +73,29 @@ pub fn bind_speaker(
         })),
         "macos-say" => Some(Box::new(MacosSay { voice })),
         "openai" => {
-            let key = credential.or_else(|| {
-                std::env::var("OPENAI_API_KEY")
-                    .ok()
-                    .filter(|k| !k.is_empty())
-                    .map(Zeroizing::new)
-            })?;
+            let base_url = slot
+                .requires
+                .get("base_url")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            // Same rule as the inference provider: a compatible endpoint
+            // named by base_url may be keyless (a local Kokoro server); the
+            // hosted default is not.
+            let key = credential
+                .or_else(|| {
+                    std::env::var("OPENAI_API_KEY")
+                        .ok()
+                        .filter(|k| !k.is_empty())
+                        .map(Zeroizing::new)
+                })
+                .or_else(|| {
+                    base_url
+                        .as_ref()
+                        .map(|_| Zeroizing::new("local".to_string()))
+                })?;
             Some(Box::new(OpenAiSpeaker {
                 key,
-                base_url: slot
-                    .requires
-                    .get("base_url")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| "https://api.openai.com/v1".into()),
+                base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
                 model: slot.model.clone().unwrap_or_else(|| "tts-1".into()),
                 voice: slot
                     .requires
@@ -317,14 +326,25 @@ impl Speaker for OpenAiSpeaker {
             .map_err(|e| crate::Error::Provider(format!("openai speech: {e}")))?
             .error_for_status()
             .map_err(|e| crate::Error::Provider(format!("openai speech: {e}")))?;
+        let media_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.split(';').next().unwrap_or(s).trim().to_string())
+            .unwrap_or_else(|| "audio/ogg".into());
+        let duration_secs = resp
+            .headers()
+            .get("x-duration-secs")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<f32>().ok());
         let bytes = resp
             .bytes()
             .map_err(|e| crate::Error::Provider(format!("openai speech body: {e}")))?
             .to_vec();
         Ok(Speech {
-            media_type: "audio/ogg".into(),
+            media_type,
             bytes,
-            duration_secs: None,
+            duration_secs,
             engine: self.id(),
         })
     }
