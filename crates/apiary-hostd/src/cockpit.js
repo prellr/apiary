@@ -1816,12 +1816,19 @@ async function renderLibrary(c) {
   };
   const nostrBuilder = () => {
     fields.replaceChildren();
-    const relays = el('input', 'grow'); relays.placeholder = 'wss://nos.lol, wss://relay.damus.io'; relays.value = 'wss://nos.lol, wss://relay.damus.io';
-    const r = el('div', 'row'); r.append(relays);
-    fields.append(help('The agent may publish public notes (kind 1) signed with its own key — only to these relays. This is the allowlist; the agent cannot add relays.'), r);
+    const relays = el('textarea', 'address-list'); relays.rows = 4;
+    relays.placeholder = 'wss://nos.lol\nwss://relay.damus.io';
+    relays.value = 'wss://nos.lol\nwss://relay.damus.io';
+    const relayValues = () => relays.value.split(/[\s,]+/).map(x => x.trim()).filter(Boolean);
+    fields.append(help('The agent may publish public notes (kind 1) signed with its own key — only to these relays. This is the allowlist; the agent cannot add relays.'),
+      field('Relay addresses', relays, 'Enter one WebSocket address per line. Comma-separated paste also works.'));
     current = {
-      caps: () => ({ relays: relays.value.split(',').map(x => x.trim()).filter(Boolean) }),
-      validate: () => relays.value.split(',').some(x => /^wss?:\/\//.test(x.trim())) ? null : 'at least one wss:// relay',
+      caps: () => ({ relays: relayValues() }),
+      validate: () => {
+        const values = relayValues();
+        if (!values.length) return 'add at least one relay address';
+        return values.every(x => /^wss?:\/\//.test(x)) ? null : 'each relay must begin with wss:// or ws://';
+      },
     };
   };
   const mockBuilder = () => { fields.replaceChildren(); fields.append(help('Echoes its input — for tests.')); current = { caps: () => ({}), validate: () => null }; };
