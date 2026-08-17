@@ -243,6 +243,7 @@ impl Connector for MockEcho {
 ///     env: []                    # env var NAMES passed through (scrubbed otherwise)
 ///     url: https://…/mcp         # http only
 ///     allowed_tools: [read_text_file, list_directory]   # REQUIRED; ["*"] = all
+///     access: read-only          # or "read-write"; absent preserves legacy behavior
 ///   credential: <nip44 blob>     # http only: bearer token or OAuth JSON
 /// ```
 ///
@@ -275,6 +276,15 @@ fn bind_mcp(
                 .into(),
         ));
     }
+    let read_only = match cap_str("access").as_deref() {
+        Some("read-only") => true,
+        Some("read-write") | None => false,
+        Some(other) => {
+            return Err(crate::Error::Provider(format!(
+                "mcp caps.access '{other}' is invalid (read-only | read-write)"
+            )))
+        }
+    };
     let transport = cap_str("transport").unwrap_or_else(|| "stdio".into());
     // Sealed credential: either a raw bearer token or an OAuth JSON object
     // ({"type":"oauth","access_token":…}). Opened just-in-time, per use.
@@ -321,14 +331,17 @@ fn bind_mcp(
     let wildcard = allowed.iter().any(|a| a == "*");
     let granted: Vec<crate::mcp::McpTool> = tools
         .into_iter()
-        .filter(|t| wildcard || allowed.contains(&t.name))
+        .filter(|t| mcp_tool_allowed(t, &allowed, wildcard, read_only))
         .collect();
     if granted.is_empty() {
-        return Err(crate::Error::Provider(
+        let message = if read_only {
+            "mcp: no allowed tool is explicitly marked readOnlyHint=true; \
+             unmarked tools fail closed in read-only mode"
+        } else {
             "mcp: server offered no tool matching caps.allowed_tools — \
              check the allowlist against the server's actual tool names"
-                .into(),
-        ));
+        };
+        return Err(crate::Error::Provider(message.into()));
     }
     let shared = Arc::new(Mutex::new(client));
     let mut out: Vec<Box<dyn Connector>> = Vec::new();
@@ -348,6 +361,15 @@ fn bind_mcp(
         }));
     }
     Ok(out)
+}
+
+fn mcp_tool_allowed(
+    tool: &crate::mcp::McpTool,
+    allowed: &[String],
+    wildcard: bool,
+    read_only: bool,
+) -> bool {
+    (wildcard || allowed.contains(&tool.name)) && (!read_only || tool.read_only)
 }
 
 struct McpToolConnector {
@@ -1976,5 +1998,24 @@ mod connector_security_tests {
         .unwrap();
         assert!(out.contains("note.txt"));
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn mcp_read_only_fails_closed_on_unmarked_tools() {
+        let read = crate::mcp::McpTool {
+            name: "read".into(),
+            description: String::new(),
+            input_schema: json!({"type":"object"}),
+            read_only: true,
+        };
+        let write = crate::mcp::McpTool {
+            name: "write".into(),
+            description: String::new(),
+            input_schema: json!({"type":"object"}),
+            read_only: false,
+        };
+        assert!(mcp_tool_allowed(&read, &[], true, true));
+        assert!(!mcp_tool_allowed(&write, &[], true, true));
+        assert!(mcp_tool_allowed(&write, &["write".into()], false, false));
     }
 }

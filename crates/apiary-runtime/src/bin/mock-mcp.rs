@@ -47,6 +47,7 @@ fn main() {
                         "jsonrpc": "2.0", "id": id,
                         "result": {"tools": [
                             {"name": "echo", "description": "Echo the input",
+                             "annotations": {"readOnlyHint": true},
                              "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}}},
                             {"name": "forbidden.tool", "description": "Should be filtered",
                              "inputSchema": {"type": "object"}},

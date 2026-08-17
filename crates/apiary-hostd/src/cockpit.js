@@ -68,6 +68,36 @@ const connectorKindLabel = {
   'mock-echo': 'Test connector',
 };
 
+function connectorSupportsReadWrite(kind, caps) {
+  if (kind === 'obsidian' || kind === 'markdown-vault') return true;
+  if (kind === 'mcp') return !/\/readonly(?:\/|$)/.test((caps && caps.url) || '');
+  return false;
+}
+
+function connectorAccessMode(kind, caps) {
+  if (kind === 'obsidian' || kind === 'markdown-vault') return caps && caps.write ? 'read-write' : 'read-only';
+  if (kind === 'mcp') {
+    if (caps && caps.access) return caps.access;
+    return /\/readonly(?:\/|$)/.test((caps && caps.url) || '') ? 'read-only' : 'read-write';
+  }
+  return 'read-only';
+}
+
+function setConnectorAccess(kind, caps, mode) {
+  if (kind === 'obsidian' || kind === 'markdown-vault') caps.write = mode === 'read-write';
+  else if (kind === 'mcp') caps.access = mode;
+}
+
+function accessSelect(mode = 'read-only') {
+  const select = el('select');
+  for (const [value, label] of [['read-only', 'Read only'], ['read-write', 'Read + write']]) {
+    const option = el('option', null, label); option.value = value; select.append(option);
+  }
+  select.value = mode;
+  select.setAttribute('aria-label', 'Connector access');
+  return select;
+}
+
 // ------------------------------------------------------------ host status
 
 async function loadStatus() {
@@ -1065,10 +1095,15 @@ async function renderConnectors(c) {
     const rv = el('button', 'btn danger', 'REVOKE');
     row.append(rv);
     box.append(row);
-    connectorDetails(box, g.type, g.caps || {}, async (on, lab) => {
-      const r = await j(api('/connectors/' + encodeURIComponent(g.type) + '/caps'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ caps: { write: on } }) });
-      gStatus.textContent = r.ok ? `${on ? 'write enabled' : 'read-only'} — re-ratify in Configuration` : 'failed: ' + r.error;
-      lab.lastChild.textContent = on ? ' read + write — the agent may create and edit notes' : ' read-only — tick to allow the agent to write notes';
+    connectorDetails(box, g.type, g.caps || {}, async (mode, select) => {
+      const previous = connectorAccessMode(g.type, g.caps || {});
+      const caps = {}; setConnectorAccess(g.type, caps, mode);
+      select.disabled = true;
+      const r = await j(api('/connectors/' + encodeURIComponent(g.type) + '/caps'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ caps }) });
+      select.disabled = false;
+      if (!r.ok) select.value = previous;
+      else setConnectorAccess(g.type, g.caps || (g.caps = {}), mode);
+      gStatus.textContent = r.ok ? `${mode === 'read-write' ? 'read + write enabled' : 'read-only'} — re-ratify in Configuration` : 'failed: ' + r.error;
       if (r.ok) loadRoster();
     });
     rv.onclick = async () => {
@@ -1091,11 +1126,15 @@ async function renderConnectors(c) {
         if (!r.ok) { dSt.textContent = 'failed: ' + r.error; return; }
         const allowed = new Set(g.caps.allowed_tools || []);
         const picked = new Set(allowed);
+        const readOnly = connectorAccessMode('mcp', g.caps || {}) === 'read-only';
         toolsBox.replaceChildren();
-        dSt.textContent = `${r.tools.length} tools — tick what this agent may use, then apply`;
+        dSt.textContent = `${r.tools.length} tools — ${readOnly ? 'only explicitly read-only tools are available' : 'tick what this agent may use'}`;
+        toolsBox.append(help('MCP read/write labels are supplied by the server. Apiary treats missing readOnlyHint as write-capable.'));
         for (const t of r.tools) {
-          const cb = el('input'); cb.type = 'checkbox'; cb.style.width = 'auto'; cb.checked = allowed.has('*') || allowed.has(t.name);
-          const lab = el('label', null, ` ${t.name}${t.description ? ' — ' + t.description.slice(0, 120) : ''}`); lab.prepend(cb); lab.style.display = 'block';
+          const unavailable = readOnly && !t.read_only;
+          if (unavailable) picked.delete(t.name);
+          const cb = el('input'); cb.type = 'checkbox'; cb.style.width = 'auto'; cb.disabled = unavailable; cb.checked = !unavailable && (allowed.has('*') || allowed.has(t.name));
+          const lab = el('label', null, ` ${t.name} · ${t.read_only ? 'read only' : 'may write'}${t.description ? ' — ' + t.description.slice(0, 120) : ''}`); lab.prepend(cb); lab.style.display = 'block';
           cb.onchange = () => { if (cb.checked) picked.add(t.name); else picked.delete(t.name); picked.delete('*'); };
           toolsBox.append(lab);
         }
@@ -1177,23 +1216,29 @@ async function renderConnectors(c) {
 // ------------------------------------------------------------ host library (host-scoped, all agents)
 
 /// Detail rows for a connector's caps, one fact per line, into `card`.
-/// `onWrite(bool)` when supplied renders the write toggle for vault kinds.
-function connectorDetails(card, kind, caps, onWrite) {
+/// `onAccess(mode, select)` renders an editable access selector when the
+/// connector can provide both read-only and read/write behavior.
+function connectorDetails(card, kind, caps, onAccess) {
   caps = caps || {};
   if (kind === 'obsidian' || kind === 'markdown-vault') {
     for (const v of (caps.vaults || [])) card.append(kv(v.name, v.path));
     const row = el('div', 'kv');
     const val = el('span', 'v');
-    if (onWrite) {
-      const cb = el('input'); cb.type = 'checkbox'; cb.style.width = 'auto'; cb.checked = !!caps.write;
-      const lab = el('label', null, cb.checked ? ' read + write — the agent may create and edit notes' : ' read-only — tick to allow the agent to write notes'); lab.prepend(cb);
-      cb.onchange = () => onWrite(cb.checked, lab);
-      val.append(lab);
-    } else val.textContent = caps.write ? 'read + write' : 'read-only';
+    if (onAccess) {
+      const select = accessSelect(connectorAccessMode(kind, caps));
+      select.onchange = () => onAccess(select.value, select);
+      val.append(select);
+    } else val.textContent = caps.write ? 'Read + write' : 'Read only';
     row.append(el('span', 'k', 'access'), val); card.append(row);
   } else if (kind === 'mcp') {
     card.append(kv('transport', caps.transport === 'http' ? `remote · ${caps.url}` : `local · ${caps.command || '?'} ${(caps.args || []).join(' ')}`.trim()));
     if (caps.oauth_client_id) card.append(kv('auth', 'OAuth (sign-in at grant)'));
+    const mode = connectorAccessMode(kind, caps);
+    if (onAccess && connectorSupportsReadWrite(kind, caps)) {
+      const select = accessSelect(mode); select.onchange = () => onAccess(select.value, select);
+      const accessRow = el('div', 'kv'); const value = el('span', 'v'); value.append(select);
+      accessRow.append(el('span', 'k', 'access'), value); card.append(accessRow);
+    } else card.append(kv('access', mode === 'read-only' ? 'Read only' : 'Read + write'));
     const tools = caps.allowed_tools || [];
     const tv = el('span', 'v');
     if (!tools.length) tv.textContent = 'none allowed';
@@ -1201,7 +1246,7 @@ function connectorDetails(card, kind, caps, onWrite) {
     else for (const t of tools) { const chip = el('span', 'chip', t); chip.style.marginRight = '4px'; tv.append(chip); }
     const row = el('div', 'kv'); row.append(el('span', 'k', 'tools'), tv); card.append(row);
   } else if (kind === 'nostr-publish') {
-    card.append(kv('relays', (caps.relays || []).join(', ')));
+    card.append(kv('access', 'Write only · publish public notes'), kv('relays', (caps.relays || []).join(', ')));
   } else if (kind === 'web-fetch') {
     card.append(kv('access', caps.allow_all_public ? 'all public HTTPS websites' : (caps.allowed_domains || []).join(', ')));
     if (!caps.allow_all_public) card.append(kv('subdomains', caps.allow_subdomains ? 'allowed' : 'not allowed'));
@@ -1226,7 +1271,8 @@ function capsSummary(kind, caps) {
   if (kind === 'mcp') {
     const where = caps.transport === 'http' ? caps.url : `${caps.command || '?'} ${(caps.args || []).join(' ')}`.trim();
     const tools = (caps.allowed_tools || []).join(', ') || 'no tools allowed';
-    return `${where}${caps.oauth_client_id ? ' · OAuth' : ''} · tools: ${tools}`;
+    const access = connectorAccessMode(kind, caps) === 'read-only' ? 'Read only' : 'Read + write';
+    return `${where}${caps.oauth_client_id ? ' · OAuth' : ''} · ${access} · tools: ${tools}`;
   }
   if (kind === 'nostr-publish') return `relays: ${(caps.relays || []).join(', ')}`;
   if (kind === 'web-fetch') return caps.allow_all_public
@@ -1280,11 +1326,13 @@ async function renderLibrary(c) {
       head.append(del);
       card.append(head);
       const caps = e.caps || {};
-      connectorDetails(card, e.kind, caps, async (on, lab) => {
-        caps.write = on; e.caps = caps;
-        lab.lastChild.textContent = on ? ' read + write — the agent may create and edit notes' : ' read-only — tick to allow the agent to write notes';
-        window.__libFlash = `${e.name}: ${on ? 'writable' : 'read-only'} for future grants (existing grants keep their own setting — change it on the agent’s Capabilities)`;
-        await saveLib();
+      connectorDetails(card, e.kind, caps, async (mode, select) => {
+        const previous = connectorAccessMode(e.kind, caps);
+        setConnectorAccess(e.kind, caps, mode); e.caps = caps; select.disabled = true;
+        window.__libFlash = `${e.name}: ${mode === 'read-write' ? 'read + write' : 'read-only'} for future grants (existing grants keep their own setting — change it on the agent’s Capabilities)`;
+        const ok = await saveLib();
+        select.disabled = false;
+        if (!ok) { setConnectorAccess(e.kind, caps, previous); select.value = previous; }
       });
       // Who has it, and grant from here.
       const gRow = el('div', 'row');
@@ -1376,16 +1424,15 @@ async function renderLibrary(c) {
     addVault();
     const more = el('button', 'btn', '+ another vault');
     more.onclick = () => addVault();
-    const write = el('input'); write.type = 'checkbox'; write.style.width = 'auto';
-    const wl = el('label', null, ' allow writing notes (default read-only)'); wl.prepend(write);
+    const access = accessSelect('read-only');
     fields.append(
       help(obsidian
         ? 'An Obsidian vault is a folder of markdown. Paste the folder path (Finder: right-click the vault → Get Info, or drag it into a Terminal). The agent gets search / read tools (and write, only if you allow it), and the notes also feed its memory retrieval as DATA. Tags, [[wikilinks]] and frontmatter are understood. .obsidian and hidden folders are skipped.'
         : 'Any folder of markdown files — a knowledge-base repo checkout, docs, meeting notes. Same tools as Obsidian without the Obsidian-specific parsing.'),
-      vaultsBox, more, wl,
+      vaultsBox, more, field('Access', access, 'Read + write adds create, append, and edit tools. Read only is the default.'),
       help('Paths are jailed: the agent cannot read or write outside the folders you list, even via symlinks. Ceiling 5000 notes per vault.'));
     current = {
-      caps: () => ({ vaults: rows.map(x => ({ name: x.n.value.trim(), path: x.pth.value.trim() })).filter(v => v.name && v.path), write: write.checked }),
+      caps: () => ({ vaults: rows.map(x => ({ name: x.n.value.trim(), path: x.pth.value.trim() })).filter(v => v.name && v.path), write: access.value === 'read-write' }),
       validate: () => rows.some(x => x.n.value.trim() && x.pth.value.trim()) ? null : 'add at least one vault (name + path)',
     };
   };
@@ -1490,6 +1537,7 @@ async function renderLibrary(c) {
     fields.replaceChildren();
     const tr = el('select');
     for (const [v, t] of [['stdio', 'local program (stdio) — e.g. npx @modelcontextprotocol/server-filesystem'], ['http', 'remote server (HTTP) — URL, optionally OAuth']]) { const o = el('option', null, t); o.value = v; tr.append(o); }
+    const access = accessSelect('read-only');
     const stdioBox = el('div');
     const cmd = el('input'); cmd.placeholder = 'command (npx, uvx, /path/to/server)';
     const args = el('input', 'grow'); args.placeholder = 'arguments, space-separated (-y @modelcontextprotocol/server-filesystem /Users/you/docs)';
@@ -1510,26 +1558,31 @@ async function renderLibrary(c) {
     let known = [];
     const drawTools = () => {
       toolsBox.replaceChildren();
-      if (!known.length) { toolsBox.append(help('Tools the agent may call must be allowed by name — click Discover to list them, then tick the ones this agent may use. (Advanced: * allows all.)')); return; }
+      if (!known.length) { toolsBox.append(help('Tools must be allowed by name. Discover the server first; in Read only mode, Apiary exposes only tools explicitly marked readOnlyHint=true.')); return; }
+      const readOnly = access.value === 'read-only';
       const all = el('input'); all.type = 'checkbox'; all.style.width = 'auto';
-      const al = el('label', null, ' allow all (*) — every tool the server exposes, now and later'); al.prepend(all);
-      toolsBox.append(al);
+      const al = el('label', null, readOnly ? ' allow every tool marked read only (*)' : ' allow every tool the server exposes (*)'); al.prepend(all);
+      toolsBox.append(al, help('MCP access labels come from the server and are trust metadata, not a sandbox guarantee. Missing readOnlyHint is treated as write-capable.'));
       all.onchange = () => { if (all.checked) { picked = new Set(['*']); } else { picked.delete('*'); } drawTools(); };
-      if (picked.has('*')) { all.checked = true; return; }
+      all.checked = picked.has('*');
       for (const t of known) {
-        const cb = el('input'); cb.type = 'checkbox'; cb.style.width = 'auto'; cb.checked = picked.has(t.name);
-        const lab = el('label', null, ` ${t.name}${t.description ? ' — ' + t.description.slice(0, 120) : ''}`); lab.prepend(cb);
+        const unavailable = readOnly && !t.read_only;
+        if (unavailable) picked.delete(t.name);
+        const cb = el('input'); cb.type = 'checkbox'; cb.style.width = 'auto'; cb.disabled = unavailable; cb.checked = !unavailable && (picked.has('*') || picked.has(t.name));
+        const risk = t.read_only ? 'read only' : 'may write';
+        const lab = el('label', null, ` ${t.name} · ${risk}${t.description ? ' — ' + t.description.slice(0, 120) : ''}`); lab.prepend(cb);
         lab.style.display = 'block';
-        cb.onchange = () => { if (cb.checked) picked.add(t.name); else picked.delete(t.name); };
+        cb.onchange = () => { picked.delete('*'); if (cb.checked) picked.add(t.name); else picked.delete(t.name); drawTools(); };
         toolsBox.append(lab);
       }
     };
     drawTools();
     tr.onchange = () => { stdioBox.style.display = tr.value === 'stdio' ? '' : 'none'; httpBox.style.display = tr.value === 'http' ? '' : 'none'; };
+    access.onchange = drawTools;
     const trRow = el('div', 'row'); trRow.append(tr);
-    fields.append(trRow, stdioBox, httpBox, dRow, toolsBox);
+    fields.append(trRow, field('Access', access, 'Read only fails closed: unmarked tools are excluded. Read + write permits every tool you explicitly select.'), stdioBox, httpBox, dRow, toolsBox);
     const buildCaps = () => {
-      const caps = { transport: tr.value, allowed_tools: [...picked] };
+      const caps = { transport: tr.value, access: access.value, allowed_tools: [...picked] };
       if (tr.value === 'stdio') { caps.command = cmd.value.trim(); caps.args = args.value.trim() ? args.value.trim().split(/\s+/) : []; if (envs.value.trim()) caps.env = envs.value.split(',').map(x => x.trim()).filter(Boolean); }
       else { caps.url = url.value.trim(); if (oauth.value.trim()) caps.oauth_client_id = oauth.value.trim(); }
       return caps;
@@ -1548,6 +1601,7 @@ async function renderLibrary(c) {
         if (tr.value === 'stdio' && !cmd.value.trim()) return 'command required';
         if (tr.value === 'http' && !/^https?:\/\//.test(url.value.trim())) return 'a full URL is required';
         if (!picked.size) return 'allow at least one tool (Discover, then tick) — or * for all';
+        if (access.value === 'read-only' && known.length && !known.some(t => t.read_only)) return 'this server marks no tools as read only; choose Read + write or use a server with readOnlyHint metadata';
         return null;
       },
     };
@@ -1585,6 +1639,7 @@ async function renderLibrary(c) {
     });
     lStatus.textContent = r.ok ? `saved (${r.count} entries)` : 'rejected: ' + r.error;
     if (r.ok) render();
+    return r.ok;
   };
   const uniqueName = (base) => {
     const slug = base.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-|-$/g, '') || 'connector';

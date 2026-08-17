@@ -65,7 +65,11 @@ model runs). What exists today:
   `initialize`-era servers; stdio (scrubbed-env subprocess) and
   Streamable HTTP (mirror headers, `x-mcp-header`, SSE); OAuth grants
   (RFC 9728 → RFC 8414 → PKCE → RFC 9207) with tokens sealed to the agent;
-  `caps.allowed_tools` required — the server offers, the manifest decides
+  `caps.allowed_tools` required — the server offers, the manifest decides.
+  New MCP entries default to **Read only**, which exposes only tools carrying
+  `annotations.readOnlyHint: true`; missing annotations fail closed. Because
+  MCP annotations are server-supplied hints, only trusted servers should be
+  treated as faithfully classified
 - Foreign harnesses via ACP (proven with claude-code-acp): permission
   requests decided host-side, default deny, harness attribution in the log
 - Tiered log publication: public entries publish as-is, self-tier publish

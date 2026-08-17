@@ -1253,6 +1253,7 @@ fn connector_catalog() -> serde_json::Value {
             "caps": {
                 "transport": "http",
                 "url": "https://api.githubcopilot.com/mcp/x/repos/readonly",
+                "access": "read-only",
                 "allowed_tools": ["get_file_contents", "search_code", "search_repositories"]
             }
         }
@@ -1405,7 +1406,9 @@ pub async fn connectors_discover(
         let tools = client.tools_list().map_err(|e| e.to_string())?;
         Ok(tools
             .into_iter()
-            .map(|t| json!({"name": t.name, "description": t.description}))
+            .map(
+                |t| json!({"name": t.name, "description": t.description, "read_only": t.read_only}),
+            )
             .collect())
     })
     .await
@@ -1520,7 +1523,9 @@ pub async fn agent_connector_discover(
             .tools_list()
             .map_err(|e| e.to_string())?
             .into_iter()
-            .map(|t| json!({"name": t.name, "description": t.description}))
+            .map(
+                |t| json!({"name": t.name, "description": t.description, "read_only": t.read_only}),
+            )
             .collect())
     })
     .await
