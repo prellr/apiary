@@ -364,7 +364,6 @@ impl AnthropicProvider {
         body: &serde_json::Value,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<serde_json::Value, crate::Error> {
-        use std::io::BufRead;
         let mut body = body.clone();
         body["stream"] = json!(true);
         let client = reqwest::blocking::Client::builder()
