@@ -243,3 +243,13 @@ docs/SPEC.md            the design: architecture, governance, failure modes, pha
 ## License
 
 Apache-2.0
+
+## Companion: apiary-voice
+
+[prellr/apiary-voice](https://github.com/prellr/apiary-voice) is the voice
+companion for Apiary agents — a menu-bar Mac app: hold a key (or just talk;
+Silero VAD decides turns), your words are transcribed on-device, sent to the
+agent through the host's governed run endpoint, and the reply comes back
+spoken (system voice or a local Kokoro server) with the text in a small HUD.
+Routines that deliver to `companion` are spoken through it. Voice never
+crosses the wire.
