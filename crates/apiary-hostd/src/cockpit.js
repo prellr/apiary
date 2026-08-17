@@ -161,6 +161,7 @@ async function render() {
   if (tab === 'manifest') return renderManifest(c);
   if (tab === 'buzz') return renderBuzz(c);
   if (tab === 'connectors') return renderConnectors(c);
+  if (tab === 'routines') return renderRoutines(c);
   if (tab === 'creds') return renderCreds(c);
 }
 
@@ -741,6 +742,117 @@ async function renderBuzz(c) {
 }
 
 // ------------------------------------------------------------ connectors
+
+// ------------------------------------------------------------ routines
+
+function whenText(r) {
+  if (r.every) return `every ${r.every}`;
+  if (r.at) return `once at ${r.at} (${r.tz})`;
+  return `${r.when} (${r.tz})`;
+}
+function tsText(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  const diff = (d - Date.now()) / 1000;
+  const abs = Math.abs(diff);
+  const rel = abs < 90 ? `${Math.round(abs)}s` : abs < 5400 ? `${Math.round(abs / 60)}m` : abs < 172800 ? `${Math.round(abs / 3600)}h` : `${Math.round(abs / 86400)}d`;
+  return `${d.toLocaleString()} (${diff >= 0 ? 'in ' + rel : rel + ' ago'})`;
+}
+
+async function renderRoutines(c) {
+  const d = await j(api('/routines'));
+  if (!d.ok) { c.append(el('div', 'ev err', 'error: ' + d.error)); return; }
+  const sec = section('Routines',
+    'Standing instructions the governor ratified once; the host replays them on schedule. Time is the only door with no human on the other side, so a routine’s authority comes from ratification — a chat message can never plant one. Each fire is an ordinary governed run (same floors, budget, signed log), on exactly one host (the lease), never overlapping. Keep them small and bounded.');
+  if (!d.coordinated) sec.append(help('This agent declares no memory.log_relays — routines run without cross-host coordination (fine for one host; add relays before running the agent on two).'));
+  if (!(d.routines || []).length) sec.append(kv('routines', 'none yet — add one below, then ratify in the Manifest tab'));
+  for (const r of d.routines) {
+    const box = el('div', 'ev');
+    const head = el('div', 'row');
+    const flag = !r.enabled ? ' · disabled' : r.paused ? ' · PAUSED on this host' : r.spent ? ' · spent (one-shot fired)' : r.running ? ' · running now' : '';
+    head.append(el('b', null, r.name), el('span', 'meta', whenText(r) + flag));
+    box.append(head);
+    box.append(kv('task', r.task));
+    box.append(kv('deliver', (r.deliver || []).length ? r.deliver.map(x => x.telegram ? `telegram ${x.telegram}${x.as_voice ? ' (voice)' : ''}` : x.buzz ? `buzz #${x.buzz}` : x.nostr ? 'nostr publish' : x.companion ? `companion${x.as_voice ? ' (voice)' : ''}` : '?').join(', ') : 'log only'));
+    box.append(kv('next fire', r.schedule_error ? 'schedule error: ' + r.schedule_error : tsText(r.next_fire)));
+    if (r.preview && r.preview.length) box.append(kv('then', r.preview.slice(1).map(p => new Date(p).toLocaleString()).join(' · ')));
+    box.append(kv('last', r.last_fired ? `${tsText(r.last_fired)} → ${r.last_outcome || '?'}` : 'never'));
+    if (r.last_delivery && r.last_delivery.length) box.append(kv('delivered', JSON.stringify(r.last_delivery)));
+    box.append(kv('fires · budget', `${r.fires} · ${r.budget && r.budget.tokens_per_run ? r.budget.tokens_per_run + ' tokens/run' : 'default reservation'} · catch_up ${r.catch_up}`));
+    if (r.note) box.append(kv('supervisor', r.note));
+    const acts = el('div', 'row');
+    const run = el('button', 'btn solid', 'RUN NOW');
+    const pause = el('button', 'btn', r.paused ? 'RESUME' : 'PAUSE');
+    const st = el('span', 'meta', '');
+    acts.append(run, pause, st);
+    box.append(acts);
+    sec.append(box);
+    run.onclick = async () => {
+      st.textContent = 'firing… (governed run + delivery)';
+      run.disabled = true;
+      const res = await j(api('/routines/' + encodeURIComponent(r.name) + '/run'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+      st.textContent = res.ok ? `→ ${res.outcome}; delivered ${JSON.stringify(res.delivered)}` : 'failed: ' + res.error;
+      run.disabled = false;
+      setTimeout(render, 1500);
+    };
+    pause.onclick = async () => {
+      const res = await j(api('/routines/' + encodeURIComponent(r.name) + '/' + (r.paused ? 'resume' : 'pause')), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+      st.textContent = res.ok ? (res.paused ? 'paused on this host (schedule stays in the manifest)' : 'resumed') : 'failed: ' + res.error;
+      render();
+    };
+  }
+  c.append(sec);
+
+  // ---- add form → appends to manifest YAML, PUTs it; ratify afterward
+  const add = section('Add a routine',
+    'Writes an amendment to the manifest — re-ratify in the Manifest tab afterward. Times are in the zone you pick; cron is standard 5-field (min hour day month weekday, Sunday = 0).');
+  const fName = el('input'); fName.placeholder = 'name (e.g. morning-brief)';
+  const fKind = el('select');
+  for (const [v, t] of [['when', 'cron'], ['every', 'every (15m, 2h, 1d)'], ['at', 'once at (YYYY-MM-DDTHH:MM)']]) { const o = el('option', null, t); o.value = v; fKind.append(o); }
+  const fWhen = el('input', 'grow'); fWhen.placeholder = '0 8 * * 1-5';
+  const fTz = el('input'); fTz.placeholder = 'tz (America/Chicago)'; fTz.value = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  const fTask = el('textarea'); fTask.rows = 3; fTask.placeholder = 'the standing instruction — what should the agent do each time?';
+  const fDeliverKind = el('select');
+  for (const [v, t] of [['', 'log only (no delivery)'], ['telegram', 'telegram chat id'], ['buzz', 'buzz channel'], ['nostr', 'nostr publish'], ['companion', 'companion (spoken by apiary-voice)']]) { const o = el('option', null, t); o.value = v; fDeliverKind.append(o); }
+  const fDeliverTo = el('input', 'grow'); fDeliverTo.placeholder = 'chat id / channel';
+  const fVoice = el('input'); fVoice.type = 'checkbox'; fVoice.style.width = 'auto';
+  const voiceLabel = el('label', null, ' as voice'); voiceLabel.prepend(fVoice);
+  const fBudget = el('input'); fBudget.placeholder = 'tokens/run (e.g. 8000)'; fBudget.value = '8000';
+  const go = el('button', 'btn solid', 'ADD (AMEND MANIFEST)');
+  const st = el('span', 'meta', '');
+  const r1 = el('div', 'row'); r1.append(fName, fKind, fWhen, fTz);
+  const r2 = el('div', 'row'); r2.append(fDeliverKind, fDeliverTo, voiceLabel, fBudget);
+  const r3 = el('div', 'row'); r3.append(go, st);
+  add.append(r1, help('cron: standard 5 fields (Sunday = 0). every: 15m/2h/1d, minimum 1m, no tz needed. at: one-shot, disables itself after firing.'), fTask, r2, r3);
+  c.append(add);
+  fKind.onchange = () => { fWhen.placeholder = fKind.value === 'when' ? '0 8 * * 1-5' : fKind.value === 'every' ? '30m' : '2026-08-17T15:00'; };
+  go.onclick = async () => {
+    const name = fName.value.trim().replace(/[^A-Za-z0-9_-]/g, '-');
+    if (!name || !fWhen.value.trim() || !fTask.value.trim()) { st.textContent = 'name, schedule, and task are required'; return; }
+    const m = await j(api('/manifest'));
+    if (!m.ok) { st.textContent = 'failed: ' + m.error; return; }
+    let yaml = m.yaml.replace(/\s+$/, '');
+    const q = s => JSON.stringify(String(s));
+    let entry = `- name: ${name}\n`;
+    entry += `  ${fKind.value}: ${q(fWhen.value.trim())}\n`;
+    if (fKind.value !== 'every') entry += `  tz: ${q(fTz.value.trim() || 'UTC')}\n`;
+    entry += `  task: |\n` + fTask.value.trim().split('\n').map(l => '    ' + l).join('\n') + '\n';
+    if (fDeliverKind.value) {
+      entry += `  deliver:\n`;
+      if (fDeliverKind.value === 'companion') entry += `  - companion: true\n`;
+      else if (fDeliverKind.value === 'nostr') entry += `  - nostr: publish\n`;
+      else entry += `  - ${fDeliverKind.value}: ${q(fDeliverTo.value.trim())}\n`;
+      if (fVoice.checked) entry += `    as_voice: true\n`;
+    }
+    if (fBudget.value.trim()) entry += `  budget:\n    tokens_per_run: ${parseInt(fBudget.value, 10) || 8000}\n`;
+    if (/^routines:\s*$/m.test(yaml)) yaml += '\n' + entry;
+    else if (/^routines:/m.test(yaml)) yaml += '\n' + entry;
+    else yaml += '\nroutines:\n' + entry;
+    const r = await j(api('/manifest'), { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ yaml }) });
+    st.textContent = r.ok ? `added ${name} — now ratify in the Manifest tab` : 'failed: ' + r.error;
+    if (r.ok) { loadRoster(); setTimeout(render, 800); }
+  };
+}
 
 async function renderConnectors(c) {
   const lib = await j('/api/connectors');
