@@ -497,7 +497,37 @@ pub(crate) fn build_working_set(
         let idx = crate::index::SemanticIndex::open(agent_dir);
         let retrieved: Result<(), crate::Error> = (|| {
             idx.update(log, embedder.as_ref())?;
-            idx.update_vaults(&manifest.memory.vaults, embedder.as_ref())?;
+            // Granted vault connectors feed recall too — a grant IS the
+            // "this is my knowledge" act; memory.vaults stays for vaults
+            // that are memory-only (no tools). Deduped by name.
+            let mut vaults = manifest.memory.vaults.clone();
+            for c in manifest
+                .connectors
+                .iter()
+                .filter(|c| c.kind == "obsidian" || c.kind == "markdown-vault")
+            {
+                if let Some(arr) = c.caps.get("vaults").and_then(|v| v.as_array()) {
+                    for v in arr {
+                        if let (Some(name), Some(path)) = (v["name"].as_str(), v["path"].as_str()) {
+                            if !vaults.iter().any(|x| x.name == name) {
+                                vaults.push(apiary_core::manifest::VaultRef {
+                                    name: name.to_string(),
+                                    path: path.to_string(),
+                                    kind: Some(
+                                        if c.kind == "obsidian" {
+                                            "obsidian"
+                                        } else {
+                                            "markdown"
+                                        }
+                                        .into(),
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            idx.update_vaults(&vaults, embedder.as_ref())?;
             for hit in idx.query(embedder.as_ref(), task, 4, &tail_ids)? {
                 relevant_lines.push(format!("- {}", hit.text));
             }

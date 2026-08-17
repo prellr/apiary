@@ -506,6 +506,11 @@ fn bind_vault(
             vaults: shared.clone(),
             names: vault_names.clone(),
         }),
+        Box::new(VaultList {
+            kind,
+            vaults: shared.clone(),
+            names: vault_names.clone(),
+        }),
     ];
     if write {
         out.push(Box::new(VaultWrite {
@@ -518,6 +523,151 @@ fn bind_vault(
 }
 
 type Vaults = std::sync::Arc<Vec<(String, std::path::PathBuf)>>;
+
+/// Browse: the shape of a vault (folders with counts, recent notes) or the
+/// notes under one folder — so "what's in here?" is answerable without
+/// guessing search terms. Bounded output; paths are jailed as always.
+struct VaultList {
+    kind: &'static str,
+    vaults: Vaults,
+    names: Vec<String>,
+}
+
+impl Connector for VaultList {
+    fn def(&self) -> ToolDef {
+        ToolDef {
+            name: format!("{}_list", self.kind),
+            description: format!(
+                "Browse a granted vault ({}). With no folder: an overview — every folder with its \
+                 note count, plus the most recently modified notes. With a folder: the notes in it \
+                 (title, path, size, modified). Use this to orient before searching or reading.",
+                self.names.join(", ")
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "vault": {"type": "string", "description": "vault name (needed only when several are granted)"},
+                    "folder": {"type": "string", "description": "folder path relative to the vault root; omit for the overview"},
+                    "limit": {"type": "integer", "description": "max notes to list (default 60, max 200)"}
+                }
+            }),
+        }
+    }
+
+    fn execute(
+        &self,
+        _custody: &Custody,
+        _agent: &AgentHandle,
+        args: &Value,
+    ) -> Result<String, crate::Error> {
+        let (vname, root) = vault_root(&self.vaults, args["vault"].as_str())?;
+        let limit = args["limit"].as_u64().unwrap_or(60).clamp(1, 200) as usize;
+        let notes = crate::vault::walk(root)?;
+        let folder = args["folder"]
+            .as_str()
+            .map(|f| f.trim().trim_matches('/').to_string())
+            .filter(|f| !f.is_empty());
+        let mut out = String::new();
+        match folder {
+            None => {
+                // Overview: folders with counts, then recent notes.
+                let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+                for n in &notes {
+                    let dir = match n.rel.rfind('/') {
+                        Some(i) => n.rel[..i].to_string(),
+                        None => "(root)".to_string(),
+                    };
+                    *counts.entry(dir).or_default() += 1;
+                }
+                out.push_str(&format!(
+                    "vault '{vname}': {} notes in {} folders\n\nfolders:\n",
+                    notes.len(),
+                    counts.len()
+                ));
+                for (dir, c) in counts.iter().take(120) {
+                    out.push_str(&format!("  {dir}/  ({c})\n"));
+                }
+                if counts.len() > 120 {
+                    out.push_str(&format!("  … and {} more folders\n", counts.len() - 120));
+                }
+                let mut recent: Vec<(std::time::SystemTime, &crate::vault::NoteRef)> = notes
+                    .iter()
+                    .filter_map(|n| {
+                        std::fs::metadata(root.join(&n.rel))
+                            .and_then(|m| m.modified())
+                            .ok()
+                            .map(|t| (t, n))
+                    })
+                    .collect();
+                recent.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+                out.push_str("\nrecently modified:\n");
+                for (t, n) in recent.iter().take(15) {
+                    let secs = t
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    out.push_str(&format!(
+                        "  {}  ({}, {})\n",
+                        n.rel,
+                        n.title,
+                        human_age(secs)
+                    ));
+                }
+                out.push_str("\nCall again with a folder to list its notes; use _search for content; _read for a note.");
+            }
+            Some(f) => {
+                let prefix = format!("{f}/");
+                let mut listed = 0;
+                let mut total = 0;
+                for n in &notes {
+                    if !(n.rel.starts_with(&prefix) || (f == "(root)" && !n.rel.contains('/'))) {
+                        continue;
+                    }
+                    total += 1;
+                    if listed >= limit {
+                        continue;
+                    }
+                    let meta = std::fs::metadata(root.join(&n.rel)).ok();
+                    let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                    let age = meta
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| human_age(d.as_secs()))
+                        .unwrap_or_default();
+                    out.push_str(&format!("  {}  ({} bytes, {age})\n", n.rel, size));
+                    listed += 1;
+                }
+                if total == 0 {
+                    return Ok(format!("no notes under '{f}/' in vault '{vname}' (folders are listed by the overview call)"));
+                }
+                out = format!(
+                    "vault '{vname}', folder '{f}/': {total} notes{}\n",
+                    if total > listed {
+                        format!(" (showing {listed})")
+                    } else {
+                        String::new()
+                    }
+                ) + &out;
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn human_age(modified_unix: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let d = now.saturating_sub(modified_unix);
+    if d < 3600 {
+        format!("{}m ago", d / 60)
+    } else if d < 86_400 {
+        format!("{}h ago", d / 3600)
+    } else {
+        format!("{}d ago", d / 86_400)
+    }
+}
 
 fn vault_root<'a>(
     vaults: &'a Vaults,
