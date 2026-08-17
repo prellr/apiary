@@ -505,10 +505,16 @@ async function renderOverview(c) {
   const drawChannels = l => {
     channelBox.replaceChildren();
     const kinds = l.ok ? (l.declared || []) : [];
+    const supervisorNote = l.supervisor_note === 'manifest is not ratified — nothing runs'
+      ? 'Waiting for approval'
+      : l.supervisor_note;
     if (!kinds.length) channelBox.append(el('div', 'none', 'No channels declared'));
     for (const kind of kinds) {
       const ch = (l.channels || {})[kind] || {};
-      channelBox.append(kv(kind, ch.running ? 'Running' : (ch.note || (roster.active ? 'Starting' : 'Inactive'))));
+      const status = ch.running
+        ? 'Running'
+        : (ch.note || supervisorNote || (roster.active ? 'Starting' : 'Inactive'));
+      channelBox.append(kv(kind, status));
     }
   };
   drawChannels(listener);
