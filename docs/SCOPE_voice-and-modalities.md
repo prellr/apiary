@@ -101,6 +101,12 @@ Out of the Rust workspace; its own repo, its own release cadence. This scope onl
   
 6. Companion app, separate repo, when 1–5 give it something to talk to.
   
+## Companion visual I/O (added after review)
+
+- **In:** ⌥⇧Space attaches the clipboard image as an image attachment on the run (opt-in per utterance — the clipboard is never sent unless asked). Screen-region capture later.
+- **Out:** reply text always shows in the HUD beside the spoken reply. Any image an agent hands back is dropped in `~/Downloads/apiary-voice/` and opened in Quick Look immediately — durable copy, instant glance, no window to manage.
+- **Open question, deliberately unresolved:** agents *generating* images (a `draw` slot). The delivery half above is generation-agnostic; whether agents draw at all — cost, content policy, what the constitution says — is undecided.
+
 ## Non-goals, stated so they stay out
 - Real-time duplex voice in the core (plugin territory).
   
