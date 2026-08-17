@@ -483,3 +483,160 @@ fn resolve_buzz_channel(s: &mut apiary_runtime::buzz::BuzzSession, name: &str) -
     }
     None
 }
+
+// ------------------------------------------------------------- endpoints
+
+use axum::extract::{OriginalUri, Path as AxPath, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::Json;
+
+/// GET /api/agents/{npub}/routines — schedule (constitutional) + host
+/// state (routines.json) + next fires in the routine's zone.
+pub async fn list_routines(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, manifest) =
+        match crate::ops::gate_pub(&state, &headers, "GET", &uri, None, &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    let st = RoutinesFile::open(&dir).load();
+    let now = Utc::now();
+    let notes = state
+        .supervisor_notes
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let running_now = running().lock().unwrap().clone();
+    let items: Vec<serde_json::Value> = manifest
+        .routines
+        .iter()
+        .map(|r| {
+            let rec = st.routines.get(&r.name).cloned().unwrap_or_default();
+            let (next, preview, sched_err) = match parse_schedule(r) {
+                Ok(s) => {
+                    let after = rec.last_scheduled.unwrap_or(now);
+                    let anchor = rec.last_fired.or(st.since);
+                    let next = if r.enabled && !rec.paused && !rec.spent {
+                        s.next_after(after.max(now - chrono::Duration::seconds(1)), anchor)
+                    } else {
+                        None
+                    };
+                    (next, s.preview(now, 3), None)
+                }
+                Err(e) => (None, vec![], Some(e.to_string())),
+            };
+            json!({
+                "name": r.name,
+                "when": r.when, "every": r.every, "at": r.at, "tz": r.tz,
+                "task": r.task,
+                "class": r.class,
+                "deliver": r.deliver,
+                "budget": r.budget,
+                "catch_up": r.catch_up,
+                "enabled": r.enabled,
+                "paused": rec.paused,
+                "spent": rec.spent,
+                "fires": rec.fires,
+                "running": running_now.contains(&format!("{npub}/{}", r.name)),
+                "last_scheduled": rec.last_scheduled,
+                "last_fired": rec.last_fired,
+                "last_outcome": rec.last_outcome,
+                "last_delivery": rec.last_delivery,
+                "next_fire": next,
+                "preview": preview,
+                "schedule_error": sched_err,
+                "note": notes.get(&format!("{npub}:routine:{}", r.name)),
+            })
+        })
+        .collect();
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "since": st.since,
+        "coordinated": !manifest.memory.log_relays.is_empty(),
+        "routines": items,
+    }))
+    .into_response()
+}
+
+/// POST /api/agents/{npub}/routines/{name}/run — fire now (operator door:
+/// a governor at a keyboard). Same gates as a scheduled fire except the
+/// clock; recorded as a routine.run with "manual": true.
+pub async fn run_routine_now(
+    State(state): State<App>,
+    AxPath((npub, name)): AxPath<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, raw, manifest) =
+        match crate::ops::gate_pub(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    let Some(r) = manifest.routines.iter().find(|r| r.name == name).cloned() else {
+        return crate::err(StatusCode::NOT_FOUND, format!("no routine '{name}'")).into_response();
+    };
+    let key = format!("{npub}/{name}");
+    if let Some(reason) = gate(&state, &npub, &raw, &manifest, &dir, &key) {
+        return crate::err(StatusCode::CONFLICT, format!("cannot fire now: {reason}"))
+            .into_response();
+    }
+    running().lock().unwrap().insert(key.clone());
+    let st2 = state.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        let res = fire(&st2, &npub, &manifest, &r, &dir, Utc::now());
+        let f = RoutinesFile::open(&dir);
+        let mut s = f.load();
+        let e = s.routines.entry(r.name.clone()).or_default();
+        e.last_fired = Some(Utc::now());
+        e.fires += 1;
+        e.last_outcome = Some(res.0.clone());
+        e.last_delivery = Some(res.1.clone());
+        let _ = f.save(&s);
+        running().lock().unwrap().remove(&key);
+        res
+    })
+    .await
+    .unwrap_or_else(|e| (format!("error: {e}"), json!(null)));
+    Json(json!({"ok": true, "outcome": out.0, "delivered": out.1})).into_response()
+}
+
+/// POST /api/agents/{npub}/routines/{name}/pause | resume — host-local,
+/// no amendment (like `active`).
+pub async fn pause_routine(
+    State(state): State<App>,
+    AxPath((npub, name, action)): AxPath<(String, String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (_ks, _npub, dir, _raw, manifest) =
+        match crate::ops::gate_pub(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    if !manifest.routines.iter().any(|r| r.name == name) {
+        return crate::err(StatusCode::NOT_FOUND, format!("no routine '{name}'")).into_response();
+    }
+    let paused = match action.as_str() {
+        "pause" => true,
+        "resume" => false,
+        other => {
+            return crate::err(StatusCode::BAD_REQUEST, format!("unknown action '{other}'"))
+                .into_response()
+        }
+    };
+    let f = RoutinesFile::open(&dir);
+    let mut s = f.load();
+    s.routines.entry(name.clone()).or_default().paused = paused;
+    if let Err(e) = f.save(&s) {
+        return crate::err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(json!({"ok": true, "routine": name, "paused": paused})).into_response()
+}

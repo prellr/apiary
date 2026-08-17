@@ -67,6 +67,27 @@ fn gate(
     Ok((ks, npub, dir, raw, manifest))
 }
 
+/// Crate-visible gate for sibling modules (routines).
+pub(crate) fn gate_pub(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    method: &str,
+    uri: &axum::http::Uri,
+    body: Option<&[u8]>,
+    npub: &str,
+) -> Result<
+    (
+        Keystore,
+        String,
+        std::path::PathBuf,
+        String,
+        apiary_core::manifest::Manifest,
+    ),
+    Resp,
+> {
+    gate(state, headers, method, uri, body, npub)
+}
+
 fn require_pass(state: &AppState) -> Result<String, Resp> {
     state.passphrase_clone().ok_or_else(|| {
         err(

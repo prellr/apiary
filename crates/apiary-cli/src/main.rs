@@ -59,6 +59,14 @@ enum Command {
     },
     /// Normalize a public key: accepts npub or hex, prints both forms.
     Key { key: String },
+    /// Routines: scheduled, governed runs (SCOPE_routines). `list` reads
+    /// the agent's manifest + host state locally; `run`/`pause`/`resume`
+    /// go through the running host (the desktop's daemon, found via
+    /// ~/.apiary/desktop.json) — firing needs its gates and delivery.
+    Routine {
+        #[command(subcommand)]
+        cmd: RoutineCmd,
+    },
     /// Buzz workspace membership: the agent authenticates to a Buzz relay
     /// with its own key (NIP-42) and participates as a first-class member.
     Buzz {
@@ -92,6 +100,18 @@ enum Command {
         #[arg(long)]
         acp_allow: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum RoutineCmd {
+    /// Schedule + host state + next fires for an agent.
+    List { npub: String },
+    /// Fire a routine now through the running host (operator door).
+    Run { npub: String, name: String },
+    /// Pause a routine on this host (no amendment).
+    Pause { npub: String, name: String },
+    /// Resume a paused routine.
+    Resume { npub: String, name: String },
 }
 
 #[derive(Subcommand)]
@@ -911,6 +931,53 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                 }
             }
         }
+        Command::Routine { cmd } => match cmd {
+            RoutineCmd::List { npub } => {
+                let dir = ks.agent_dir(npub);
+                let raw = std::fs::read_to_string(dir.join("manifest.yaml"))?;
+                let m = apiary_core::manifest::Manifest::from_yaml(&raw)?;
+                let st = apiary_runtime::routines::RoutinesFile::open(&dir).load();
+                let now = chrono::Utc::now();
+                let items: Vec<serde_json::Value> = m
+                    .routines
+                    .iter()
+                    .map(|r| {
+                        let rec = st.routines.get(&r.name).cloned().unwrap_or_default();
+                        let (next, preview) = match apiary_runtime::routines::parse_schedule(r) {
+                            Ok(s) => (
+                                if r.enabled && !rec.paused && !rec.spent {
+                                    s.next_after(rec.last_scheduled.unwrap_or(now).max(now), rec.last_fired.or(st.since))
+                                } else {
+                                    None
+                                },
+                                s.preview(now, 3),
+                            ),
+                            Err(_) => (None, vec![]),
+                        };
+                        json!({
+                            "name": r.name, "when": r.when, "every": r.every, "at": r.at, "tz": r.tz,
+                            "enabled": r.enabled, "paused": rec.paused, "spent": rec.spent,
+                            "fires": rec.fires, "last_fired": rec.last_fired,
+                            "last_outcome": rec.last_outcome, "next_fire": next, "preview": preview,
+                            "deliver": r.deliver,
+                        })
+                    })
+                    .collect();
+                Ok(json!({"ok": true, "npub": npub, "since": st.since, "routines": items}))
+            }
+            RoutineCmd::Run { npub, name } => host_post(
+                &cli.home,
+                &format!("/api/agents/{npub}/routines/{name}/run"),
+            ),
+            RoutineCmd::Pause { npub, name } => host_post(
+                &cli.home,
+                &format!("/api/agents/{npub}/routines/{name}/pause"),
+            ),
+            RoutineCmd::Resume { npub, name } => host_post(
+                &cli.home,
+                &format!("/api/agents/{npub}/routines/{name}/resume"),
+            ),
+        },
         Command::Key { key } => {
             let pk = apiary_core::identity::parse_npub(key)?;
             let npub = apiary_core::identity::to_npub(&pk)?;
@@ -1068,4 +1135,36 @@ fn founding_manifest_yaml(npub: &str, suspend_keys: &[String]) -> String {
          governance:\n\
          \x20 suspend_keys:\n{keys_yaml}"
     )
+}
+
+/// POST to the running desktop's daemon (found via <home>/desktop.json:
+/// {url, token, pid} — written per launch, 0600). The operator door.
+fn host_post(
+    home: &std::path::Path,
+    path: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let disc = home.join("desktop.json");
+    let d: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&disc).map_err(|_| {
+            format!(
+                "no running host found ({} missing) — launch the Apiary desktop first",
+                disc.display()
+            )
+        })?)?;
+    let url = d["url"].as_str().ok_or("desktop.json has no url")?;
+    let token = d["token"].as_str().unwrap_or("");
+    let resp = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()?
+        .post(format!("{url}{path}"))
+        .header("x-apiary-token", token)
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().unwrap_or(json!({"error": "non-JSON reply"}));
+    if !status.is_success() {
+        return Err(format!("host {status}: {}", body["error"].as_str().unwrap_or("?")).into());
+    }
+    Ok(body)
 }
