@@ -33,6 +33,12 @@ pub struct Manifest {
     /// Single-instance liveness (SPEC §8 split-brain, §12.2 takeover modes).
     #[serde(default)]
     pub lease: LeaseConfig,
+    /// Standing instructions the governor ratified once; the host replays
+    /// them on schedule (SCOPE_routines). Time is the fourth door — the
+    /// only one with no human on the other side — so a routine's authority
+    /// comes from ratification, and it travels with the agent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routines: Vec<Routine>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,6 +275,77 @@ pub struct EncryptedBlob {
     pub nip44: String,
 }
 
+/// One scheduled, governed run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Routine {
+    pub name: String,
+    /// Exactly one of `when` (5-field cron or @hourly/@daily/@weekly),
+    /// `every` ("15m", "2h", "1d"; minimum 1m), `at` (ISO-8601 datetime,
+    /// one-shot — disables itself after firing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub every: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+    /// IANA zone; REQUIRED with `when` and `at` (a portable agent must not
+    /// fire at the wrong hour because it moved hosts). Ignored for `every`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tz: Option<String>,
+    /// The instruction. Ratified with the manifest — a mention can never
+    /// plant one.
+    pub task: String,
+    /// task_class for routing rules (default "routine").
+    #[serde(default = "default_routine_class")]
+    pub class: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deliver: Vec<Delivery>,
+    #[serde(default)]
+    pub budget: RoutineBudget,
+    /// "none" | "one" — a missed fire (host asleep) runs once on wake,
+    /// never a backlog.
+    #[serde(default = "default_catch_up")]
+    pub catch_up: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// Where a routine's reply goes — surfaces the agent already has.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Delivery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telegram: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buzz: Option<String>,
+    /// `publish` — kind-1 via the nostr-publish connector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nostr: Option<String>,
+    /// Spoken by a connected apiary-voice.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub companion: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub as_voice: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineBudget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_per_run: Option<u64>,
+}
+
+fn default_routine_class() -> String {
+    "routine".into()
+}
+fn default_catch_up() -> String {
+    "one".into()
+}
+fn default_true() -> bool {
+    true
+}
+
 impl Manifest {
     pub fn from_yaml(s: &str) -> Result<Self, crate::Error> {
         let m: Manifest = serde_yaml::from_str(s)?;
@@ -320,6 +397,85 @@ impl Manifest {
                 return Err(crate::Error::Manifest(format!(
                     "routing default targets unknown inference slot '{d}'"
                 )));
+            }
+        }
+        // Routines: one schedule spelling, tz where it matters, valid
+        // delivery targets, unique names.
+        let mut rnames = std::collections::BTreeSet::new();
+        for r in &self.routines {
+            if r.name.trim().is_empty() || !rnames.insert(r.name.as_str()) {
+                return Err(crate::Error::Manifest(format!(
+                    "routine name '{}' is empty or duplicated",
+                    r.name
+                )));
+            }
+            let spellings = [r.when.is_some(), r.every.is_some(), r.at.is_some()]
+                .iter()
+                .filter(|b| **b)
+                .count();
+            if spellings != 1 {
+                return Err(crate::Error::Manifest(format!(
+                    "routine '{}' needs exactly one of when / every / at",
+                    r.name
+                )));
+            }
+            if (r.when.is_some() || r.at.is_some()) && r.tz.is_none() {
+                return Err(crate::Error::Manifest(format!(
+                    "routine '{}' needs tz (an IANA zone) with when/at — a portable agent \
+                     must not fire at the wrong hour on a new host",
+                    r.name
+                )));
+            }
+            if r.task.trim().is_empty() {
+                return Err(crate::Error::Manifest(format!(
+                    "routine '{}' has an empty task",
+                    r.name
+                )));
+            }
+            if !matches!(r.catch_up.as_str(), "none" | "one") {
+                return Err(crate::Error::Manifest(format!(
+                    "routine '{}': catch_up must be none | one",
+                    r.name
+                )));
+            }
+            for d in &r.deliver {
+                let targets = [
+                    d.telegram.is_some(),
+                    d.buzz.is_some(),
+                    d.nostr.is_some(),
+                    d.companion,
+                ]
+                .iter()
+                .filter(|b| **b)
+                .count();
+                if targets != 1 {
+                    return Err(crate::Error::Manifest(format!(
+                        "routine '{}': each deliver entry names exactly one target",
+                        r.name
+                    )));
+                }
+                if d.telegram.is_some() && self.presence.channel("telegram").is_none() {
+                    return Err(crate::Error::Manifest(format!(
+                        "routine '{}' delivers to telegram but the agent has no telegram presence",
+                        r.name
+                    )));
+                }
+                if d.buzz.is_some() && self.presence.channel("buzz").is_none() {
+                    return Err(crate::Error::Manifest(format!(
+                        "routine '{}' delivers to buzz but the agent has no buzz presence",
+                        r.name
+                    )));
+                }
+                if let Some(n) = &d.nostr {
+                    if n != "publish" || !self.connectors.iter().any(|c| c.kind == "nostr-publish")
+                    {
+                        return Err(crate::Error::Manifest(format!(
+                            "routine '{}': nostr delivery must be 'publish' and needs the \
+                             nostr-publish connector",
+                            r.name
+                        )));
+                    }
+                }
             }
         }
         // Duplicate slot names would make routing ambiguous.

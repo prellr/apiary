@@ -16,6 +16,7 @@ pub mod plugin;
 pub mod presence;
 pub mod publish;
 pub mod relay;
+pub mod routines;
 pub mod routing;
 pub mod runner;
 pub mod slack;
