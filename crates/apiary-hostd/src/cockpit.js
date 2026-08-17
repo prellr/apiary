@@ -920,14 +920,22 @@ async function renderConnectors(c) {
     'A grant copies a host-library entry into this agent’s manifest, sealing any secret to this agent alone. Every grant or revoke is an amendment — re-ratify in the Manifest tab afterward.');
   const grants = (d.manifest.connectors || []);
   if (!grants.length) gSec.append(kv('grants', 'none — the agent can think and speak, not act'));
+  const kindLabel = { obsidian: 'Obsidian vault', 'markdown-vault': 'Markdown folder', mcp: 'MCP server', 'nostr-publish': 'Nostr publish', 'mock-echo': 'mock' };
   for (const g of grants) {
     const box = el('div', 'ev');
     const row = el('div', 'row');
-    row.append(el('span', 'v', `${g.type} · ${capsSummary(g.type, g.caps || {})} · credential ${g.credential ? 'sealed to this agent' : 'none'}`));
-    row.title = JSON.stringify(g.caps || {});
+    const title = (g.caps && g.caps.library_name) || (g.caps && g.caps.vaults && g.caps.vaults[0] && g.caps.vaults[0].name) || g.type;
+    row.append(el('b', null, title), el('span', 'meta', kindLabel[g.type] || g.type), el('span', 'meta', g.credential ? 'credential sealed to this agent' : 'no credential'));
+    row.append(el('span', 'grow', ''));
     const rv = el('button', 'btn danger', 'REVOKE');
     row.append(rv);
     box.append(row);
+    connectorDetails(box, g.type, g.caps || {}, async (on, lab) => {
+      const r = await j(api('/connectors/' + encodeURIComponent(g.type) + '/caps'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ caps: { write: on } }) });
+      gStatus.textContent = r.ok ? `${on ? 'write enabled' : 'read-only'} — re-ratify in the Manifest tab` : 'failed: ' + r.error;
+      lab.lastChild.textContent = on ? ' read + write — the agent may create and edit notes' : ' read-only — tick to allow the agent to write notes';
+      if (r.ok) loadRoster();
+    });
     rv.onclick = async () => {
       const r = await j(api('/connectors/' + encodeURIComponent(g.type)), { method: 'DELETE' });
       gStatus.textContent = r.ok ? `revoked ${g.type} — re-ratify in the Manifest tab` : 'failed: ' + r.error;
@@ -1025,6 +1033,37 @@ async function renderConnectors(c) {
 
 // ------------------------------------------------------------ host library (host-scoped, all agents)
 
+/// Detail rows for a connector's caps, one fact per line, into `card`.
+/// `onWrite(bool)` when supplied renders the write toggle for vault kinds.
+function connectorDetails(card, kind, caps, onWrite) {
+  caps = caps || {};
+  if (kind === 'obsidian' || kind === 'markdown-vault') {
+    for (const v of (caps.vaults || [])) card.append(kv(v.name, v.path));
+    const row = el('div', 'kv');
+    const val = el('span', 'v');
+    if (onWrite) {
+      const cb = el('input'); cb.type = 'checkbox'; cb.style.width = 'auto'; cb.checked = !!caps.write;
+      const lab = el('label', null, cb.checked ? ' read + write — the agent may create and edit notes' : ' read-only — tick to allow the agent to write notes'); lab.prepend(cb);
+      cb.onchange = () => onWrite(cb.checked, lab);
+      val.append(lab);
+    } else val.textContent = caps.write ? 'read + write' : 'read-only';
+    row.append(el('span', 'k', 'access'), val); card.append(row);
+  } else if (kind === 'mcp') {
+    card.append(kv('transport', caps.transport === 'http' ? `remote · ${caps.url}` : `local · ${caps.command || '?'} ${(caps.args || []).join(' ')}`.trim()));
+    if (caps.oauth_client_id) card.append(kv('auth', 'OAuth (sign-in at grant)'));
+    const tools = caps.allowed_tools || [];
+    const tv = el('span', 'v');
+    if (!tools.length) tv.textContent = 'none allowed';
+    else if (tools.includes('*')) tv.textContent = 'all tools (*)';
+    else for (const t of tools) { const chip = el('span', 'chip', t); chip.style.marginRight = '4px'; tv.append(chip); }
+    const row = el('div', 'kv'); row.append(el('span', 'k', 'tools'), tv); card.append(row);
+  } else if (kind === 'nostr-publish') {
+    card.append(kv('relays', (caps.relays || []).join(', ')));
+  } else {
+    card.append(kv('caps', JSON.stringify(caps)));
+  }
+}
+
 function capsSummary(kind, caps) {
   if (kind === 'obsidian' || kind === 'markdown-vault') {
     const v = (caps.vaults || []).map(x => `${x.name} → ${x.path}`).join('; ');
@@ -1067,20 +1106,51 @@ async function renderLibrary(c) {
   const lStatus = el('span', 'meta', '');
   const drawList = () => {
     list.replaceChildren();
-    if (!entries.length) list.append(el('div', 'meta', 'no entries yet — add your first below'));
+    if (!entries.length) { list.append(el('div', 'meta', 'no entries yet — add your first below')); return; }
+    const kindLabel = { obsidian: 'Obsidian vault', 'markdown-vault': 'Markdown folder', mcp: 'MCP server', 'nostr-publish': 'Nostr publish', 'mock-echo': 'mock' };
     entries.forEach((e, i) => {
-      const row = el('div', 'row');
+      const card = el('div', 'ev');
+      const head = el('div', 'row');
+      head.append(el('b', null, e.name), el('span', 'meta', kindLabel[e.kind] || e.kind));
       const holders = grantsByKind[e.kind] || [];
-      row.append(el('span', 'v', `${e.name} · ${e.kind} · ${capsSummary(e.kind, e.caps || {})}`));
-      row.title = JSON.stringify(e.caps || {});
-      row.append(el('span', 'meta', holders.length ? 'granted to: ' + holders.join(', ') : 'granted to: nobody'));
+      const spacer = el('span', 'grow', ''); head.append(spacer);
       const del = el('button', 'btn danger', 'REMOVE');
-      row.append(del);
-      del.onclick = async () => {
-        entries.splice(i, 1);
+      head.append(del);
+      card.append(head);
+      const caps = e.caps || {};
+      connectorDetails(card, e.kind, caps, async (on, lab) => {
+        caps.write = on; e.caps = caps;
+        lab.lastChild.textContent = on ? ' read + write — the agent may create and edit notes' : ' read-only — tick to allow the agent to write notes';
+        window.__libFlash = `${e.name}: ${on ? 'writable' : 'read-only'} for future grants (existing grants keep their own setting — change it on the agent’s Connectors tab)`;
         await saveLib();
+      });
+      // Who has it, and grant from here.
+      const gRow = el('div', 'row');
+      gRow.append(el('span', 'meta', holders.length ? 'granted to: ' + holders.join(', ') : 'granted to: nobody yet'));
+      const sel = el('select');
+      const eligible = agents.filter(a => !holders.includes(a.name || a.npub.slice(0, 12)));
+      for (const a of eligible) { const o = el('option', null, a.name || a.npub.slice(0, 12)); o.value = a.npub; sel.append(o); }
+      const gBtn = el('button', 'btn', 'GRANT TO ▸');
+      const gSt = el('span', 'meta', '');
+      if (eligible.length) gRow.append(sel, gBtn, gSt);
+      card.append(gRow);
+      list.append(card);
+      del.onclick = async () => { entries.splice(i, 1); window.__libFlash = `removed ${e.name} (grants already made are untouched)`; await saveLib(); };
+      gBtn.onclick = async () => {
+        const npub = sel.value; if (!npub) return;
+        const needsSecret = e.kind === 'mcp' && caps.transport === 'http' && !caps.oauth_client_id;
+        if (needsSecret) { gSt.textContent = 'this one needs an API key sealed to the agent — grant it from the agent’s Connectors tab'; return; }
+        gBtn.disabled = true; gSt.textContent = 'granting…';
+        const r = await j(`/api/agents/${encodeURIComponent(npub)}/connectors`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: e.name }) });
+        gBtn.disabled = false;
+        if (r.ok) {
+          const who = (agents.find(a => a.npub === npub) || {}).name || npub.slice(0, 12);
+          window.__libFlash = `granted ${e.name} to ${who} — ratify on ${who}’s Manifest tab before it takes effect`;
+          loadRoster(); render();
+        } else if (r.oauth_url || (r.error && /oauth/i.test(r.error))) {
+          gSt.textContent = 'needs OAuth sign-in — grant from the agent’s Connectors tab (it opens the flow)';
+        } else gSt.textContent = 'failed: ' + r.error;
       };
-      list.append(row);
     });
   };
   // ---- add: a form per kind (JSON is the advanced view, not the way in)

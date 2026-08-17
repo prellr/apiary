@@ -101,6 +101,10 @@ pub fn build_router(state: App) -> Router {
             "/api/agents/{npub}/connectors/{kind}/allowed_tools",
             post(ops::connector_set_allowed_tools),
         )
+        .route(
+            "/api/agents/{npub}/connectors/{kind}/caps",
+            post(ops::connector_patch_caps),
+        )
         .route("/api/agents", get(list_agents))
         .route("/api/agents/found", post(found_agent))
         .route("/api/agents/import", post(ops::import_agent))

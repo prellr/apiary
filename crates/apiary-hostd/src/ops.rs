@@ -1390,6 +1390,54 @@ pub async fn connector_set_allowed_tools(
     .into_response()
 }
 
+/// POST /api/agents/{npub}/connectors/{kind}/caps {"caps": {...}} — merge
+/// keys into a grant's caps (e.g. {"write": true} on a vault grant). An
+/// amendment: re-ratify afterward. Governor.
+pub async fn connector_patch_caps(
+    State(state): State<App>,
+    AxPath((npub, kind)): AxPath<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    let body: serde_json::Value = match serde_json::from_slice(&raw_body) {
+        Ok(b) => b,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let Some(patch) = body["caps"].as_object() else {
+        return err(StatusCode::BAD_REQUEST, "caps object required").into_response();
+    };
+    let Some(c) = manifest.connectors.iter_mut().find(|c| c.kind == kind) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("agent has no '{kind}' connector"),
+        )
+        .into_response();
+    };
+    for (k, v) in patch {
+        c.caps.insert(k.clone(), v.clone());
+    }
+    let caps_now = c.caps.clone();
+    let yaml = match serde_yaml::to_string(&manifest) {
+        Ok(y) => y,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(json!({
+        "ok": true, "npub": npub, "kind": kind, "caps": caps_now,
+        "manifest_sha256": ceremony::manifest_hash(&yaml), "ratified": false,
+        "note": "caps changed — re-ratify in the Manifest tab",
+    }))
+    .into_response()
+}
+
 pub async fn connectors_put(
     State(state): State<App>,
     OriginalUri(uri): OriginalUri,
