@@ -982,6 +982,7 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                 attachments: Vec::new(),
                 task_class: class.clone(),
                 data_class: data_class.clone(),
+                tokens_per_run: None,
             };
             let out = apiary_runtime::runner::run_task(
                 &manifest, &agent_dir, &custody, &handle, task, &ctx,

@@ -11,6 +11,7 @@
 pub mod agui;
 pub mod nip98;
 pub mod ops;
+pub mod routines;
 
 use apiary_core::{
     ceremony, custody::Custody, keystore::Keystore, log::EpisodicLog, manifest::Manifest,

@@ -142,6 +142,7 @@ pub async fn run_stream(
         attachments: to_attachments(body.attachments),
         task_class: body.class.clone(),
         data_class: body.data_class.clone(),
+        tokens_per_run: None,
     };
     let task = body.task.clone();
     let run_id2 = run_id.clone();

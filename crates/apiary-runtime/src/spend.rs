@@ -145,12 +145,26 @@ impl SpendLedger {
     /// reservation is MAX_RESERVATION (bounded, not infinite). Refuses when
     /// nothing remains after counting used + already-reserved.
     pub fn reserve(&self, cap: Option<u64>) -> Result<Reservation, crate::Error> {
+        self.reserve_up_to(cap, None)
+    }
+
+    /// Reserve with an additional per-run ceiling (a routine's
+    /// tokens_per_run): the claim is min(remaining, MAX_RESERVATION, per_run).
+    pub fn reserve_up_to(
+        &self,
+        cap: Option<u64>,
+        per_run: Option<u64>,
+    ) -> Result<Reservation, crate::Error> {
         self.with_locked(|s| {
             let used = s.input_tokens + s.output_tokens;
             let reserved: u64 = s.reservations.iter().map(|r| r.amount).sum();
             let remaining = match cap {
                 Some(c) => c.saturating_sub(used + reserved),
                 None => MAX_RESERVATION,
+            };
+            let remaining = match per_run {
+                Some(p) => remaining.min(p.max(1)),
+                None => remaining,
             };
             if remaining == 0 {
                 return Err(crate::Error::Budget(format!(

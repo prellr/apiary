@@ -2398,6 +2398,7 @@ pub fn spawn_supervisor(state: App) {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             reconcile(&state, &mut backoff);
+            crate::routines::reconcile_routines(&state);
         }
     });
 }
@@ -2430,7 +2431,13 @@ fn reconcile(state: &App, backoff: &mut std::collections::HashMap<String, u64>) 
             .as_ref()
             .map(|m| m.presence.channels.keys().cloned().collect())
             .unwrap_or_default();
-        if !active || manifest.is_none() || declared.is_empty() {
+        // Routine-only agents (no presence, but routines + log_relays) still
+        // need the lease keeper — routines fire on exactly one host.
+        let has_routines = manifest
+            .as_ref()
+            .map(|m| !m.routines.is_empty() && !m.memory.log_relays.is_empty())
+            .unwrap_or(false);
+        if !active || manifest.is_none() || (declared.is_empty() && !has_routines) {
             stop_all(presence);
             map.remove(&npub);
             continue;

@@ -256,7 +256,7 @@ impl crate::presence::ChannelAdapter for TelegramAdapter {
 /// audio is present and the text fits a caption, else sendMessage. A
 /// refused voice upload (codec, size) still delivers the text. Shared by
 /// the presence adapter and the `telegram-send` connector.
-pub(crate) fn send_reply(
+pub fn send_reply(
     client: &reqwest::blocking::Client,
     token: &str,
     chat_id: i64,

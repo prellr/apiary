@@ -17,6 +17,9 @@ pub struct TaskContext {
     pub task_class: Option<String>,
     /// e.g. "sensitive"
     pub data_class: Option<String>,
+    /// Per-run ceiling within the day's cap (routines set this); None =
+    /// the ledger's default reservation.
+    pub tokens_per_run: Option<u64>,
 }
 
 fn rule_matches(rule: &RoutingRule, ctx: &TaskContext) -> bool {
@@ -109,6 +112,7 @@ governance:
                 task_class: Some("reasoning".into()),
                 data_class: Some("sensitive".into()),
                 attachments: Vec::new(),
+                tokens_per_run: None,
             },
         )
         .unwrap();
@@ -125,6 +129,7 @@ governance:
                     task_class: Some("reasoning".into()),
                     data_class: None,
                     attachments: Vec::new(),
+                    tokens_per_run: None,
                 }
             )
             .unwrap(),

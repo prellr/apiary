@@ -164,6 +164,7 @@ dependencies = [
  "apiary-runtime",
  "axum",
  "base64 0.22.1",
+ "chrono",
  "clap",
  "nostr",
  "reqwest 0.12.28",

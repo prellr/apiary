@@ -92,7 +92,7 @@ pub fn run_task_observed(
     //    (concurrent runs cannot all pass; the reservation clamps the
     //    provider). Refusals are part of the track record too.
     let cap = tokens_per_day(&manifest.governance.budgets)?;
-    let reservation = match ledger.reserve(cap) {
+    let reservation = match ledger.reserve_up_to(cap, ctx.tokens_per_run) {
         Ok(r) => r,
         Err(e) => {
             log.append(
