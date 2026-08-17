@@ -1108,6 +1108,248 @@ pub struct LibraryBody {
     library: Vec<LibraryEntry>,
 }
 
+/// POST /api/connectors/discover — probe an MCP configuration and return
+/// its tools, so a human can pick `allowed_tools` from a list instead of
+/// guessing names. Body: {"caps": {...mcp caps...}, "bearer": "…"?}. For
+/// an HTTP server that answers 401 the reply says auth_required (grant
+/// the connector to an agent to run OAuth, then discover again with the
+/// agent's token via …/agents/{npub}/connectors/{name}/discover). Admin.
+pub async fn connectors_discover(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let pq = uri
+        .path_and_query()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| uri.path().to_string());
+    let signer = match nip98::check(&state, &headers, "POST", &pq, Some(&raw_body)) {
+        Ok(sig) => sig,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = nip98::authorize_admin(&state, signer) {
+        return e.into_response();
+    }
+    let body: serde_json::Value = match serde_json::from_slice(&raw_body) {
+        Ok(b) => b,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let caps = body["caps"].clone();
+    let bearer = body["bearer"].as_str().map(String::from);
+    let res = tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Value>, String> {
+        let cap_str = |k: &str| caps.get(k).and_then(|v| v.as_str()).map(String::from);
+        let cap_list = |k: &str| -> Vec<String> {
+            caps.get(k)
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let transport = cap_str("transport").unwrap_or_else(|| "stdio".into());
+        let binding = match transport.as_str() {
+            "stdio" => apiary_runtime::mcp::Binding::Stdio {
+                command: cap_str("command").ok_or("mcp stdio requires command")?,
+                args: cap_list("args"),
+                env_passthrough: cap_list("env"),
+            },
+            "http" => apiary_runtime::mcp::Binding::Http {
+                url: cap_str("url").ok_or("mcp http requires url")?,
+                bearer,
+            },
+            other => return Err(format!("transport '{other}' not supported (stdio | http)")),
+        };
+        let mut client =
+            apiary_runtime::mcp::McpClient::connect(binding).map_err(|e| e.to_string())?;
+        let tools = client.tools_list().map_err(|e| e.to_string())?;
+        Ok(tools
+            .into_iter()
+            .map(|t| json!({"name": t.name, "description": t.description}))
+            .collect())
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    match res {
+        Ok(tools) => Json(json!({"ok": true, "tools": tools})).into_response(),
+        Err(e) if e.contains("mcp-auth-required") => Json(json!({
+            "ok": false,
+            "auth_required": true,
+            "error": "the server wants OAuth — grant this connector to an agent (the grant runs the flow), then discover with that agent",
+            "challenge": e,
+        }))
+        .into_response(),
+        Err(e) => err(StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+}
+
+/// POST /api/agents/{npub}/connectors/{name}/discover — like the host
+/// discover, but with the agent's sealed credential (post-OAuth), so tools
+/// behind auth can be listed and allowed. Governor.
+pub async fn agent_connector_discover(
+    State(state): State<App>,
+    AxPath((npub, name)): AxPath<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (ks, npub, _dir, _raw, manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    // Grants are keyed by kind; `name` here is the library entry name and
+    // is matched against caps.library_name when present, else the sole
+    // mcp grant (or the one whose url/command matches).
+    let Some(entry) = manifest
+        .connectors
+        .iter()
+        .filter(|c| c.kind == "mcp")
+        .find(|c| {
+            c.caps.get("library_name").and_then(|v| v.as_str()) == Some(name.as_str())
+                || c.caps.get("url").and_then(|v| v.as_str()) == Some(name.as_str())
+                || c.caps.get("command").and_then(|v| v.as_str()) == Some(name.as_str())
+        })
+        .or_else(|| {
+            let mcps: Vec<_> = manifest
+                .connectors
+                .iter()
+                .filter(|c| c.kind == "mcp")
+                .collect();
+            if mcps.len() == 1 {
+                Some(mcps[0])
+            } else {
+                None
+            }
+        })
+        .cloned()
+    else {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("no mcp connector matching '{name}' granted to this agent"),
+        )
+        .into_response();
+    };
+    let (custody, handle) = match crate::admit_agent(&state, &ks, &npub) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+    };
+    let bearer = match &entry.credential {
+        Some(blob) => match custody.open(&handle, blob) {
+            Ok(z) => {
+                let raw = z.as_str().to_string();
+                match serde_json::from_str::<serde_json::Value>(&raw) {
+                    Ok(v) if v["type"] == "oauth" => v["access_token"].as_str().map(String::from),
+                    _ => Some(raw),
+                }
+            }
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        },
+        None => None,
+    };
+    let caps = serde_json::to_value(&entry.caps).unwrap_or_default();
+    let res = tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Value>, String> {
+        let cap_str = |k: &str| caps.get(k).and_then(|v| v.as_str()).map(String::from);
+        let cap_list = |k: &str| -> Vec<String> {
+            caps.get(k)
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let binding = match cap_str("transport")
+            .unwrap_or_else(|| "stdio".into())
+            .as_str()
+        {
+            "stdio" => apiary_runtime::mcp::Binding::Stdio {
+                command: cap_str("command").ok_or("mcp stdio requires command")?,
+                args: cap_list("args"),
+                env_passthrough: cap_list("env"),
+            },
+            _ => apiary_runtime::mcp::Binding::Http {
+                url: cap_str("url").ok_or("mcp http requires url")?,
+                bearer,
+            },
+        };
+        let mut client =
+            apiary_runtime::mcp::McpClient::connect(binding).map_err(|e| e.to_string())?;
+        Ok(client
+            .tools_list()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|t| json!({"name": t.name, "description": t.description}))
+            .collect())
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    match res {
+        Ok(tools) => Json(json!({"ok": true, "tools": tools})).into_response(),
+        Err(e) => err(StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+}
+
+/// POST /api/agents/{npub}/connectors/{kind}/allowed_tools {"tools":[…]}
+/// — rewrite an mcp grant's allowlist (after Discover). An amendment:
+/// re-ratify afterward. Governor.
+pub async fn connector_set_allowed_tools(
+    State(state): State<App>,
+    AxPath((npub, kind)): AxPath<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    let body: serde_json::Value = match serde_json::from_slice(&raw_body) {
+        Ok(b) => b,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let tools: Vec<String> = body["tools"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if tools.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "tools must name at least one tool (or *)",
+        )
+        .into_response();
+    }
+    let Some(c) = manifest.connectors.iter_mut().find(|c| c.kind == kind) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("agent has no '{kind}' connector"),
+        )
+        .into_response();
+    };
+    c.caps.insert("allowed_tools".into(), json!(tools));
+    let yaml = match serde_yaml::to_string(&manifest) {
+        Ok(y) => y,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(json!({
+        "ok": true, "npub": npub, "kind": kind, "allowed_tools": tools,
+        "manifest_sha256": ceremony::manifest_hash(&yaml), "ratified": false,
+        "note": "allowlist changed — re-ratify in the Manifest tab",
+    }))
+    .into_response()
+}
+
 pub async fn connectors_put(
     State(state): State<App>,
     OriginalUri(uri): OriginalUri,

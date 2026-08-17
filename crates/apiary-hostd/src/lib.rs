@@ -89,6 +89,15 @@ pub fn build_router(state: App) -> Router {
             "/api/connectors",
             get(ops::connectors_get).put(ops::connectors_put),
         )
+        .route("/api/connectors/discover", post(ops::connectors_discover))
+        .route(
+            "/api/agents/{npub}/connectors/{name}/discover",
+            post(ops::agent_connector_discover),
+        )
+        .route(
+            "/api/agents/{npub}/connectors/{kind}/allowed_tools",
+            post(ops::connector_set_allowed_tools),
+        )
         .route("/api/agents", get(list_agents))
         .route("/api/agents/found", post(found_agent))
         .route("/api/agents/import", post(ops::import_agent))

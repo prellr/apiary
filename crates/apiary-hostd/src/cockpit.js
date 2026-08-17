@@ -866,16 +866,53 @@ async function renderConnectors(c) {
   const grants = (d.manifest.connectors || []);
   if (!grants.length) gSec.append(kv('grants', 'none — the agent can think and speak, not act'));
   for (const g of grants) {
+    const box = el('div', 'ev');
     const row = el('div', 'row');
-    row.append(el('span', 'v', `${g.type} · caps ${JSON.stringify(g.caps || {})} · credential ${g.credential ? 'sealed to this agent' : 'none'}`));
+    row.append(el('span', 'v', `${g.type} · ${capsSummary(g.type, g.caps || {})} · credential ${g.credential ? 'sealed to this agent' : 'none'}`));
+    row.title = JSON.stringify(g.caps || {});
     const rv = el('button', 'btn danger', 'REVOKE');
     row.append(rv);
-    gSec.append(row);
+    box.append(row);
     rv.onclick = async () => {
       const r = await j(api('/connectors/' + encodeURIComponent(g.type)), { method: 'DELETE' });
       gStatus.textContent = r.ok ? `revoked ${g.type} — re-ratify in the Manifest tab` : 'failed: ' + r.error;
       loadRoster(); render();
     };
+    if (g.type === 'mcp') {
+      // Discover with THIS agent's sealed credential (post-OAuth), tick, apply.
+      const dRow = el('div', 'row');
+      const disc = el('button', 'btn', 'DISCOVER TOOLS');
+      const dSt = el('span', 'meta', '');
+      dRow.append(disc, dSt);
+      const toolsBox = el('div');
+      box.append(dRow, toolsBox);
+      disc.onclick = async () => {
+        dSt.textContent = 'probing with this agent’s credential…';
+        const key = (g.caps && (g.caps.library_name || g.caps.url || g.caps.command)) || 'mcp';
+        const r = await j(api('/connectors/' + encodeURIComponent(key) + '/discover'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+        if (!r.ok) { dSt.textContent = 'failed: ' + r.error; return; }
+        const allowed = new Set(g.caps.allowed_tools || []);
+        const picked = new Set(allowed);
+        toolsBox.replaceChildren();
+        dSt.textContent = `${r.tools.length} tools — tick what this agent may use, then apply`;
+        for (const t of r.tools) {
+          const cb = el('input'); cb.type = 'checkbox'; cb.style.width = 'auto'; cb.checked = allowed.has('*') || allowed.has(t.name);
+          const lab = el('label', null, ` ${t.name}${t.description ? ' — ' + t.description.slice(0, 120) : ''}`); lab.prepend(cb); lab.style.display = 'block';
+          cb.onchange = () => { if (cb.checked) picked.add(t.name); else picked.delete(t.name); picked.delete('*'); };
+          toolsBox.append(lab);
+        }
+        const apply = el('button', 'btn solid', 'APPLY ALLOWLIST (AMEND)');
+        const aSt = el('span', 'meta', '');
+        const aRow = el('div', 'row'); aRow.append(apply, aSt);
+        toolsBox.append(aRow);
+        apply.onclick = async () => {
+          const rr = await j(api('/connectors/mcp/allowed_tools'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tools: [...picked] }) });
+          aSt.textContent = rr.ok ? 'applied — re-ratify in the Manifest tab' : 'failed: ' + rr.error;
+          if (rr.ok) { loadRoster(); setTimeout(render, 800); }
+        };
+      };
+    }
+    gSec.append(box);
   }
   const gRow = el('div', 'row');
   const gSel = el('select');
@@ -933,6 +970,20 @@ async function renderConnectors(c) {
 
 // ------------------------------------------------------------ host library (host-scoped, all agents)
 
+function capsSummary(kind, caps) {
+  if (kind === 'obsidian' || kind === 'markdown-vault') {
+    const v = (caps.vaults || []).map(x => `${x.name} → ${x.path}`).join('; ');
+    return `${v || 'no vaults'}${caps.write ? ' · writable' : ' · read-only'}`;
+  }
+  if (kind === 'mcp') {
+    const where = caps.transport === 'http' ? caps.url : `${caps.command || '?'} ${(caps.args || []).join(' ')}`.trim();
+    const tools = (caps.allowed_tools || []).join(', ') || 'no tools allowed';
+    return `${where}${caps.oauth_client_id ? ' · OAuth' : ''} · tools: ${tools}`;
+  }
+  if (kind === 'nostr-publish') return `relays: ${(caps.relays || []).join(', ')}`;
+  return JSON.stringify(caps);
+}
+
 async function renderLibrary(c) {
   c.append(help('Host-scoped: named connector configurations (kind + caps — never secrets), shared by all agents. Grant from an agent’s Connectors tab; each grant is a ratified amendment for that agent alone.'));
   const lib = await j('/api/connectors');
@@ -959,7 +1010,8 @@ async function renderLibrary(c) {
     entries.forEach((e, i) => {
       const row = el('div', 'row');
       const holders = grantsByKind[e.kind] || [];
-      row.append(el('span', 'v', `${e.name} · ${e.kind} · caps ${JSON.stringify(e.caps || {})}`));
+      row.append(el('span', 'v', `${e.name} · ${e.kind} · ${capsSummary(e.kind, e.caps || {})}`));
+      row.title = JSON.stringify(e.caps || {});
       row.append(el('span', 'meta', holders.length ? 'granted to: ' + holders.join(', ') : 'granted to: nobody'));
       const del = el('button', 'btn danger', 'REMOVE');
       row.append(del);
@@ -970,24 +1022,139 @@ async function renderLibrary(c) {
       list.append(row);
     });
   };
-  const nName = el('input'); nName.placeholder = 'name (e.g. publish-main)';
+  // ---- add: a form per kind (JSON is the advanced view, not the way in)
+  const addSec = section('Add a connector',
+    'Pick a kind and fill in the fields. Nothing here is secret — secrets are sealed to an agent at grant time. Removing a library entry does not revoke grants; those live in agent manifests.');
+  const nName = el('input'); nName.placeholder = 'name (e.g. my-notes)';
   const nKind = el('select');
-  for (const k of (lib.host_binds || [])) { const o = el('option', null, k); o.value = k; nKind.append(o); }
-  const nCaps = el('input', 'grow'); nCaps.placeholder = 'caps JSON (e.g. {"relays":["wss://nos.lol"]})';
-  const nGo = el('button', 'btn', 'ADD TO LIBRARY');
-  const nRow = el('div', 'row'); nRow.append(nName, nKind, nCaps, nGo, lStatus);
-  lSec.append(list, nRow);
-  const ref = el('details');
-  ref.append(el('summary', null, 'caps reference & examples'));
-  const refBody = el('div');
-  refBody.append(help('caps are human-owned limits enforced host-side at every call. Removing a library entry does not revoke grants — those live in agent manifests.'));
-  refBody.append(kv('nostr-publish', '{"relays":["wss://nos.lol"]} — publish allowlist'));
-  refBody.append(kv('mcp (stdio)', '{"transport":"stdio","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/data"],"allowed_tools":["read_text_file"]}'));
-  refBody.append(kv('mcp (remote)', '{"transport":"http","url":"https://…/mcp","allowed_tools":["search"],"oauth_client_id":"…"}'));
-  refBody.append(kv('obsidian / markdown-vault', '{"vaults":[{"name":"kb","path":"~/repos/winery-kb/kb"}],"write":false}'));
-  ref.append(refBody);
-  lSec.append(ref);
-  c.append(lSec);
+  const kindLabels = { 'obsidian': 'Obsidian vault (memory + notes tools)', 'markdown-vault': 'Markdown folder (memory + notes tools)', 'mcp': 'MCP server (tools; stdio or remote/OAuth)', 'nostr-publish': 'Nostr publish (post notes to relays)', 'mock-echo': 'mock-echo (testing)' };
+  for (const k of (lib.host_binds || [])) { const o = el('option', null, kindLabels[k] || k); o.value = k; nKind.append(o); }
+  const kindRow = el('div', 'row'); kindRow.append(nName, nKind);
+  const fields = el('div');
+  const advanced = el('details');
+  advanced.append(el('summary', null, 'advanced: caps as JSON'));
+  const nCaps = el('textarea'); nCaps.rows = 3; nCaps.placeholder = '{}';
+  advanced.append(nCaps, help('This is exactly what the form writes. Edit it if you know what you want; the form fields above are ignored while this has content.'));
+  const nGo = el('button', 'btn solid', 'ADD TO LIBRARY');
+  const goRow = el('div', 'row'); goRow.append(nGo, lStatus);
+  addSec.append(kindRow, fields, advanced, goRow);
+  lSec.append(list);
+  c.append(lSec, addSec);
+
+  // Per-kind field builders. Each returns { caps() → object, validate() → error|null }.
+  let current = null;
+  const vaultBuilder = (obsidian) => {
+    fields.replaceChildren();
+    const rows = [];
+    const vaultsBox = el('div');
+    const addVault = (name = '', path = '') => {
+      const r = el('div', 'row');
+      const n = el('input'); n.placeholder = 'vault name (e.g. notes)'; n.value = name;
+      const pth = el('input', 'grow'); pth.placeholder = obsidian ? '/Users/you/Obsidian/MyVault' : '/Users/you/repos/some-kb/docs'; pth.value = path;
+      const rm = el('button', 'btn', '−');
+      r.append(n, pth, rm); vaultsBox.append(r); rows.push({ n, pth, r });
+      rm.onclick = () => { r.remove(); rows.splice(rows.findIndex(x => x.r === r), 1); };
+    };
+    addVault();
+    const more = el('button', 'btn', '+ another vault');
+    more.onclick = () => addVault();
+    const write = el('input'); write.type = 'checkbox'; write.style.width = 'auto';
+    const wl = el('label', null, ' allow writing notes (default read-only)'); wl.prepend(write);
+    fields.append(
+      help(obsidian
+        ? 'An Obsidian vault is a folder of markdown. Paste the folder path (Finder: right-click the vault → Get Info, or drag it into a Terminal). The agent gets search / read tools (and write, only if you allow it), and the notes also feed its memory retrieval as DATA. Tags, [[wikilinks]] and frontmatter are understood. .obsidian and hidden folders are skipped.'
+        : 'Any folder of markdown files — a knowledge-base repo checkout, docs, meeting notes. Same tools as Obsidian without the Obsidian-specific parsing.'),
+      vaultsBox, more, wl,
+      help('Paths are jailed: the agent cannot read or write outside the folders you list, even via symlinks. Ceiling 5000 notes per vault.'));
+    current = {
+      caps: () => ({ vaults: rows.map(x => ({ name: x.n.value.trim(), path: x.pth.value.trim() })).filter(v => v.name && v.path), write: write.checked }),
+      validate: () => rows.some(x => x.n.value.trim() && x.pth.value.trim()) ? null : 'add at least one vault (name + path)',
+    };
+  };
+  const mcpBuilder = () => {
+    fields.replaceChildren();
+    const tr = el('select');
+    for (const [v, t] of [['stdio', 'local program (stdio) — e.g. npx @modelcontextprotocol/server-filesystem'], ['http', 'remote server (HTTP) — URL, optionally OAuth']]) { const o = el('option', null, t); o.value = v; tr.append(o); }
+    const stdioBox = el('div');
+    const cmd = el('input'); cmd.placeholder = 'command (npx, uvx, /path/to/server)';
+    const args = el('input', 'grow'); args.placeholder = 'arguments, space-separated (-y @modelcontextprotocol/server-filesystem /Users/you/docs)';
+    const envs = el('input'); envs.placeholder = 'env vars to pass through (optional, comma-separated)';
+    const r1 = el('div', 'row'); r1.append(cmd, args); const r1b = el('div', 'row'); r1b.append(envs);
+    stdioBox.append(r1, r1b, help('The program is spawned with a scrubbed environment (PATH, HOME, TMPDIR, LANG + what you list). Pre-run `npx …` once in a terminal so the first probe isn’t a download.'));
+    const httpBox = el('div'); httpBox.style.display = 'none';
+    const url = el('input', 'grow'); url.placeholder = 'https://mcp.example.com/mcp';
+    const oauth = el('input'); oauth.placeholder = 'OAuth client id (if the server uses OAuth)';
+    const bearer = el('input'); bearer.type = 'password'; bearer.placeholder = 'API key / bearer for discovery only (not stored)';
+    const r2 = el('div', 'row'); r2.append(url); const r2b = el('div', 'row'); r2b.append(oauth, bearer);
+    httpBox.append(r2, r2b, help('OAuth servers: leave the key blank; when you GRANT this to an agent the cockpit runs the sign-in and seals the tokens to that agent. Then use “Discover tools” on the agent’s Connectors tab. API-key servers: the key is sealed at grant time; you can paste it here just to discover.'));
+    const disc = el('button', 'btn', 'DISCOVER TOOLS');
+    const dStatus = el('span', 'meta', '');
+    const toolsBox = el('div');
+    const dRow = el('div', 'row'); dRow.append(disc, dStatus);
+    let picked = new Set();
+    let known = [];
+    const drawTools = () => {
+      toolsBox.replaceChildren();
+      if (!known.length) { toolsBox.append(help('Tools the agent may call must be allowed by name — click Discover to list them, then tick the ones this agent may use. (Advanced: * allows all.)')); return; }
+      const all = el('input'); all.type = 'checkbox'; all.style.width = 'auto';
+      const al = el('label', null, ' allow all (*) — every tool the server exposes, now and later'); al.prepend(all);
+      toolsBox.append(al);
+      all.onchange = () => { if (all.checked) { picked = new Set(['*']); } else { picked.delete('*'); } drawTools(); };
+      if (picked.has('*')) { all.checked = true; return; }
+      for (const t of known) {
+        const cb = el('input'); cb.type = 'checkbox'; cb.style.width = 'auto'; cb.checked = picked.has(t.name);
+        const lab = el('label', null, ` ${t.name}${t.description ? ' — ' + t.description.slice(0, 120) : ''}`); lab.prepend(cb);
+        lab.style.display = 'block';
+        cb.onchange = () => { if (cb.checked) picked.add(t.name); else picked.delete(t.name); };
+        toolsBox.append(lab);
+      }
+    };
+    drawTools();
+    tr.onchange = () => { stdioBox.style.display = tr.value === 'stdio' ? '' : 'none'; httpBox.style.display = tr.value === 'http' ? '' : 'none'; };
+    const trRow = el('div', 'row'); trRow.append(tr);
+    fields.append(trRow, stdioBox, httpBox, dRow, toolsBox);
+    const buildCaps = () => {
+      const caps = { transport: tr.value, allowed_tools: [...picked] };
+      if (tr.value === 'stdio') { caps.command = cmd.value.trim(); caps.args = args.value.trim() ? args.value.trim().split(/\s+/) : []; if (envs.value.trim()) caps.env = envs.value.split(',').map(x => x.trim()).filter(Boolean); }
+      else { caps.url = url.value.trim(); if (oauth.value.trim()) caps.oauth_client_id = oauth.value.trim(); }
+      return caps;
+    };
+    disc.onclick = async () => {
+      dStatus.textContent = 'probing…';
+      const caps = buildCaps();
+      const r = await j('/api/connectors/discover', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ caps, bearer: bearer.value || undefined }) });
+      if (r.ok) { known = r.tools || []; dStatus.textContent = `${known.length} tools`; drawTools(); }
+      else if (r.auth_required) { dStatus.textContent = 'server wants OAuth — save the entry, grant it to an agent (that runs the sign-in), then discover from the agent’s Connectors tab'; }
+      else dStatus.textContent = 'failed: ' + r.error;
+    };
+    current = {
+      caps: buildCaps,
+      validate: () => {
+        if (tr.value === 'stdio' && !cmd.value.trim()) return 'command required';
+        if (tr.value === 'http' && !/^https?:\/\//.test(url.value.trim())) return 'a full URL is required';
+        if (!picked.size) return 'allow at least one tool (Discover, then tick) — or * for all';
+        return null;
+      },
+    };
+  };
+  const nostrBuilder = () => {
+    fields.replaceChildren();
+    const relays = el('input', 'grow'); relays.placeholder = 'wss://nos.lol, wss://relay.damus.io'; relays.value = 'wss://nos.lol, wss://relay.damus.io';
+    const r = el('div', 'row'); r.append(relays);
+    fields.append(help('The agent may publish public notes (kind 1) signed with its own key — only to these relays. This is the allowlist; the agent cannot add relays.'), r);
+    current = {
+      caps: () => ({ relays: relays.value.split(',').map(x => x.trim()).filter(Boolean) }),
+      validate: () => relays.value.split(',').some(x => /^wss?:\/\//.test(x.trim())) ? null : 'at least one wss:// relay',
+    };
+  };
+  const mockBuilder = () => { fields.replaceChildren(); fields.append(help('Echoes its input — for tests.')); current = { caps: () => ({}), validate: () => null }; };
+  const pickBuilder = () => {
+    nCaps.value = '';
+    ({ 'obsidian': () => vaultBuilder(true), 'markdown-vault': () => vaultBuilder(false), 'mcp': mcpBuilder, 'nostr-publish': nostrBuilder }[nKind.value] || mockBuilder)();
+  };
+  nKind.onchange = pickBuilder;
+  pickBuilder();
+
   const saveLib = async () => {
     const r = await j('/api/connectors', {
       method: 'PUT', headers: { 'content-type': 'application/json' },
@@ -998,12 +1165,16 @@ async function renderLibrary(c) {
   };
   drawList();
   nGo.onclick = async () => {
-    let caps = {};
+    let caps;
     if (nCaps.value.trim()) {
-      try { caps = JSON.parse(nCaps.value); } catch { lStatus.textContent = 'caps is not valid JSON'; return; }
+      try { caps = JSON.parse(nCaps.value); } catch { lStatus.textContent = 'advanced caps is not valid JSON'; return; }
+    } else {
+      const bad = current.validate();
+      if (bad) { lStatus.textContent = bad; return; }
+      caps = current.caps();
     }
-    if (!nName.value.trim()) { lStatus.textContent = 'name required'; return; }
-    entries.push({ name: nName.value.trim(), kind: nKind.value, caps });
+    if (!nName.value.trim()) { lStatus.textContent = 'give it a name'; return; }
+    entries.push({ name: nName.value.trim().replace(/[^A-Za-z0-9_-]/g, '-'), kind: nKind.value, caps });
     await saveLib();
   };
 
