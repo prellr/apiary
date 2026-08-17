@@ -1203,8 +1203,9 @@ function connectorDetails(card, kind, caps, onWrite) {
   } else if (kind === 'nostr-publish') {
     card.append(kv('relays', (caps.relays || []).join(', ')));
   } else if (kind === 'web-fetch') {
-    card.append(kv('domains', (caps.allowed_domains || []).join(', ')),
-      kv('subdomains', caps.allow_subdomains ? 'allowed' : 'not allowed'),
+    card.append(kv('access', caps.allow_all_public ? 'all public HTTPS websites' : (caps.allowed_domains || []).join(', ')));
+    if (!caps.allow_all_public) card.append(kv('subdomains', caps.allow_subdomains ? 'allowed' : 'not allowed'));
+    card.append(kv('safety', 'private and special-use networks blocked'),
       kv('response limit', `${Math.round((caps.max_bytes || 262144) / 1024)} KiB`));
   } else if (kind === 'files') {
     for (const root of (caps.roots || [])) card.append(kv(root.name, root.path));
@@ -1228,7 +1229,9 @@ function capsSummary(kind, caps) {
     return `${where}${caps.oauth_client_id ? ' · OAuth' : ''} · tools: ${tools}`;
   }
   if (kind === 'nostr-publish') return `relays: ${(caps.relays || []).join(', ')}`;
-  if (kind === 'web-fetch') return `HTTPS: ${(caps.allowed_domains || []).join(', ') || 'no domains'}`;
+  if (kind === 'web-fetch') return caps.allow_all_public
+    ? 'all public HTTPS websites · private networks blocked'
+    : `HTTPS: ${(caps.allowed_domains || []).join(', ') || 'no domains'}`;
   if (kind === 'files') return `${(caps.roots || []).map(x => `${x.name} → ${x.path}`).join('; ') || 'no roots'} · read-only`;
   if (kind === 'git') return `${(caps.repos || []).map(x => `${x.name} → ${x.path}`).join('; ') || 'no repositories'} · read-only`;
   return JSON.stringify(caps);
@@ -1320,7 +1323,7 @@ async function renderLibrary(c) {
   nName.oninput = () => { nName.dataset.auto = ''; };
   const nKind = el('select');
   const kindLabels = {
-    'web-fetch': 'Web research (approved HTTPS domains)',
+    'web-fetch': 'Web research (all public websites)',
     'files': 'Files and documents (read-only folders)',
     'git': 'Git repositories (read-only)',
     'obsidian': 'Obsidian vault (memory + notes tools)',
@@ -1423,21 +1426,25 @@ async function renderLibrary(c) {
   };
   const webBuilder = () => {
     fields.replaceChildren();
+    const restrict = el('input'); restrict.type = 'checkbox'; restrict.style.width = 'auto';
+    const restrictLabel = el('label', null, ' restrict access to specific domains'); restrictLabel.prepend(restrict);
     const domains = el('textarea'); domains.rows = 3; domains.placeholder = 'docs.example.com\napi.example.com';
     const subdomains = el('input'); subdomains.type = 'checkbox'; subdomains.style.width = 'auto';
     const subdomainsLabel = el('label', null, ' also allow subdomains of each domain'); subdomainsLabel.prepend(subdomains);
+    const domainBox = el('div'); domainBox.style.display = 'none';
+    domainBox.append(field('Approved domains', domains, 'One per line or comma-separated. Exact hosts only unless you allow subdomains.'), subdomainsLabel);
     const maxKiB = el('input'); maxKiB.type = 'number'; maxKiB.min = '16'; maxKiB.max = '2048'; maxKiB.value = '256';
     const limitRow = el('div', 'row'); limitRow.append(field('Maximum response (KiB)', maxKiB, '16–2048 KiB'));
+    restrict.onchange = () => { domainBox.style.display = restrict.checked ? '' : 'none'; if (restrict.checked) domains.focus(); };
     fields.append(
-      help('HTTPS only. Enter host names—not URLs or paths. DNS is resolved and pinned for each request; loopback, private, link-local, and other special-use addresses are refused, including after redirects.'),
-      field('Approved domains', domains, 'One per line or comma-separated. Exact hosts only unless you allow subdomains.'),
-      subdomainsLabel, limitRow);
+      help('By default the agent may read any public HTTPS website. DNS is resolved and pinned for every request; loopback, private, link-local, and other special-use networks stay blocked, including after redirects.'),
+      restrictLabel, domainBox, limitRow);
     const parsed = () => domains.value.split(/[\s,]+/).map(x => x.trim().toLowerCase()).filter(Boolean);
     current = {
-      caps: () => ({ allowed_domains: [...new Set(parsed())], allow_subdomains: subdomains.checked, max_bytes: Number(maxKiB.value) * 1024 }),
+      caps: () => ({ allow_all_public: !restrict.checked, allowed_domains: restrict.checked ? [...new Set(parsed())] : [], allow_subdomains: restrict.checked && subdomains.checked, max_bytes: Number(maxKiB.value) * 1024 }),
       validate: () => {
-        if (!parsed().length) return 'add at least one approved domain';
-        if (parsed().some(x => !/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(x))) return 'domains must be host names only (no scheme, port, or path)';
+        if (restrict.checked && !parsed().length) return 'add at least one approved domain or turn off the restriction';
+        if (restrict.checked && parsed().some(x => !/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(x))) return 'domains must be host names only (no scheme, port, or path)';
         const size = Number(maxKiB.value);
         return Number.isFinite(size) && size >= 16 && size <= 2048 ? null : 'response limit must be between 16 and 2048 KiB';
       },
@@ -1595,15 +1602,18 @@ async function renderLibrary(c) {
       meta.append(el('span', null, item.publisher), el('span', 'risk', item.risk));
       const row = el('div', 'row'); row.append(meta, el('span', 'grow', ''));
       const installed = entries.find(e => e.caps && e.caps.catalog_id === item.id);
-      const action = el('button', 'btn', installed ? 'ADDED ✓' : (item.setup === 'credential' ? 'ADD TO LIBRARY' : 'CONFIGURE'));
+      const directAdd = item.setup === 'credential' || item.setup === 'none';
+      const action = el('button', 'btn', installed ? 'ADDED ✓' : (directAdd ? 'ADD TO LIBRARY' : 'CONFIGURE'));
       action.disabled = !!installed;
       row.append(action); card.append(row); catalogList.append(card);
       action.onclick = async () => {
-        if (item.setup === 'credential') {
+        if (directAdd) {
           action.disabled = true; action.textContent = 'ADDING…';
           const caps = JSON.parse(JSON.stringify(item.caps || {})); caps.catalog_id = item.id;
           entries.push({ name: uniqueName(item.name), kind: item.kind, caps });
-          window.__libFlash = `added ${item.name} — grant it from an agent’s Capabilities and seal the requested credential there`;
+          window.__libFlash = item.setup === 'credential'
+            ? `added ${item.name} — grant it from an agent’s Capabilities and seal the requested credential there`
+            : `added ${item.name} — grant it to an agent, then ratify the capability change`;
           await saveLib();
           return;
         }

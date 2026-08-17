@@ -1210,13 +1210,13 @@ fn connector_catalog() -> serde_json::Value {
         {
             "id": "web-research",
             "name": "Web research",
-            "description": "Read approved HTTPS sites. Redirects are rechecked and private networks are blocked.",
+            "description": "Read any public HTTPS website. Private networks stay blocked and every redirect is rechecked.",
             "kind": "web-fetch",
-            "risk": "read-only network",
+            "risk": "read-only public network",
             "publisher": "Apiary",
             "source": "built-in",
-            "setup": "domains",
-            "caps": {"allowed_domains": [], "allow_subdomains": false, "max_bytes": 262144}
+            "setup": "none",
+            "caps": {"allow_all_public": true, "allowed_domains": [], "allow_subdomains": false, "max_bytes": 262144}
         },
         {
             "id": "files-readonly",

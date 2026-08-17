@@ -453,6 +453,11 @@ fn refresh_access_token(oauth: &Value) -> Result<String, crate::Error> {
 /// are rejected, and every redirect is checked again. There is no generic
 /// request method, arbitrary header, or private-network escape hatch.
 fn bind_web_fetch(entry: &apiary_core::manifest::Connector) -> Result<WebFetch, crate::Error> {
+    let allow_all_public = entry
+        .caps
+        .get("allow_all_public")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let domains = entry
         .caps
         .get("allowed_domains")
@@ -471,9 +476,9 @@ fn bind_web_fetch(entry: &apiary_core::manifest::Connector) -> Result<WebFetch, 
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    if domains.is_empty() {
+    if domains.is_empty() && !allow_all_public {
         return Err(crate::Error::Provider(
-            "web-fetch requires caps.allowed_domains (explicit hostnames)".into(),
+            "web-fetch requires caps.allow_all_public=true or explicit caps.allowed_domains".into(),
         ));
     }
     let max_bytes = entry
@@ -484,6 +489,7 @@ fn bind_web_fetch(entry: &apiary_core::manifest::Connector) -> Result<WebFetch, 
         .clamp(1_024, 2_097_152) as usize;
     Ok(WebFetch {
         domains,
+        allow_all_public,
         allow_subdomains: entry
             .caps
             .get("allow_subdomains")
@@ -495,19 +501,24 @@ fn bind_web_fetch(entry: &apiary_core::manifest::Connector) -> Result<WebFetch, 
 
 struct WebFetch {
     domains: Vec<String>,
+    allow_all_public: bool,
     allow_subdomains: bool,
     max_bytes: usize,
 }
 
 impl Connector for WebFetch {
     fn def(&self) -> ToolDef {
+        let access = if self.allow_all_public {
+            "all public HTTPS websites".to_string()
+        } else {
+            format!("the human-approved domains: {}", self.domains.join(", "))
+        };
         ToolDef {
             name: "web_fetch".into(),
             description: format!(
-                "Read a text, HTML, JSON, or XML page over HTTPS. The human-approved domain \
-                 allowlist is: {}. Private networks, credentials in URLs, unapproved redirects, \
+                "Read a text, HTML, JSON, or XML page over HTTPS from {access}. \
+                 Private networks, credentials in URLs, unapproved redirects, \
                  binary bodies, and responses above the configured limit are refused.",
-                self.domains.join(", ")
             ),
             input_schema: json!({
                 "type": "object",
@@ -530,7 +541,12 @@ impl Connector for WebFetch {
         let mut url = reqwest::Url::parse(raw)
             .map_err(|e| crate::Error::Provider(format!("invalid URL: {e}")))?;
         for _ in 0..=5 {
-            let (host, addr) = validate_web_url(&url, &self.domains, self.allow_subdomains)?;
+            let (host, addr) = validate_web_url(
+                &url,
+                self.allow_all_public,
+                &self.domains,
+                self.allow_subdomains,
+            )?;
             let client = reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(20))
                 .redirect(reqwest::redirect::Policy::none())
@@ -605,6 +621,7 @@ impl Connector for WebFetch {
 
 fn validate_web_url(
     url: &reqwest::Url,
+    allow_all_public: bool,
     domains: &[String],
     allow_subdomains: bool,
 ) -> Result<(String, std::net::SocketAddr), crate::Error> {
@@ -621,7 +638,7 @@ fn validate_web_url(
         .ok_or_else(|| crate::Error::Provider("URL has no hostname".into()))?
         .trim_end_matches('.')
         .to_ascii_lowercase();
-    if !domain_allowed(&host, domains, allow_subdomains) {
+    if !domain_allowed(&host, allow_all_public, domains, allow_subdomains) {
         return Err(crate::Error::Provider(format!(
             "domain '{host}' is not in the manifest allowlist"
         )));
@@ -641,16 +658,22 @@ fn validate_web_url(
     ))
 }
 
-fn domain_allowed(host: &str, domains: &[String], allow_subdomains: bool) -> bool {
-    domains.iter().any(|configured| {
-        let wildcard = configured.strip_prefix("*.");
-        let base = wildcard.unwrap_or(configured);
-        host == base
-            || ((allow_subdomains || wildcard.is_some())
-                && host.len() > base.len()
-                && host.ends_with(base)
-                && host.as_bytes()[host.len() - base.len() - 1] == b'.')
-    })
+fn domain_allowed(
+    host: &str,
+    allow_all_public: bool,
+    domains: &[String],
+    allow_subdomains: bool,
+) -> bool {
+    allow_all_public
+        || domains.iter().any(|configured| {
+            let wildcard = configured.strip_prefix("*.");
+            let base = wildcard.unwrap_or(configured);
+            host == base
+                || ((allow_subdomains || wildcard.is_some())
+                    && host.len() > base.len()
+                    && host.ends_with(base)
+                    && host.as_bytes()[host.len() - base.len() - 1] == b'.')
+        })
 }
 
 fn public_ip(ip: std::net::IpAddr) -> bool {
@@ -1859,16 +1882,23 @@ mod connector_security_tests {
     #[test]
     fn web_domains_are_exact_unless_subdomains_are_explicit() {
         let domains = vec!["example.com".to_string()];
-        assert!(domain_allowed("example.com", &domains, false));
-        assert!(!domain_allowed("www.example.com", &domains, false));
-        assert!(domain_allowed("www.example.com", &domains, true));
-        assert!(!domain_allowed("evilexample.com", &domains, true));
-        assert!(!domain_allowed("example.com.evil.test", &domains, true));
+        assert!(domain_allowed("example.com", false, &domains, false));
+        assert!(!domain_allowed("www.example.com", false, &domains, false));
+        assert!(domain_allowed("www.example.com", false, &domains, true));
+        assert!(!domain_allowed("evilexample.com", false, &domains, true));
+        assert!(!domain_allowed(
+            "example.com.evil.test",
+            false,
+            &domains,
+            true
+        ));
         assert!(domain_allowed(
             "docs.example.com",
+            false,
             &["*.example.com".to_string()],
             false
         ));
+        assert!(domain_allowed("anywhere.example", true, &[], false));
     }
 
     #[test]

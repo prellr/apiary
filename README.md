@@ -46,8 +46,8 @@ model runs). What exists today:
   and the operator's task (proven live: a channel mention asking an agent
   to use its connectors gets a polite refusal)
 - Connectors, default-deny: `nostr-publish` (relay-allowlisted), **`mcp`**
-  (see below), read-only **`web-fetch`** (HTTPS domain allowlist with
-  DNS-rebinding/redirect checks), **`files`** (named roots, text-type and
+  (see below), read-only **`web-fetch`** (all public HTTPS sites by default,
+  with optional domain restriction and DNS-rebinding/redirect checks), **`files`** (named roots, text-type and
   size limits), read-only **`git`** (status/log/diff/show/search with Git
   hooks and external programs disabled), and **`obsidian` / `markdown-vault`** — named markdown
   knowledge folders (Obsidian vaults, checked-out KB repos, plain note
