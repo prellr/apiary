@@ -80,6 +80,56 @@ pub trait Provider {
         max_tokens: u64,
     ) -> Result<Completion, crate::Error>;
 
+    /// Streaming completion: `on_delta` receives text as the model produces
+    /// it; the returned Completion is the whole. Providers without a
+    /// streaming path deliver the full text as one delta — callers can
+    /// always treat the stream as the truth. Same budget clamp as `complete`.
+    fn complete_streaming(
+        &self,
+        model: &str,
+        system: &str,
+        prompt: &str,
+        images: &[ImageInput],
+        max_tokens: u64,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<Completion, crate::Error> {
+        let c = self.complete(model, system, prompt, images, max_tokens)?;
+        if !c.text.is_empty() {
+            on_delta(&c.text);
+        }
+        Ok(c)
+    }
+
+    /// Tool loop with streamed text: deltas of every assistant turn (the
+    /// "let me check…" before a tool call and the final answer) reach
+    /// `on_delta` live. Default: the non-streaming loop, then one delta.
+    #[allow(clippy::too_many_arguments)]
+    fn complete_with_tools_streaming(
+        &self,
+        model: &str,
+        system: &str,
+        prompt: &str,
+        images: &[ImageInput],
+        tools: &[crate::connector::ToolDef],
+        dispatch: ToolDispatch,
+        budget_tokens: u64,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<Completion, crate::Error> {
+        let c = self.complete_with_tools(
+            model,
+            system,
+            prompt,
+            images,
+            tools,
+            dispatch,
+            budget_tokens,
+        )?;
+        if !c.text.is_empty() {
+            on_delta(&c.text);
+        }
+        Ok(c)
+    }
+
     /// Multi-turn tool loop under a cumulative token budget: each iteration
     /// is clamped to what remains, and the loop stops (outcome
     /// "budget-exhausted") rather than overrunning. Providers without tool
@@ -224,6 +274,61 @@ impl Provider for AnthropicProvider {
         })
     }
 
+    fn complete_streaming(
+        &self,
+        model: &str,
+        system: &str,
+        prompt: &str,
+        images: &[ImageInput],
+        max_tokens: u64,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<Completion, crate::Error> {
+        let payload = self.request_streaming(
+            &json!({
+                "model": model,
+                "max_tokens": max_tokens.clamp(1, 16000),
+                "system": system,
+                "messages": [{"role": "user", "content": anthropic_user_content(prompt, images)}],
+            }),
+            on_delta,
+        )?;
+        let stop_reason = payload["stop_reason"].as_str().unwrap_or("unknown");
+        Ok(Completion {
+            text: extract_text(&payload),
+            model: payload["model"].as_str().unwrap_or(model).to_string(),
+            outcome: match stop_reason {
+                "end_turn" | "stop_sequence" => "ok".into(),
+                other => other.into(),
+            },
+            input_tokens: payload["usage"]["input_tokens"].as_u64().unwrap_or(0),
+            output_tokens: payload["usage"]["output_tokens"].as_u64().unwrap_or(0),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn complete_with_tools_streaming(
+        &self,
+        model: &str,
+        system: &str,
+        prompt: &str,
+        images: &[ImageInput],
+        tools: &[crate::connector::ToolDef],
+        dispatch: ToolDispatch,
+        budget_tokens: u64,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<Completion, crate::Error> {
+        self.tool_loop(
+            model,
+            system,
+            prompt,
+            images,
+            tools,
+            dispatch,
+            budget_tokens,
+            Some(on_delta),
+        )
+    }
+
     /// The tool loop: model requests → host dispatches → results return →
     /// repeat until end_turn (or the iteration cap: bounded by construction).
     fn complete_with_tools(
@@ -235,6 +340,174 @@ impl Provider for AnthropicProvider {
         tools: &[crate::connector::ToolDef],
         dispatch: ToolDispatch,
         budget_tokens: u64,
+    ) -> Result<Completion, crate::Error> {
+        self.tool_loop(
+            model,
+            system,
+            prompt,
+            images,
+            tools,
+            dispatch,
+            budget_tokens,
+            None,
+        )
+    }
+}
+
+impl AnthropicProvider {
+    /// One Messages call over SSE, assembled back into the non-streaming
+    /// payload shape ({content:[…], stop_reason, usage, model}) so the
+    /// tool loop is unchanged — with text deltas handed to `on_delta` as
+    /// they arrive and tool_use inputs rebuilt from input_json_delta.
+    fn request_streaming(
+        &self,
+        body: &serde_json::Value,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<serde_json::Value, crate::Error> {
+        use std::io::BufRead;
+        let mut body = body.clone();
+        body["stream"] = json!(true);
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .map_err(|e| crate::Error::Provider(format!("anthropic client: {e}")))?;
+        let mut req = client
+            .post(format!("{}/v1/messages", self.base_url))
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream");
+        req = match &self.auth {
+            AnthropicAuth::ApiKey(k) => req.header("x-api-key", k.as_str()),
+            AnthropicAuth::Bearer(t) => req
+                .header("authorization", format!("Bearer {}", t.as_str()))
+                .header("anthropic-beta", "oauth-2025-04-20"),
+        };
+        let resp = req
+            .json(&body)
+            .send()
+            .map_err(|e| crate::Error::Provider(format!("anthropic request: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let payload: serde_json::Value = resp.json().unwrap_or_default();
+            let msg = payload["error"]["message"].as_str().unwrap_or("unknown");
+            return Err(crate::Error::Provider(format!("anthropic {status}: {msg}")));
+        }
+        // Assembly state.
+        let mut blocks: Vec<serde_json::Value> = Vec::new();
+        let mut json_bufs: std::collections::HashMap<usize, String> = Default::default();
+        let mut used_model = body["model"].as_str().unwrap_or("").to_string();
+        let mut input_tokens = 0u64;
+        let mut output_tokens = 0u64;
+        let mut stop_reason = "unknown".to_string();
+        let mut error: Option<String> = None;
+        let reader = std::io::BufReader::new(resp);
+        for line in reader.lines() {
+            let line =
+                line.map_err(|e| crate::Error::Provider(format!("anthropic stream: {e}")))?;
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            let Ok(ev) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            match ev["type"].as_str().unwrap_or("") {
+                "message_start" => {
+                    if let Some(m) = ev["message"]["model"].as_str() {
+                        used_model = m.to_string();
+                    }
+                    input_tokens = ev["message"]["usage"]["input_tokens"].as_u64().unwrap_or(0);
+                }
+                "content_block_start" => {
+                    let idx = ev["index"].as_u64().unwrap_or(blocks.len() as u64) as usize;
+                    while blocks.len() <= idx {
+                        blocks.push(json!({"type": "text", "text": ""}));
+                    }
+                    let mut b = ev["content_block"].clone();
+                    if b["type"] == "tool_use" {
+                        json_bufs.insert(idx, String::new());
+                        b["input"] = json!({});
+                    }
+                    blocks[idx] = b;
+                }
+                "content_block_delta" => {
+                    let idx = ev["index"].as_u64().unwrap_or(0) as usize;
+                    while blocks.len() <= idx {
+                        blocks.push(json!({"type": "text", "text": ""}));
+                    }
+                    match ev["delta"]["type"].as_str().unwrap_or("") {
+                        "text_delta" => {
+                            if let Some(t) = ev["delta"]["text"].as_str() {
+                                let cur = blocks[idx]["text"].as_str().unwrap_or("").to_string();
+                                blocks[idx]["text"] = json!(cur + t);
+                                on_delta(t);
+                            }
+                        }
+                        "input_json_delta" => {
+                            if let Some(pj) = ev["delta"]["partial_json"].as_str() {
+                                json_bufs.entry(idx).or_default().push_str(pj);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                "content_block_stop" => {
+                    let idx = ev["index"].as_u64().unwrap_or(0) as usize;
+                    if let Some(buf) = json_bufs.remove(&idx) {
+                        let input = if buf.trim().is_empty() {
+                            json!({})
+                        } else {
+                            serde_json::from_str(&buf).unwrap_or(json!({}))
+                        };
+                        if idx < blocks.len() {
+                            blocks[idx]["input"] = input;
+                        }
+                    }
+                }
+                "message_delta" => {
+                    if let Some(sr) = ev["delta"]["stop_reason"].as_str() {
+                        stop_reason = sr.to_string();
+                    }
+                    if let Some(o) = ev["usage"]["output_tokens"].as_u64() {
+                        output_tokens = o;
+                    }
+                }
+                "error" => {
+                    error = Some(
+                        ev["error"]["message"]
+                            .as_str()
+                            .unwrap_or("stream error")
+                            .to_string(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        if let Some(e) = error {
+            return Err(crate::Error::Provider(format!("anthropic stream: {e}")));
+        }
+        Ok(json!({
+            "content": blocks,
+            "stop_reason": stop_reason,
+            "model": used_model,
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tool_loop(
+        &self,
+        model: &str,
+        system: &str,
+        prompt: &str,
+        images: &[ImageInput],
+        tools: &[crate::connector::ToolDef],
+        dispatch: ToolDispatch,
+        budget_tokens: u64,
+        mut on_delta: Option<&mut dyn FnMut(&str)>,
     ) -> Result<Completion, crate::Error> {
         const MAX_ITERATIONS: usize = 8;
         let base_estimate = estimate_tokens(system)
@@ -276,13 +549,17 @@ impl Provider for AnthropicProvider {
                     output_tokens: out_total,
                 });
             }
-            let payload = self.request(&json!({
+            let body = json!({
                 "model": model,
                 "max_tokens": remaining.clamp(1, 16000),
                 "system": system,
                 "messages": messages,
                 "tools": tool_defs,
-            }))?;
+            });
+            let payload = match on_delta.as_mut() {
+                Some(cb) => self.request_streaming(&body, *cb)?,
+                None => self.request(&body)?,
+            };
             in_total += payload["usage"]["input_tokens"].as_u64().unwrap_or(0);
             out_total += payload["usage"]["output_tokens"].as_u64().unwrap_or(0);
             if let Some(m) = payload["model"].as_str() {

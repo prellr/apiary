@@ -150,8 +150,23 @@ pub async fn run_stream(
 
     tokio::task::spawn_blocking(move || {
         let msg_id = format!("{run_id2}-msg");
+        // Streamed deltas open the message; the completion branch then
+        // only closes it (no duplicate content).
+        let streamed = std::sync::atomic::AtomicBool::new(false);
         let observer = |e: RunEvent| {
             let _ = match e {
+                RunEvent::TextDelta { text } => {
+                    if !streamed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        let _ = tx2.send(agui(
+                            "TEXT_MESSAGE_START",
+                            json!({"messageId": msg_id, "role": "assistant"}),
+                        ));
+                    }
+                    tx2.send(agui(
+                        "TEXT_MESSAGE_CONTENT",
+                        json!({"messageId": msg_id, "delta": text}),
+                    ))
+                }
                 RunEvent::Started { slot, model } => tx2.send(agui(
                     "STEP_STARTED",
                     json!({"stepName": format!("infer:{slot}/{model}")}),
@@ -184,14 +199,16 @@ pub async fn run_stream(
         );
         match result {
             Ok(out) => {
-                let _ = tx2.send(agui(
-                    "TEXT_MESSAGE_START",
-                    json!({"messageId": msg_id, "role": "assistant"}),
-                ));
-                let _ = tx2.send(agui(
-                    "TEXT_MESSAGE_CONTENT",
-                    json!({"messageId": msg_id, "delta": out.completion.text}),
-                ));
+                if !streamed.load(std::sync::atomic::Ordering::SeqCst) {
+                    let _ = tx2.send(agui(
+                        "TEXT_MESSAGE_START",
+                        json!({"messageId": msg_id, "role": "assistant"}),
+                    ));
+                    let _ = tx2.send(agui(
+                        "TEXT_MESSAGE_CONTENT",
+                        json!({"messageId": msg_id, "delta": out.completion.text}),
+                    ));
+                }
                 let _ = tx2.send(agui("TEXT_MESSAGE_END", json!({"messageId": msg_id})));
                 let _ = tx2.send(agui(
                     "CUSTOM",

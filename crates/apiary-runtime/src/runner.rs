@@ -41,6 +41,11 @@ pub enum RunEvent {
         ok: bool,
         detail: String,
     },
+    /// A piece of the reply as the model produces it (streaming path).
+    /// The Finished event still carries the whole text.
+    TextDelta {
+        text: String,
+    },
     Finished {
         outcome: String,
         text: String,
@@ -193,12 +198,21 @@ pub fn run_task_observed(
     }
     let run = || -> Result<crate::inference::Completion, crate::Error> {
         Ok(if connectors.is_empty() {
-            provider.complete(
+            // No tools → stream: observers (the AG-UI endpoint, a voice
+            // companion) get text as it is generated. Providers without a
+            // streaming path deliver one delta; nothing changes for them.
+            let mut on_delta = |t: &str| {
+                emit(RunEvent::TextDelta {
+                    text: t.to_string(),
+                })
+            };
+            provider.complete_streaming(
                 &model,
                 &system,
                 task,
                 &images,
                 reservation.amount - input_estimate,
+                &mut on_delta,
             )?
         } else {
             let tool_defs: Vec<crate::connector::ToolDef> =
@@ -251,7 +265,12 @@ pub fn run_task_observed(
                 )?;
                 result
             };
-            provider.complete_with_tools(
+            let mut on_delta = |t: &str| {
+                emit(RunEvent::TextDelta {
+                    text: t.to_string(),
+                })
+            };
+            provider.complete_with_tools_streaming(
                 &model,
                 &system,
                 task,
@@ -259,6 +278,7 @@ pub fn run_task_observed(
                 &tool_defs,
                 &mut dispatch,
                 reservation.amount,
+                &mut on_delta,
             )?
         })
     };
