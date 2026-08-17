@@ -138,6 +138,11 @@ pub fn build_router(state: App) -> Router {
         )
         .route("/oauth/callback", get(ops::oauth_callback))
         .route("/api/agents/{npub}/name", post(ops::rename_agent))
+        .route("/api/agents/{npub}/proposal", get(routines::get_proposal))
+        .route(
+            "/api/agents/{npub}/proposal/{decision}",
+            post(routines::decide_proposal),
+        )
         .route("/api/agents/{npub}/routines", get(routines::list_routines))
         .route(
             "/api/agents/{npub}/routines/{name}/run",

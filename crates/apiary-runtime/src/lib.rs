@@ -14,6 +14,7 @@ pub mod lease;
 pub mod mcp;
 pub mod plugin;
 pub mod presence;
+pub mod proposal;
 pub mod publish;
 pub mod relay;
 pub mod routines;

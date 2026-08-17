@@ -642,3 +642,112 @@ pub async fn pause_routine(
     }
     Json(json!({"ok": true, "routine": name, "paused": paused})).into_response()
 }
+
+// ------------------------------------------------------------- proposals
+
+/// GET /api/agents/{npub}/proposal — the pending agent-drafted amendment,
+/// if any, with the current YAML for a diff.
+pub async fn get_proposal(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, _npub, dir, raw, _manifest) =
+        match crate::ops::gate_pub(&state, &headers, "GET", &uri, None, &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    match apiary_runtime::proposal::read_proposal(&dir) {
+        Some((yaml, meta)) => Json(json!({
+            "ok": true, "pending": true, "proposed_yaml": yaml, "current_yaml": raw,
+            "reason": meta.reason, "summary": meta.summary, "at": meta.at, "kind": meta.kind,
+        }))
+        .into_response(),
+        None => Json(json!({"ok": true, "pending": false})).into_response(),
+    }
+}
+
+/// POST /api/agents/{npub}/proposal/{decision} — accept (write the manifest;
+/// ratify next) or reject. Governor. Both are signed log entries.
+pub async fn decide_proposal(
+    State(state): State<App>,
+    AxPath((npub, decision)): AxPath<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (ks, npub, dir, _raw, current) =
+        match crate::ops::gate_pub(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    let Some((yaml, meta)) = apiary_runtime::proposal::read_proposal(&dir) else {
+        return crate::err(StatusCode::NOT_FOUND, "no pending proposal").into_response();
+    };
+    let accepted = match decision.as_str() {
+        "accept" => true,
+        "reject" => false,
+        other => {
+            return crate::err(
+                StatusCode::BAD_REQUEST,
+                format!("unknown decision '{other}'"),
+            )
+            .into_response()
+        }
+    };
+    if accepted {
+        // Re-check at decision time: the rules the agent could not break.
+        let candidate = match Manifest::from_yaml(&yaml) {
+            Ok(m) => m,
+            Err(e) => {
+                return crate::err(
+                    StatusCode::CONFLICT,
+                    format!("proposal no longer valid: {e}"),
+                )
+                .into_response()
+            }
+        };
+        if candidate.identity.npub != current.identity.npub
+            || candidate.governance.suspend_keys != current.governance.suspend_keys
+        {
+            return crate::err(
+                StatusCode::CONFLICT,
+                "proposal touches identity or governors — refused",
+            )
+            .into_response();
+        }
+        if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+            return crate::err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    apiary_runtime::proposal::clear_proposal(&dir);
+    if let Ok((custody, handle)) = admit_agent(&state, &ks, &npub) {
+        let _ = EpisodicLog::open(&dir).append(
+            &custody,
+            &handle,
+            Tier::Self_,
+            &EntryBody {
+                action: if accepted {
+                    "amendment.accepted"
+                } else {
+                    "amendment.rejected"
+                }
+                .into(),
+                model: None,
+                cost: None,
+                harness: None,
+                outcome: meta.summary.clone(),
+                detail: Some(
+                    json!({"reason": meta.reason, "kind": meta.kind, "proposed_at": meta.at}),
+                ),
+            },
+        );
+    }
+    Json(json!({
+        "ok": true, "accepted": accepted,
+        "manifest_sha256": if accepted { Some(ceremony::manifest_hash(&yaml)) } else { None },
+        "note": if accepted { "written — ratify in the Manifest tab; nothing runs until then" } else { "rejected and removed" },
+    }))
+    .into_response()
+}

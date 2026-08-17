@@ -176,7 +176,12 @@ pub fn run_task_observed(
     // 5. Bind connectors (default-deny: an empty manifest list means no
     //    capabilities exist) and infer. Every dispatch is logged BEFORE the
     //    result returns to the model — the track record sees each action.
-    let connectors = prep!(crate::connector::bind_connectors(manifest, custody, agent));
+    let connectors = prep!(crate::connector::bind_connectors_in(
+        manifest,
+        custody,
+        agent,
+        Some(agent_dir)
+    ));
     // Input counts against the ceiling: refuse before dispatch when the
     // working set alone would consume the reservation.
     let images: Vec<crate::inference::ImageInput> = ctx
@@ -874,15 +879,18 @@ governance:
             "{}",
             out.completion.text
         );
-        // The log holds the tool.call entry AND the run.task entry, chained.
+        // The log holds tool.call entries (mock_echo, plus the always-bound
+        // propose_* tools the mock provider also pokes) AND the run.task
+        // entry, chained.
         let log = EpisodicLog::open(&dir);
         let entries = log.tail(10).unwrap();
         let actions: Vec<String> = entries
             .iter()
             .map(|e| EpisodicLog::parse_body(e).unwrap().action)
             .collect();
-        assert_eq!(actions, vec!["tool.call", "run.task"]);
-        assert_eq!(log.verify().unwrap(), 2);
+        assert!(actions.iter().filter(|a| *a == "tool.call").count() >= 1);
+        assert_eq!(actions.last().map(String::as_str), Some("run.task"));
+        assert_eq!(log.verify().unwrap(), actions.len());
         std::fs::remove_dir_all(&dir).ok();
     }
 

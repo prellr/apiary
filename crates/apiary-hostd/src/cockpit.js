@@ -167,7 +167,61 @@ async function render() {
 
 // ------------------------------------------------------------ overview
 
+// ------------------------------------------------------ proposal banner
+
+function lineDiff(a, b) {
+  const A = a.split('\n'), B = b.split('\n');
+  const setA = new Set(A), setB = new Set(B);
+  const out = el('pre', 'diff');
+  out.style.cssText = 'white-space:pre-wrap;font-size:11px;max-height:280px;overflow:auto;margin:6px 0;';
+  // Simple: lines only in B are additions, only in A are removals; common lines shown dim.
+  const seenB = new Set();
+  for (const line of B) {
+    const d = el('div', null, (setA.has(line) ? '  ' : '+ ') + line);
+    if (!setA.has(line)) d.style.color = '#7ec87e';
+    else d.style.opacity = '0.45';
+    out.append(d);
+    seenB.add(line);
+  }
+  for (const line of A) if (!setB.has(line)) { const d = el('div', null, '- ' + line); d.style.color = '#e07070'; out.append(d); }
+  return out;
+}
+
+async function proposalBanner(c) {
+  const p = await j(api('/proposal'));
+  if (!p.ok || !p.pending) return;
+  const box = el('div', 'ev');
+  box.style.borderColor = 'var(--amber)';
+  const who = (agents.find(a => a.npub === sel) || {}).name || 'the agent';
+  box.append(el('b', null, `${who} proposes an amendment — waiting for you`));
+  box.append(kv('summary', p.summary));
+  if (p.reason) box.append(kv('its reason', p.reason));
+  box.append(kv('proposed', p.at ? new Date(p.at).toLocaleString() : '—'));
+  const details = el('details');
+  details.append(el('summary', null, 'what would change'));
+  details.append(lineDiff(p.current_yaml || '', p.proposed_yaml || ''));
+  box.append(details);
+  const row = el('div', 'row');
+  const acc = el('button', 'btn solid', 'ACCEPT (WRITE, THEN RATIFY)');
+  const rej = el('button', 'btn danger', 'REJECT');
+  const st = el('span', 'meta', '');
+  row.append(acc, rej, st);
+  box.append(row, help('Accepting writes the proposal as the manifest — nothing runs until you ratify it (Manifest tab). The agent can propose; only you can enact. Identity and governors cannot be changed by a proposal.'));
+  c.append(box);
+  acc.onclick = async () => {
+    const r = await j(api('/proposal/accept'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    st.textContent = r.ok ? 'accepted — ratify in the Manifest tab' : 'failed: ' + r.error;
+    if (r.ok) { loadRoster(); setTimeout(render, 800); }
+  };
+  rej.onclick = async () => {
+    const r = await j(api('/proposal/reject'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    st.textContent = r.ok ? 'rejected' : 'failed: ' + r.error;
+    if (r.ok) setTimeout(render, 500);
+  };
+}
+
 async function renderOverview(c) {
+  await proposalBanner(c);
   const d = await j(api('/manifest'));
   if (!d.ok) { c.append(el('div', 'ev err', 'error: ' + d.error)); return; }
   const m = d.manifest || {};
@@ -760,6 +814,7 @@ function tsText(iso) {
 }
 
 async function renderRoutines(c) {
+  await proposalBanner(c);
   const d = await j(api('/routines'));
   if (!d.ok) { c.append(el('div', 'ev err', 'error: ' + d.error)); return; }
   const sec = section('Routines',

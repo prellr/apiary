@@ -48,7 +48,28 @@ pub fn bind_connectors(
     custody: &Custody,
     agent: &AgentHandle,
 ) -> Result<Vec<Box<dyn Connector>>, crate::Error> {
+    bind_connectors_in(manifest, custody, agent, None)
+}
+
+/// With the agent dir known, the agent also gets the PROPOSE tools —
+/// harmless by construction (a proposal is never enacted by the agent).
+pub fn bind_connectors_in(
+    manifest: &Manifest,
+    custody: &Custody,
+    agent: &AgentHandle,
+    agent_dir: Option<&std::path::Path>,
+) -> Result<Vec<Box<dyn Connector>>, crate::Error> {
     let mut out: Vec<Box<dyn Connector>> = Vec::new();
+    if let Some(dir) = agent_dir {
+        out.push(Box::new(crate::proposal::ProposeRoutine {
+            agent_dir: dir.to_path_buf(),
+            manifest: manifest.clone(),
+        }));
+        out.push(Box::new(crate::proposal::ProposeAmendment {
+            agent_dir: dir.to_path_buf(),
+            manifest: manifest.clone(),
+        }));
+    }
     for entry in &manifest.connectors {
         match entry.kind.as_str() {
             "mcp" => out.extend(bind_mcp(entry, custody, agent)?),
