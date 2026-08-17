@@ -97,6 +97,31 @@ fn require_pass(state: &AppState) -> Result<String, Resp> {
     })
 }
 
+fn check_admin(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    method: &str,
+    uri: &axum::http::Uri,
+    body: Option<&[u8]>,
+) -> Result<(), Resp> {
+    let pq = uri
+        .path_and_query()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| uri.path().to_string());
+    let signer = nip98::check(state, headers, method, &pq, body)?;
+    nip98::authorize_admin(state, signer)
+}
+
+fn write_private(path: &std::path::Path, content: &str) -> Result<(), std::io::Error> {
+    std::fs::write(path, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 fn admit(
     ks: &Keystore,
     npub: &str,
@@ -129,10 +154,23 @@ pub async fn status(
         .read()
         .map(|g| g.is_some())
         .unwrap_or(false);
-    let agents = Keystore::open(&state.home)
-        .and_then(|ks| ks.list())
-        .map(|v| v.len())
-        .unwrap_or(0);
+    let (agents, owners) = Keystore::open(&state.home)
+        .and_then(|ks| {
+            let slots = ks.list()?;
+            let agents = slots
+                .iter()
+                .filter(|npub| ks.agent_dir(npub).join("manifest.yaml").exists())
+                .count();
+            let owners = slots
+                .iter()
+                .filter(|npub| {
+                    std::fs::read_to_string(ks.agent_dir(npub).join("principal.kind"))
+                        .is_ok_and(|kind| kind.trim() == "owner")
+                })
+                .count();
+            Ok((agents, owners))
+        })
+        .unwrap_or((0, 0));
     let listeners: Vec<serde_json::Value> = state
         .listeners
         .lock()
@@ -162,12 +200,107 @@ pub async fn status(
         "token_gated": state.token.is_some(),
         "unlocked": unlocked,
         "agents": agents,
+        "owners": owners,
         "listeners": listeners,
         "anthropic_key_present": std::env::var("ANTHROPIC_API_KEY").is_ok()
             || std::env::var("ANTHROPIC_AUTH_TOKEN").is_ok(),
         "relay_pool": apiary_runtime::relay::stats(),
     }))
     .into_response()
+}
+
+// ---------------------------------------------------------------- owners
+
+#[derive(serde::Deserialize)]
+pub struct CreateOwnerBody {
+    name: String,
+}
+
+/// List locally held human approval identities. They occupy an encrypted
+/// keystore slot but deliberately have no agent manifest, so they never run,
+/// appear in the roster, or acquire capabilities.
+pub async fn owners_get(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = check_admin(&state, &headers, "GET", &uri, None) {
+        return e.into_response();
+    }
+    let ks = match Keystore::open(&state.home) {
+        Ok(ks) => ks,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let mut owners = Vec::new();
+    for npub in ks.list().unwrap_or_default() {
+        let dir = ks.agent_dir(&npub);
+        let is_owner = std::fs::read_to_string(dir.join("principal.kind"))
+            .is_ok_and(|kind| kind.trim() == "owner");
+        if !is_owner {
+            continue;
+        }
+        let name = std::fs::read_to_string(dir.join("name"))
+            .unwrap_or_else(|_| "Owner".into())
+            .trim()
+            .to_string();
+        owners.push(json!({"npub": npub, "name": name}));
+    }
+    Json(json!({"ok": true, "owners": owners})).into_response()
+}
+
+/// Create a separate human approval identity for desktop-first onboarding.
+/// It is NIP-49-encrypted under the already-unlocked keystore passphrase and
+/// can ratify agents, but it is not itself an agent.
+pub async fn owners_create(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    if let Err(e) = check_admin(&state, &headers, "POST", &uri, Some(&raw_body)) {
+        return e.into_response();
+    }
+    let body: CreateOwnerBody = match serde_json::from_slice(&raw_body) {
+        Ok(body) => body,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let name = body.name.trim().to_string();
+    if name.is_empty() || name.chars().count() > 60 {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "owner name must be 1–60 characters",
+        )
+        .into_response();
+    }
+    let pass = match require_pass(&state) {
+        Ok(pass) => pass,
+        Err(e) => return e.into_response(),
+    };
+    let home = state.home.clone();
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, Resp> {
+        let ks = Keystore::open(&home).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let keys = apiary_core::identity::generate();
+        let npub = apiary_core::identity::to_npub(&keys.public_key())
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        ks.store(&keys, &pass)
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let dir = ks.agent_dir(&npub);
+        write_private(&dir.join("principal.kind"), "owner\n")
+            .and_then(|_| write_private(&dir.join("name"), &name))
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        Ok(json!({
+            "ok": true,
+            "npub": npub,
+            "name": name,
+            "note": "owner identity created and encrypted in this keystore",
+        }))
+    })
+    .await
+    .unwrap_or_else(|e| Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)));
+    match out {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -550,6 +683,11 @@ pub async fn ratify_import(
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
         ceremony::import_ratification(&log, &event, &raw, &listed)
             .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+        // Importing the signed event is authoritative. Keep a missing review
+        // snapshot as a warning instead of claiming ratification failed.
+        let snapshot_warning = write_private(&dir.join("manifest.approved.yaml"), &raw)
+            .err()
+            .map(|e| e.to_string());
         Ok(json!({
             "ok": true,
             "npub": npub,
@@ -557,6 +695,7 @@ pub async fn ratify_import(
             "imported": event.id.to_hex(),
             "ratified_by": event.pubkey.to_hex(),
             "manifest_sha256": ceremony::manifest_hash(&raw),
+            "snapshot_warning": snapshot_warning,
         }))
     })
     .await

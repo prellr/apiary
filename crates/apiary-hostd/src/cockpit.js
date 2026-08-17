@@ -4,7 +4,7 @@
 // no inline script, no external sources.)
 'use strict';
 
-let sel = null, tab = 'overview', agents = [], hostStatus = {};
+let sel = null, tab = 'overview', agents = [], owners = [], hostStatus = {};
 let hostView = null; // null | 'library' | 'found' | 'import'
 let listenerPoll = null;
 
@@ -44,6 +44,19 @@ function section(title, helpText) {
 }
 function api(path) { return `/api/agents/${encodeURIComponent(sel)}${path}`; }
 
+function ownerHolders(keys) {
+  const byNpub = new Map();
+  for (const identity of [...owners, ...agents]) byNpub.set(identity.npub, identity);
+  return [...byNpub.values()].filter(identity => keys.some(k => k === identity.npub));
+}
+
+function field(labelText, control, hint) {
+  const label = el('label', 'field');
+  label.append(el('span', null, labelText), control);
+  if (hint) label.append(el('small', null, hint));
+  return label;
+}
+
 // ------------------------------------------------------------ host status
 
 async function loadStatus() {
@@ -53,10 +66,11 @@ async function loadStatus() {
     n.textContent = text;
     if (cls !== undefined) n.className = cls;
   };
-  set('c-ver', 'v' + (hostStatus.version || '?'));
+  set('c-ver', 'Apiary v' + (hostStatus.version || '?'));
   document.getElementById('c-home').title = 'state directory: ' + (hostStatus.home || '?');
-  set('c-auth', 'auth ' + (hostStatus.auth || '?') + (hostStatus.token_gated ? ' +token' : ''));
-  set('c-model', hostStatus.anthropic_key_present ? 'model key ✓' : 'model key —',
+  set('c-home', 'State · ' + ((hostStatus.home || '?').split('/').filter(Boolean).pop() || '/'));
+  set('c-auth', 'Authentication · ' + (hostStatus.auth || '?') + (hostStatus.token_gated ? ' + token' : ''));
+  set('c-model', hostStatus.anthropic_key_present ? 'Model ready' : 'Model not configured',
       'chip ' + (hostStatus.anthropic_key_present ? 'ok' : ''));
   document.getElementById('c-model').title = hostStatus.anthropic_key_present
     ? 'ANTHROPIC_API_KEY present in the host environment'
@@ -71,6 +85,15 @@ async function loadStatus() {
   document.getElementById('u-help').textContent = unlocked
     ? 'keystore unlocked for this session — LOCK to forget the passphrase'
     : 'passphrase unlocks the NIP-49 keystore for this session — needed to run, ratify, found, post, seal:';
+}
+
+async function loadOwners() {
+  try {
+    const d = await j('/api/owners');
+    owners = d.ok ? (d.owners || []) : [];
+  } catch {
+    owners = [];
+  }
 }
 
 document.getElementById('c-lock').onclick = () => {
@@ -94,8 +117,9 @@ document.getElementById('u-go').onclick = async () => {
   if (r.ok) {
     document.getElementById('u-pass').value = '';
     setTimeout(() => { document.getElementById('unlockbar').style.display = 'none'; }, 1200);
+    await loadOwners();
   }
-  loadStatus();
+  await loadStatus(); render();
 };
 document.getElementById('u-lock').onclick = async () => {
   await j('/api/lock', { method: 'POST' });
@@ -114,15 +138,17 @@ async function loadRoster() {
   agents = d.agents || [];
   const root = document.getElementById('roster');
   root.replaceChildren();
-  if (!agents.length) root.append(el('div', 'empty', 'no agents in this keystore'));
+  if (!agents.length) root.append(el('div', 'empty', 'Your first agent will appear here.'));
   const running = new Set((hostStatus.listeners || []).filter(l => l.running).map(l => l.npub));
   for (const a of agents) {
-    const card = el('div', 'agent' + (sel === a.npub ? ' sel' : ''));
+    const card = el('button', 'agent' + (sel === a.npub ? ' sel' : ''));
+    card.type = 'button';
+    card.setAttribute('aria-pressed', sel === a.npub ? 'true' : 'false');
     const nm = el('div', 'nm', a.name || '(unnamed)');
     nm.append(el('span', 'badge ' + (a.ratified ? 'rat' : 'unrat'), a.ratified ? 'ratified' : 'unratified'));
     nm.append(el('span', 'badge ' + (a.active ? 'live' : 'unrat'), a.active ? 'active' : 'inactive'));
     if (running.has(a.npub)) nm.append(el('span', 'badge live', 'listening'));
-    card.append(nm, el('div', 'np', a.npub), el('div', 'np', a.log_entries + ' log entries'));
+    card.append(nm, el('div', 'np', a.npub), el('div', 'np', a.log_entries + ' signed events'));
     card.onclick = () => { hostView = null; sel = a.npub; render(); loadRoster(); };
     root.append(card);
   }
@@ -132,8 +158,19 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   hostView = null;
   tab = b.dataset.tab;
   document.querySelectorAll('nav button').forEach(x => x.classList.toggle('sel', x === b));
+  document.querySelectorAll('nav button').forEach(x => x.setAttribute('aria-current', x === b ? 'page' : 'false'));
   render();
 });
+
+function openTab(next) {
+  hostView = null; tab = next;
+  document.querySelectorAll('nav button').forEach(x => {
+    const current = x.dataset.tab === next;
+    x.classList.toggle('sel', current);
+    x.setAttribute('aria-current', current ? 'page' : 'false');
+  });
+  render();
+}
 
 function entryLine(bold, rest, metaLines) {
   const div = el('div', 'entry');
@@ -154,7 +191,8 @@ async function render() {
   if (hostView === 'library') return renderLibrary(c);
   if (hostView === 'found') return renderFound(c);
   if (hostView === 'import') return renderImport(c);
-  if (!sel) { c.append(el('div', 'empty', 'select an agent — or open the host connector library from the sidebar')); return; }
+  if (!sel && !agents.length) return renderWelcome(c);
+  if (!sel) { c.append(el('div', 'empty', 'Choose an agent from the sidebar.')); return; }
   await ratifyBanner(c);
   if (tab === 'overview') return renderOverview(c);
   if (tab === 'run') return renderRun(c);
@@ -164,6 +202,94 @@ async function render() {
   if (tab === 'connectors') return renderConnectors(c);
   if (tab === 'routines') return renderRoutines(c);
   if (tab === 'creds') return renderCreds(c);
+}
+
+// ------------------------------------------------------------ first run
+
+function setupProgress(current) {
+  const steps = el('div', 'setup-steps');
+  for (let i = 1; i <= 3; i++) steps.append(el('span', 'setup-step' + (i < current ? ' done' : i === current ? ' current' : '')));
+  return steps;
+}
+
+function renderWelcome(c) {
+  const wrap = el('section', 'setup');
+  const card = el('div', 'setup-card');
+  wrap.append(card); c.append(wrap);
+  const eyebrow = el('div', 'eyebrow', 'Set up Apiary');
+  const status = el('div', 'meta');
+  status.setAttribute('role', 'status');
+  status.setAttribute('aria-live', 'polite');
+
+  if (!hostStatus.unlocked) {
+    card.append(eyebrow, el('h2', null, 'Protect your agent workspace'),
+      help('Create the passphrase that encrypts identities and credentials on this device. Apiary keeps it in memory only while unlocked.'),
+      setupProgress(1));
+    const pass = el('input'); pass.type = 'password'; pass.autocomplete = 'new-password';
+    const confirm = el('input'); confirm.type = 'password'; confirm.autocomplete = 'new-password';
+    const go = el('button', 'btn solid', 'Continue');
+    card.append(field('Workspace passphrase', pass, 'Use at least 10 characters and store it somewhere safe.'),
+      field('Confirm passphrase', confirm), el('div', 'row'), status);
+    card.querySelector('.row').append(go);
+    go.onclick = async () => {
+      if (pass.value.length < 10) { status.textContent = 'Use at least 10 characters.'; pass.focus(); return; }
+      if (pass.value !== confirm.value) { status.textContent = 'The passphrases do not match.'; confirm.focus(); return; }
+      go.disabled = true; status.textContent = 'Creating your encrypted workspace…';
+      const r = await j('/api/unlock', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({passphrase:pass.value}) });
+      pass.value = ''; confirm.value = ''; go.disabled = false;
+      if (!r.ok) { status.textContent = 'Could not unlock: ' + r.error; return; }
+      await Promise.all([loadStatus(), loadOwners()]); render();
+    };
+    return;
+  }
+
+  if (!owners.length) {
+    card.append(eyebrow, el('h2', null, 'Create your approval identity'),
+      help('This is your human authority in Apiary. It approves agent configurations and can stop an agent. It is separate from every agent identity.'),
+      setupProgress(2));
+    const name = el('input'); name.placeholder = 'e.g. Ryan'; name.autocomplete = 'name';
+    const go = el('button', 'btn solid', 'Create approval identity');
+    const note = el('div', 'attention');
+    note.append(el('b', null, 'Why this is separate'), help('An agent can never approve its own permissions. Your approval key is encrypted with the workspace passphrase and never appears as a runnable agent.'));
+    const row = el('div', 'row'); row.append(go);
+    card.append(field('Your name', name, 'Used only as a local label.'), note, row, status);
+    go.onclick = async () => {
+      if (!name.value.trim()) { status.textContent = 'Enter a name for your approval identity.'; name.focus(); return; }
+      go.disabled = true; status.textContent = 'Creating and encrypting your approval identity…';
+      const r = await j('/api/owners', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({name:name.value.trim()}) });
+      go.disabled = false;
+      if (!r.ok) { status.textContent = 'Could not create the identity: ' + r.error; return; }
+      await Promise.all([loadOwners(), loadStatus()]); render();
+    };
+    return;
+  }
+
+  card.append(eyebrow, el('h2', null, 'Create your first agent'),
+    help('Start with a clear job. Apiary creates a conservative configuration for you to review before the agent can run.'),
+    setupProgress(3));
+  const name = el('input'); name.placeholder = 'e.g. Morning brief';
+  const purpose = el('textarea'); purpose.rows = 4; purpose.placeholder = 'What should this agent reliably help you do?';
+  const owner = el('select');
+  for (const identity of owners) { const option = el('option', null, identity.name); option.value = identity.npub; owner.append(option); }
+  const draft = el('input'); draft.type = 'checkbox'; draft.checked = !!hostStatus.anthropic_key_present; draft.disabled = !hostStatus.anthropic_key_present;
+  const draftLabel = el('label', 'field'); const draftLine = el('span'); draftLine.append(draft, document.createTextNode(' Tailor the configuration with the connected model'));
+  draftLabel.append(draftLine, el('small', null, hostStatus.anthropic_key_present ? 'You will review everything before approval.' : 'No host model credential is configured, so Apiary will use its conservative template.'));
+  const go = el('button', 'btn solid', 'Create draft');
+  const row = el('div', 'row'); row.append(go);
+  card.append(field('Agent name', name), field('Purpose', purpose), field('Approved by', owner), draftLabel, row, status);
+  go.onclick = async () => {
+    if (!name.value.trim()) { status.textContent = 'Give the agent a name.'; name.focus(); return; }
+    if (!purpose.value.trim()) { status.textContent = 'Describe what the agent should do.'; purpose.focus(); return; }
+    go.disabled = true; status.textContent = 'Creating the identity and draft configuration…';
+    const r = await j('/api/agents/found', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({
+      name:name.value.trim(), purpose:purpose.value.trim(), suspend_keys:[owner.value], draft_with:draft.checked ? 'anthropic' : null,
+    }) });
+    go.disabled = false;
+    if (!r.ok) { status.textContent = 'Could not create the agent: ' + r.error; return; }
+    sel = r.npub; tab = 'manifest'; hostView = null;
+    document.querySelectorAll('nav button').forEach(x => x.classList.toggle('sel', x.dataset.tab === 'manifest'));
+    await Promise.all([loadRoster(), loadStatus()]); render();
+  };
 }
 
 // ------------------------------------------------------------ overview
@@ -176,30 +302,58 @@ async function render() {
 async function ratifyBanner(c) {
   const a = agents.find(x => x.npub === sel);
   if (!a || a.ratified) return;
-  const box = el('div', 'ev');
-  box.style.borderColor = '#e0a040';
-  const head = el('div', 'row');
-  head.append(el('b', null, `${a.name || 'this agent'} has an unratified manifest — nothing runs until you ratify`));
-  box.append(head);
-  const row = el('div', 'row');
-  const who = el('select');
-  // Governor keys held in this keystore = agents whose npub is (or contains) a suspend key.
+  const box = el('section', 'attention');
+  box.append(el('h2', null, 'Review changes before this agent can run'),
+    help(`${a.name || 'This agent'} is paused because its configuration has not been approved. Apiary will show you the effective setup and the exact file changes before signing.`));
   const d = await j(api('/manifest'));
   const keys = (d.ok && d.manifest && d.manifest.governance && d.manifest.governance.suspend_keys) || [];
-  const holders = agents.filter(x => keys.some(k => k.includes(x.npub) || x.npub.includes(k)));
-  let anyKey = false;
-  for (const h of holders) { const o = el('option', null, h.name || h.npub.slice(0, 16)); o.value = h.npub; who.append(o); anyKey = true; }
-  const rat = el('button', 'btn solid', 'RATIFY NOW');
-  const st = el('span', 'meta', anyKey ? 'as:' : 'no keystore-held governor key on this host — use the Manifest tab (external ratification) or the CLI');
-  if (anyKey) row.append(st, who, rat); else row.append(st);
-  box.append(row, help('A grant, a routine, a caps change, an accepted proposal — each is an amendment. Ratifying signs the manifest hash twice (agent, then your key); the supervisor restarts presence and routines under the new constitution.'));
+  const holders = ownerHolders(keys);
+  const row = el('div', 'row');
+  const review = el('button', 'btn solid', 'Review changes');
+  const st = el('span', 'meta', holders.length ? '' : 'This host does not hold an approval key named by this configuration.');
+  row.append(review, st); box.append(row);
   c.append(box);
-  rat.onclick = async () => {
-    rat.disabled = true; st.textContent = 'ratifying… (two NIP-49 key loads; slow by design)';
-    const r = await j(api('/ratify'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ as: who.value }) });
-    st.textContent = r.ok ? 'ratified ✓' : 'refused: ' + r.error;
-    rat.disabled = false;
-    if (r.ok) { await loadRoster(); render(); }
+
+  review.onclick = () => {
+    review.remove();
+    if (!d.ok) { st.textContent = 'Could not load the configuration: ' + d.error; return; }
+    const m = d.manifest || {};
+    const inf = (m.inference || [])[0];
+    const summary = el('div', 'section');
+    summary.append(el('h3', null, 'Effective setup'),
+      kv('Model', inf ? `${inf.provider} / ${inf.model}` : 'No model configured'),
+      kv('Daily token limit', ((m.governance || {}).budgets || {}).tokens_per_day || 'No limit set'),
+      kv('Capabilities', `${(m.connectors || []).length} granted`),
+      kv('Always-on channels', Object.keys(m.presence || {}).length),
+      kv('Automations', (m.routines || []).length));
+    const technical = el('details', 'technical');
+    technical.append(el('summary', null, d.approved_yaml ? 'Technical diff' : 'Full configuration for first approval'));
+    technical.append(d.approved_yaml ? lineDiff(d.approved_yaml, d.yaml || '') : (() => {
+      const pre = el('pre'); pre.textContent = d.yaml || ''; return pre;
+    })());
+    summary.append(technical); box.append(summary);
+
+    if (!holders.length) {
+      st.textContent = 'Approval is unavailable here. Add a key listed under governance.suspend_keys, or use the external approval tools in Configuration.';
+      const open = el('button', 'btn', 'Open Configuration');
+      open.onclick = () => openTab('manifest');
+      box.append(open);
+      return;
+    }
+    const who = el('select');
+    for (const h of holders) { const o = el('option', null, h.name || h.npub.slice(0, 16)); o.value = h.npub; who.append(o); }
+    const rat = el('button', 'btn solid', 'Approve configuration');
+    const approveRow = el('div', 'row');
+    approveRow.append(el('span', 'meta', 'Approve as'), who, rat); box.append(approveRow);
+    rat.onclick = async () => {
+      rat.disabled = true; st.textContent = 'Signing with the agent and your approval identity…';
+      const r = await j(api('/ratify'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ as: who.value }) });
+      st.textContent = r.ok
+        ? (r.snapshot_warning ? 'Approved, but Apiary could not save the review snapshot: ' + r.snapshot_warning : 'Approved. The configuration is now in force.')
+        : 'Could not approve: ' + r.error;
+      rat.disabled = false;
+      if (r.ok) { await loadRoster(); render(); }
+    };
   };
 }
 
@@ -238,15 +392,15 @@ async function proposalBanner(c) {
   details.append(lineDiff(p.current_yaml || '', p.proposed_yaml || ''));
   box.append(details);
   const row = el('div', 'row');
-  const acc = el('button', 'btn solid', 'ACCEPT (WRITE, THEN RATIFY)');
-  const rej = el('button', 'btn danger', 'REJECT');
+  const acc = el('button', 'btn solid', 'Accept draft');
+  const rej = el('button', 'btn danger', 'Reject');
   const st = el('span', 'meta', '');
   row.append(acc, rej, st);
-  box.append(row, help('Accepting writes the proposal as the manifest — nothing runs until you ratify it (Manifest tab). The agent can propose; only you can enact. Identity and governors cannot be changed by a proposal.'));
+  box.append(row, help('Accepting moves the draft into the configuration review above. It does not approve or run the changes. The agent can propose; only you can enact.'));
   c.append(box);
   acc.onclick = async () => {
     const r = await j(api('/proposal/accept'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
-    st.textContent = r.ok ? 'accepted — ratify in the Manifest tab' : 'failed: ' + r.error;
+    st.textContent = r.ok ? 'Accepted. Review and approve the configuration above.' : 'Failed: ' + r.error;
     if (r.ok) { loadRoster(); setTimeout(render, 800); }
   };
   rej.onclick = async () => {
@@ -256,222 +410,160 @@ async function proposalBanner(c) {
   };
 }
 
+function metric(label, value) {
+  const node = el('div', 'metric');
+  node.append(el('span', 'label', label), el('span', 'value', value));
+  return node;
+}
+
+function quick(title, description, target) {
+  const button = el('button', 'quick'); button.type = 'button';
+  button.append(el('b', null, title), el('span', null, description));
+  button.onclick = () => openTab(target);
+  return button;
+}
+
 async function renderOverview(c) {
   await proposalBanner(c);
-  const d = await j(api('/manifest'));
-  if (!d.ok) { c.append(el('div', 'ev err', 'error: ' + d.error)); return; }
+  const [d, spend, listener] = await Promise.all([j(api('/manifest')), j(api('/spend')), j(api('/listener'))]);
+  if (!d.ok) { c.append(el('div', 'ev err', 'Could not load this agent: ' + d.error)); return; }
   const m = d.manifest || {};
-  const gov = m.governance || {};
-
   const roster = agents.find(a => a.npub === sel) || {};
-  const idSec = section('Identity',
-    'The agent IS this keypair. The npub is public and portable — Buzz membership, log signatures, and published memory all bind to it. The private half never leaves the NIP-49 keystore on this host.');
-  idSec.append(kv('npub', sel));
-  const keyRow = await j('/api/key?key=' + encodeURIComponent(sel));
-  if (keyRow.ok) idSec.append(kv('hex', keyRow.hex));
-  idSec.append(kv('ratified', d.ratified ? 'yes — constitution in force' : 'NO — nothing runs unratified'));
-  idSec.append(kv('manifest sha256', d.manifest_sha256));
-  const rnRow = el('div', 'row');
-  const rnIn = el('input'); rnIn.placeholder = 'new label'; rnIn.value = roster.name || '';
-  const rnGo = el('button', 'btn', 'RENAME');
-  const rnSt = el('span', 'meta', '');
-  rnRow.append(rnIn, rnGo, rnSt);
-  idSec.append(rnRow, help('The label is host-local and for humans — the identity is the keypair. The Buzz display name (kind-0 profile) is published separately from the Buzz tab; a running listener keeps its old @trigger until restarted.'));
-  rnGo.onclick = async () => {
-    const r = await j(api('/name'), {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: rnIn.value.trim() }),
-    });
-    rnSt.textContent = r.ok ? 'renamed ✓' : 'refused: ' + r.error;
-    loadRoster();
-  };
-  c.append(idSec);
+  const models = m.inference || [];
+  const connectors = m.connectors || [];
+  const declared = listener.ok ? (listener.declared || []) : [];
+  const routines = m.routines || [];
 
-  const actSec = section('Activation',
-    'Host-local operator switch — deliberately not part of the constitution. While ACTIVE, this host supervises the agent’s declared standing presence: if the manifest declares presence.buzz, the mention listener runs, restarts if it dies, and stops on deactivation. Inactive agents hold no standing presence; one-shot runs stay available either way.');
-  actSec.append(kv('state', roster.active ? 'ACTIVE' : 'inactive'));
-  actSec.append(kv('presence.buzz', roster.buzz_declared ? 'declared in manifest — supervised' : 'not declared — nothing to supervise (see the Manifest field guide)'));
+  const head = el('div', 'page-head');
+  head.append(el('div', 'eyebrow', roster.active ? 'Active on this host' : 'Agent overview'),
+    el('h2', 'page-title', roster.name || 'Unnamed agent'),
+    el('p', 'page-lede', d.ratified
+      ? 'Ready for governed tasks. Review its limits, connections, and always-on presence at a glance.'
+      : 'Its draft configuration is waiting for your review and approval.'));
+  c.append(head);
+
+  const stats = el('div', 'metrics');
+  const remaining = spend.ok && spend.remaining !== null && spend.remaining !== undefined
+    ? Number(spend.remaining).toLocaleString() : 'Not limited';
+  stats.append(metric('Approval', d.ratified ? 'Approved' : 'Needs review'),
+    metric('Daily tokens left', remaining),
+    metric('Capabilities', String(connectors.length)),
+    metric('Always-on channels', String(declared.length)));
+  c.append(stats);
+
+  const shortcuts = el('div', 'quick-grid');
+  shortcuts.append(quick('Start a task', 'Give this agent a one-time job.', 'run'),
+    quick('Manage capabilities', 'Choose what it can read or change.', 'connectors'),
+    quick('Edit configuration', 'Models, limits, memory, and governance.', 'manifest'));
+  c.append(shortcuts);
+
+  const active = section('Always-on presence', declared.length
+    ? 'Activation keeps declared channels available on this host. One-time tasks work while inactive.'
+    : 'No always-on channel is configured. One-time tasks are still available.');
+  const channelBox = el('div');
+  const drawChannels = l => {
+    channelBox.replaceChildren();
+    const kinds = l.ok ? (l.declared || []) : [];
+    if (!kinds.length) channelBox.append(el('div', 'none', 'No channels declared'));
+    for (const kind of kinds) {
+      const ch = (l.channels || {})[kind] || {};
+      channelBox.append(kv(kind, ch.running ? 'Running' : (ch.note || (roster.active ? 'Starting' : 'Inactive'))));
+    }
+  };
+  drawChannels(listener);
   const actRow = el('div', 'row');
-  const actBtn = el('button', 'btn' + (roster.active ? ' danger' : ' solid'), roster.active ? 'DEACTIVATE' : 'ACTIVATE');
+  const actBtn = el('button', 'btn' + (roster.active ? ' danger' : ' solid'), roster.active ? 'Deactivate' : 'Activate');
   const actSt = el('span', 'meta', '');
   actRow.append(actBtn, actSt);
-  actSec.append(actRow);
+  active.append(channelBox, actRow);
   actBtn.onclick = async () => {
-    const r = await j(api('/active'), {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ active: !roster.active }),
-    });
-    actSt.textContent = r.ok ? r.note : 'failed: ' + r.error;
+    actBtn.disabled = true;
+    const r = await j(api('/active'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ active: !roster.active }) });
+    actSt.textContent = r.ok ? r.note : 'Could not change activation: ' + r.error;
     await loadRoster(); render();
   };
-  c.append(actSec);
 
-  const portSec = section('Portability',
-    'The agent IS manifest + key + signed log + semantic index — this exports ALL of it as one verified bundle, recall included: the imported agent needs nothing rebuilt and no matching embedding model. The key inside stays NIP-49-locked; share the passphrase out of band, never alongside the file. Import on the other host verifies the key, manifest, every signature, the chain, and ratification before anything lands; the agent arrives INACTIVE and the lease referees the switchover: export → import there → deactivate here → activate there.');
-  const pRow2 = el('div', 'row');
-  const exPass = el('input'); exPass.type = 'password';
-  exPass.placeholder = 'handoff passphrase (optional)';
-  const exTo = el('input', 'grow'); exTo.placeholder = 'or seal to recipient npub (optional)';
-  const exBtn = el('button', 'btn', 'EXPORT BUNDLE');
-  const exStat = el('span', 'meta', '');
-  pRow2.append(exPass, exTo, exBtn, exStat);
-  portSec.append(pRow2, help('Three modes, none required: plain (for your own hosts), handoff passphrase (zero recipient setup — share the secret out of band), or SEALED to a recipient npub — a kind-4602 envelope signed by the agent and encrypted so only that key opens it: no secret in flight, tamper- and truncation-evident, safe over any channel. The recipient needs that key in their keystore. To hand over governance too, first amend suspend_keys to include the recipient and ratify — the key lets them act AS the agent, only a listed suspend key can amend its constitution.'));
-  exBtn.onclick = async () => {
-    if (exPass.value && exTo.value) { exStat.textContent = 'choose ONE: passphrase or npub'; return; }
-    exStat.textContent = (exPass.value || exTo.value) ? 'unlocking + sealing…' : 'exporting…';
-    const r = await j(api('/export'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ export_passphrase: exPass.value || null, to_npub: exTo.value.trim() || null }) });
-    exPass.value = ''; exTo.value = '';
-    exStat.textContent = r.ok
-      ? (r.sealed_to ? `sealed to ${r.sealed_to.slice(0, 16)}… → ${r.path}` : `saved: ${r.path} (${r.log_entries} log entries, ${r.index_rows} index rows${r.handoff_passphrase ? ', handoff-locked' : ''})`)
-      : 'failed: ' + r.error;
-  };
-  c.append(portSec);
-
-  const govSec = section('Governance',
-    'Suspend keys are the human governors: only they ratify, and any of them can suspend. Ratification = the agent signs its manifest hash AND a suspend-key holder countersigns; both land in the public log. Editing the manifest changes the hash, which suspends the agent until re-ratified.');
-  for (const k of (gov.suspend_keys || [])) govSec.append(kv('suspend key', k));
-  const budget = (gov.budgets || {}).tokens_per_day;
-  govSec.append(kv('tokens_per_day', budget !== undefined ? budget + ' (hard ceiling)' : 'none set — runs reserve a bounded default'));
-  const spend = await j(api('/spend'));
-  if (spend.ok) {
-    govSec.append(kv('spent today (' + spend.date + ')', `${spend.used} used · ${spend.reserved} reserved` + (spend.remaining !== null && spend.remaining !== undefined ? ` · ${spend.remaining} remaining` : '')));
-    if (spend.budget_tokens_per_day) {
-      const bar = el('div', 'bar'); const fill = el('div');
-      const frac = Math.min(1, (spend.used + spend.reserved) / spend.budget_tokens_per_day);
-      fill.style.width = (frac * 100).toFixed(1) + '%';
-      if (frac > 0.85) fill.className = 'hot';
-      bar.append(fill); govSec.append(bar);
-      govSec.append(help('The budget is enforced by atomic reservations taken before each model call — a run that would exceed it is refused, not trimmed.'));
-    }
-  }
-  c.append(govSec);
-
-  const infSec = section('Inference pool & routing',
-    'Models are slots, not identity — "inference in, connections out". The routing table picks a slot per task class; human-set floors clamp what routing may choose (stricter than the floor is allowed, looser never).');
-  for (const slot of (m.inference || [])) infSec.append(kv(slot.name, `${slot.provider} / ${slot.model}`));
-  if (!(m.inference || []).length) infSec.append(kv('pool', 'empty — this agent cannot run'));
-  const routing = m.routing || {};
-  if (routing.default) infSec.append(kv('routing.default', routing.default));
-  for (const r of (routing.rules || [])) infSec.append(kv('rule', JSON.stringify(r)));
-  for (const f of (routing.floors || [])) infSec.append(kv('floor', JSON.stringify(f)));
-  c.append(infSec);
-
-  const conSec = section('Connectors',
-    'Everything the agent can touch is a connector, declared here and default-deny at runtime. Credentials are NIP-44-sealed to the agent’s own key (see the Credentials tab) — a manifest dump is not a credential dump.');
-  for (const con of (m.connectors || [])) conSec.append(kv(con.name || con.type || '?', JSON.stringify(con.caps || {})));
-  if (!(m.connectors || []).length) conSec.append(kv('connectors', 'none — the agent can think and speak, not act'));
-  conSec.append(help('Grant and revoke in the Connectors tab: definitions are configured once at host level, grants are per-agent manifest amendments (ratified, portable).'));
-  c.append(conSec);
-
-  const mem = m.memory || {};
-  const memSec = section('Memory',
-    'Three tiers by sensitivity: public log entries publish to relays as-is; self-tier entries publish encrypted to the agent’s own key (portable but stranger-proof); local never leaves this machine. The semantic index embeds the log for retrieval into the working set.');
-  memSec.append(kv('log tier default', mem.log));
-  memSec.append(kv('index', mem.index));
-  for (const r of (mem.log_relays || [])) memSec.append(kv('log relay', r));
-  if (!(mem.log_relays || []).length) memSec.append(kv('log relays', 'none — publishing disabled until added to the manifest'));
-  c.append(memSec);
-
-  const lease = m.lease || {};
-  const leaseSec = section('Lease',
-    'Which host may run this agent’s standing presence. The running host heartbeats an agent-signed lease event on the log relays; a second host refuses to start while a live foreign lease exists. Takeover policy "contested-human": superseding a live lease is a button a person presses, never something hosts do on their own. One-shot runs are not lease-gated.');
-  leaseSec.append(kv('mechanism / takeover', (lease.mechanism || 'relay-event') + ' / ' + (lease.takeover || 'contested-human')));
-  leaseSec.append(kv('heartbeat / expiry', (lease.heartbeat_secs || '—') + 's / ' + (lease.expiry_secs || '—') + 's'));
-  const leaseLine = kv('current lease', 'checking relays…');
-  leaseSec.append(leaseLine);
-  const toRow = el('div', 'row'); toRow.style.display = 'none';
-  const toBtn = el('button', 'btn danger', 'TAKE OVER (HUMAN DECISION)');
-  const toSt = el('span', 'meta', '');
-  toRow.append(toBtn, toSt);
-  leaseSec.append(toRow);
-  c.append(leaseSec);
-  j(api('/lease')).then(lz => {
-    if (!lz.ok) { leaseLine.replaceChildren(el('span','k','current lease'), el('span','v','error: ' + lz.error)); return; }
-    if (!lz.coordinated) {
-      leaseLine.replaceChildren(el('span','k','current lease'), el('span','v', lz.note));
-      return;
-    }
-    if (!lz.lease) {
-      leaseLine.replaceChildren(el('span','k','current lease'), el('span','v', 'none on the relays — first active host claims it (this host: ' + lz.host_id + ')'));
-      return;
-    }
-    const l = lz.lease;
-    const until = new Date(l.expires_at * 1000).toLocaleTimeString();
-    let text;
-    if (l.ours) text = `held by THIS host (${l.holder}) · seq ${l.seq} · renews until ${until}`;
-    else if (l.expired) text = `expired lease from host ${l.holder} — this host may claim it freely`;
-    else { text = `HELD BY ANOTHER HOST (${l.holder}) · seq ${l.seq} · expires ${until}`; toRow.style.display = 'flex'; }
-    leaseLine.replaceChildren(el('span','k','current lease'), el('span','v', text));
-  });
-  toBtn.onclick = async () => {
-    toSt.textContent = 'taking over…';
-    const r = await j(api('/lease/takeover'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
-    toSt.textContent = r.ok ? r.note : 'failed: ' + r.error;
-  };
-
-  const lisSec = section('Presence channels',
-    'Everywhere the agent LIVES — each channel declared in the manifest (ratified), all supervised together under one lease while the agent is ACTIVE. Declare channels below or in the manifest; this panel is live.');
-  const chanBox = el('div');
-  lisSec.append(chanBox);
-  c.append(lisSec);
-  const updateListener = async () => {
-    const l = await j(api('/listener'));
-    if (!l.ok) return;
-    chanBox.replaceChildren();
-    if (!(l.declared || []).length) {
-      chanBox.append(kv('channels', 'none declared — nothing to supervise (declare below, see the field guide, or use the Buzz tab)'));
-    }
-    for (const kind of (l.declared || [])) {
-      const ch = (l.channels || {})[kind] || {};
-      let status = ch.running ? 'running' : (ch.note || (roster.active ? (hostStatus.unlocked ? 'starting (supervisor ~10s, retry 30s)' : 'waiting — keystore locked') : 'inactive — activate above'));
-      const row = kv(kind, status);
-      const stopB = el('button', 'btn danger', 'STOP');
-      stopB.style.marginLeft = '8px';
-      stopB.style.display = ch.running ? '' : 'none';
-      stopB.onclick = async () => { await j(api('/listener?channel=' + encodeURIComponent(kind)), { method: 'DELETE' }); updateListener(); };
-      row.append(stopB);
-      chanBox.append(row);
-      if ((ch.lines || []).length) {
-        const pre = el('pre'); pre.textContent = ch.lines.slice(-6).join('\n');
-        chanBox.append(pre);
-      }
-    }
-    if (l.lease_keeper) {
-      chanBox.append(kv('lease keeper', l.lease_keeper.lost ? 'LOST — see Lease section' : (l.lease_keeper.running ? 'holding the lease' : 'stopped')));
-    } else if ((l.declared || []).length) {
-      chanBox.append(kv('lease keeper', l.supervisor_note || 'not running'));
-    }
-  };
-  updateListener();
-  listenerPoll = setInterval(updateListener, 3000);
-
-  // Declare-a-channel forms: telegram + slack (buzz has its tab; plugins
-  // declare with the generic form).
-  const decSec = section('Declare presence',
-    'Declaring a channel writes it into the manifest with the platform secret NIP-44-sealed to this agent — an amendment, so re-ratify after. Telegram: a BotFather token + allowed chat ids (["*"] admits anyone, deliberately). Slack: a Socket-Mode app token AND bot token as JSON {"app_token":"xapp-…","bot_token":"xoxb-…"} + optional allowed channel ids. Plugins installed on this host declare by their name with config JSON.');
+  const setup = el('details', 'technical');
+  setup.append(el('summary', null, 'Add or inspect channels'));
   const dKind = el('select');
-  for (const k of ['telegram', 'slack', 'buzz']) { const o = el('option', null, k); o.value = k; dKind.append(o); }
-  const dCred = el('input', 'grow'); dCred.type = 'password'; dCred.placeholder = 'platform secret (token / JSON) — sealed to the agent';
-  const dConf = el('input', 'grow'); dConf.placeholder = 'config JSON (e.g. {"allowed_chats":["123"]} or {"relay":"wss://…"})';
-  const dGo = el('button', 'btn solid', 'DECLARE');
+  for (const kind of ['telegram', 'slack', 'buzz']) { const option = el('option', null, kind); option.value = kind; dKind.append(option); }
+  const dCred = el('input'); dCred.type = 'password'; dCred.placeholder = 'Channel secret, if required';
+  const dConf = el('textarea'); dConf.rows = 3; dConf.placeholder = 'Advanced channel settings as JSON';
+  const dGo = el('button', 'btn', 'Add channel');
   const dSt = el('span', 'meta', '');
-  const dRow = el('div', 'row'); dRow.append(dKind, dCred, dConf, dGo, dSt);
-  decSec.append(dRow);
-  c.append(decSec);
+  const dRow = el('div', 'row'); dRow.append(dGo, dSt);
+  setup.append(field('Channel type', dKind), field('Secret', dCred), field('Settings', dConf), dRow,
+    help('Telegram and Slack require platform credentials. Buzz can be configured more easily from Workspace. Adding a channel creates a change for you to review.'));
   dGo.onclick = async () => {
     let config = {};
-    if (dConf.value.trim()) {
-      try { config = JSON.parse(dConf.value); } catch { dSt.textContent = 'config is not valid JSON'; return; }
-    }
-    dSt.textContent = 'sealing + declaring…';
-    const r = await j(api('/presence'), {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ kind: dKind.value, credential: dCred.value || null, config }),
-    });
-    dCred.value = '';
-    dSt.textContent = r.ok ? `declared ${r.declared} — re-ratify in the Manifest tab` : 'refused: ' + r.error;
-    if (r.ok) loadRoster();
+    try { if (dConf.value.trim()) config = JSON.parse(dConf.value); }
+    catch { dSt.textContent = 'Settings must be valid JSON.'; dConf.focus(); return; }
+    dGo.disabled = true; dSt.textContent = 'Encrypting and adding…';
+    const r = await j(api('/presence'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ kind: dKind.value, credential: dCred.value || null, config }) });
+    dGo.disabled = false; dCred.value = '';
+    dSt.textContent = r.ok ? 'Added. Review and approve the change above.' : 'Could not add channel: ' + r.error;
+    if (r.ok) { await loadRoster(); render(); }
   };
+  active.append(setup); c.append(active);
+  listenerPoll = setInterval(async () => drawChannels(await j(api('/listener'))), 4000);
+
+  const current = section('Current setup');
+  current.append(kv('Model', models.length ? models.map(x => `${x.provider} / ${x.model}`).join(', ') : 'None configured'),
+    kv('Default route', (m.routing || {}).default || 'Not set'),
+    kv('Capabilities', connectors.length ? connectors.map(x => x.name || x.type).join(', ') : 'None granted'),
+    kv('Automations', routines.length ? `${routines.length} configured` : 'None'),
+    kv('Memory', `${(m.memory || {}).log || 'local'} log · ${(m.memory || {}).index || 'no index'}`));
+  if (spend.ok && spend.budget_tokens_per_day) {
+    const bar = el('div', 'bar'); const fill = el('div');
+    const used = spend.used + spend.reserved;
+    fill.style.width = (Math.min(1, used / spend.budget_tokens_per_day) * 100).toFixed(1) + '%';
+    if (used / spend.budget_tokens_per_day > .85) fill.className = 'hot';
+    bar.append(fill); current.append(bar, help(`${Number(used).toLocaleString()} of ${Number(spend.budget_tokens_per_day).toLocaleString()} daily tokens used or reserved.`));
+  }
+  c.append(current);
+
+  const advanced = el('details', 'section technical');
+  advanced.append(el('summary', null, 'Identity, portability, and host coordination'));
+  const body = el('div');
+  body.append(kv('Public identity', sel), kv('Configuration hash', d.manifest_sha256));
+  const rnIn = el('input'); rnIn.value = roster.name || '';
+  const rnGo = el('button', 'btn', 'Rename'); const rnSt = el('span', 'meta', '');
+  const rnRow = el('div', 'row'); rnRow.append(rnGo, rnSt);
+  body.append(field('Local display name', rnIn), rnRow);
+  rnGo.onclick = async () => {
+    const r = await j(api('/name'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: rnIn.value.trim() }) });
+    rnSt.textContent = r.ok ? 'Renamed.' : 'Could not rename: ' + r.error;
+    if (r.ok) await loadRoster();
+  };
+  const exPass = el('input'); exPass.type = 'password'; exPass.placeholder = 'Optional handoff passphrase';
+  const exTo = el('input'); exTo.placeholder = 'Or recipient npub';
+  const exBtn = el('button', 'btn', 'Export agent'); const exSt = el('span', 'meta', '');
+  const exRow = el('div', 'row'); exRow.append(exBtn, exSt);
+  body.append(field('Protect export with', exPass), field('Seal export to', exTo), exRow,
+    help('Leave both blank for your own hosts. Choose either a handoff passphrase or a recipient identity, never both.'));
+  exBtn.onclick = async () => {
+    if (exPass.value && exTo.value) { exSt.textContent = 'Choose a passphrase or recipient, not both.'; return; }
+    exBtn.disabled = true; exSt.textContent = 'Creating verified bundle…';
+    const r = await j(api('/export'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ export_passphrase: exPass.value || null, to_npub: exTo.value.trim() || null }) });
+    exBtn.disabled = false; exPass.value = ''; exTo.value = '';
+    exSt.textContent = r.ok ? `Saved to ${r.path}` : 'Could not export: ' + r.error;
+  };
+  const leaseLine = kv('Host lease', 'Checking…'); body.append(leaseLine);
+  j(api('/lease')).then(lz => {
+    let value = lz.ok ? (lz.note || 'No live lease') : 'Unavailable: ' + lz.error;
+    if (lz.ok && lz.lease) value = lz.lease.ours ? 'Held by this host' : (lz.lease.expired ? 'Previous lease expired' : `Held by another host: ${lz.lease.holder}`);
+    leaseLine.replaceChildren(el('span', 'k', 'Host lease'), el('span', 'v', value));
+    if (lz.ok && lz.lease && !lz.lease.ours && !lz.lease.expired) {
+      const take = el('button', 'btn danger', 'Take over on this host');
+      take.onclick = async () => {
+        take.disabled = true;
+        const r = await j(api('/lease/takeover'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+        take.textContent = r.ok ? 'Takeover requested' : 'Takeover failed';
+      };
+      body.append(take);
+    }
+  });
+  advanced.append(body); c.append(advanced);
 }
 
 // ------------------------------------------------------------ run
@@ -480,11 +572,14 @@ function renderRun(c) {
   c.append(help('One governed task. The stream below is AG-UI presence (steps, tool calls, text); the signed log is truth — every model call lands as a signed checkpoint entry. Budget reservations are taken before the call and settled after.'));
   const box = el('div'); box.id = 'runbox';
   const ta = el('textarea'); ta.id = 'task'; ta.placeholder = 'task for this agent…';
-  const go = el('button', null, 'RUN'); go.id = 'go';
+  ta.setAttribute('aria-label', 'Task');
+  const go = el('button', null, 'Run task'); go.id = 'go';
   box.append(ta, go);
   const row = el('div', 'row');
   const cls = el('input'); cls.placeholder = 'class (optional, e.g. reasoning)';
   const dcls = el('input'); dcls.placeholder = 'data class (optional, e.g. sensitive)';
+  cls.setAttribute('aria-label', 'Routing class');
+  dcls.setAttribute('aria-label', 'Data class');
   row.append(cls, dcls);
   c.append(box, row,
     help('class picks a routing rule from the manifest (which model slot handles this kind of task). data class engages routing floors — e.g. a "sensitive" floor can pin such tasks to a local model regardless of what routing would prefer.'));
@@ -494,7 +589,10 @@ function renderRun(c) {
 }
 
 function ev(events, cls, text) {
-  events.prepend(el('div', 'ev ' + cls, text));
+  const node = el('div', 'ev ' + cls, text);
+  events.append(node);
+  node.scrollIntoView({ block: 'nearest' });
+  return node;
 }
 
 async function runTask(ta, go, events, cls, dcls) {
@@ -518,6 +616,7 @@ async function runTask(ta, go, events, cls, dcls) {
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
     let buf = '';
+    let responseNode = null;
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -534,7 +633,11 @@ async function runTask(ta, go, events, cls, dcls) {
           case 'TOOL_CALL_START': ev(events, 'tool', '⚒ tool: ' + e.toolCallName); break;
           case 'TOOL_CALL_ARGS': ev(events, 'meta', 'args ' + e.delta); break;
           case 'TOOL_CALL_END': ev(events, e.ok ? 'tool' : 'err', `⚒ ${e.toolCallId} ${e.ok ? 'ok' : 'FAILED'} — ${e.detail}`); break;
-          case 'TEXT_MESSAGE_CONTENT': ev(events, 'text', e.delta); break;
+          case 'TEXT_MESSAGE_CONTENT':
+            if (!responseNode) responseNode = ev(events, 'text', '');
+            responseNode.textContent += e.delta;
+            responseNode.scrollIntoView({ block: 'nearest' });
+            break;
           case 'CUSTOM':
             if (e.name === 'apiary.checkpoint') {
               const v = e.value;
@@ -610,13 +713,15 @@ async function renderLog(c) {
 
 async function renderManifest(c) {
   const d = await j(api('/manifest'));
-  if (!d.ok) { c.append(el('div', 'ev err', 'error: ' + d.error)); return; }
-  const status = d.ratified ? 'ratified' : 'NOT ratified — amend freely, then ratify';
-  c.append(entryLine('sha256', d.manifest_sha256 + ' — ' + status));
-  c.append(help('The manifest is the agent’s constitution: identity, model pool, routing, connectors, memory, governance, lease. Saving an amendment changes the hash, which automatically suspends the agent until a suspend-key holder re-ratifies — amendments are cheap, unratified amendments are inert.'));
+  if (!d.ok) { c.append(el('div', 'ev err', 'Could not load configuration: ' + d.error)); return; }
+  const head = el('div', 'page-head');
+  head.append(el('div', 'eyebrow', d.ratified ? 'Approved configuration' : 'Draft configuration'),
+    el('h2', 'page-title', 'Configuration'),
+    el('p', 'page-lede', 'Advanced editing for models, routing, memory, limits, governance, and host coordination. Saving creates a draft for separate review and approval.'));
+  c.append(head);
 
   const guide = el('details');
-  guide.append(el('summary', null, 'field guide — what every setting does'));
+  guide.append(el('summary', null, 'Configuration field guide'));
   const g = el('div');
   const rows = [
     ['identity.npub', 'the agent’s public key — immutable; the host refuses an amendment that changes it'],
@@ -624,7 +729,7 @@ async function renderManifest(c) {
     ['routing.default', 'slot used when no rule matches'],
     ['routing.rules[]', 'per-task-class slot choices, e.g. {class: reasoning, use: workhorse}'],
     ['routing.floors[]', 'human-owned clamps, e.g. {data_class: sensitive, require_provider: ollama} — routing may be stricter than a floor, never looser'],
-    ['connectors[]', 'what the agent may touch, default-deny. Each entry: {type, caps, credential?}. Managed from the Connectors tab: host library holds configurations, grants are per-agent amendments with credentials sealed to this agent alone.'],
+    ['connectors[]', 'what the agent may touch, default-deny. Each entry: {type, caps, credential?}. Managed from Capabilities: host library holds configurations, grants are per-agent amendments with credentials sealed to this agent alone.'],
     ['memory.log', 'default tier for new log entries: public | self | local'],
     ['memory.index', 'semantic index location (local)'],
     ['memory.log_relays[]', 'nostr relays the log publishes to (tier-enforced)'],
@@ -638,44 +743,26 @@ async function renderManifest(c) {
   c.append(guide);
 
   const ed = el('textarea'); ed.id = 'med'; ed.spellcheck = false; ed.value = d.yaml;
+  ed.setAttribute('aria-label', 'Manifest YAML');
   const row = el('div', 'row');
-  const save = el('button', 'btn', 'SAVE AMENDMENT');
-  const who = el('select');
-  const holders = agents.filter(a => (d.manifest.governance.suspend_keys || []).some(k => k.includes(a.npub) || a.npub.includes(k)));
-  if (holders.length) {
-    for (const h of holders) {
-      const o = el('option', null, h.name || h.npub.slice(0, 16));
-      o.value = h.npub; who.append(o);
-    }
-  } else {
-    who.append(el('option', null, 'no keystore-held suspend key'));
-  }
-  const rat = el('button', 'btn solid', 'RATIFY');
+  const save = el('button', 'btn solid', 'Save changes for review');
   const status2 = el('span', 'meta', '');
-  row.append(save, el('span', 'meta', 'ratify as:'), who, rat, status2);
+  row.append(save, status2);
   c.append(ed, row);
-  c.append(help('Ratify signs twice: the agent signs its manifest hash, then the selected human key countersigns. Both events land in the public log — the founding ceremony, repeated for every amendment.'));
+  c.append(help('Saving pauses the agent until these changes pass the review-and-approve step.'));
   save.onclick = async () => {
+    save.disabled = true; status2.textContent = 'Validating…';
     const r = await j(api('/manifest'), {
       method: 'PUT', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ yaml: ed.value }),
     });
-    status2.textContent = r.ok ? `saved · ${r.manifest_sha256.slice(0, 12)}… · re-ratify to run` : `rejected: ${r.error}`;
-    loadRoster();
-  };
-  rat.onclick = async () => {
-    if (!who.value || !who.value.startsWith('npub')) return;
-    status2.textContent = 'ratifying… (two NIP-49 key loads; slow by design)';
-    const r = await j(api('/ratify'), {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ as: who.value }),
-    });
-    status2.textContent = r.ok ? 'ratified ✓ both signatures in the log' : `refused: ${r.error}`;
-    loadRoster(); if (r.ok) render();
+    save.disabled = false;
+    status2.textContent = r.ok ? 'Saved. Review the changes above.' : `Could not save: ${r.error}`;
+    if (r.ok) { await loadRoster(); render(); }
   };
 
-  const ext = el('details');
-  ext.append(el('summary', null, 'external ratification — sign with a key that never enters Apiary'));
+  const ext = el('details', 'technical');
+  ext.append(el('summary', null, 'Approve with an external signing key'));
   const extBody = el('div');
   extBody.append(help('For governors who keep their master nostr key outside this host: export the unsigned ratification event, sign it with your own tooling (nak, a NIP-07 extension, a signer app), and import the signed event. The keystore never sees the key.'));
   const exRow = el('div', 'row');
@@ -707,7 +794,9 @@ async function renderManifest(c) {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ event: evj }),
     });
-    exSt.textContent = r.ok ? 'imported ✓ ratified by ' + r.ratified_by.slice(0, 12) + '…' : 'refused: ' + r.error;
+    exSt.textContent = r.ok
+      ? (r.snapshot_warning ? 'Approved, but the review snapshot could not be saved: ' + r.snapshot_warning : 'Approved by ' + r.ratified_by.slice(0, 12) + '…')
+      : 'Could not import approval: ' + r.error;
     loadRoster(); if (r.ok) render();
   };
 }
@@ -856,7 +945,7 @@ async function renderRoutines(c) {
   const sec = section('Routines',
     'Standing instructions the governor ratified once; the host replays them on schedule. Time is the only door with no human on the other side, so a routine’s authority comes from ratification — a chat message can never plant one. Each fire is an ordinary governed run (same floors, budget, signed log), on exactly one host (the lease), never overlapping. Keep them small and bounded.');
   if (!d.coordinated) sec.append(help('This agent declares no memory.log_relays — routines run without cross-host coordination (fine for one host; add relays before running the agent on two).'));
-  if (!(d.routines || []).length) sec.append(kv('routines', 'none yet — add one below, then ratify in the Manifest tab'));
+  if (!(d.routines || []).length) sec.append(kv('routines', 'none yet — add one below, then ratify in Configuration'));
   for (const r of d.routines) {
     const box = el('div', 'ev');
     const head = el('div', 'row');
@@ -896,7 +985,7 @@ async function renderRoutines(c) {
 
   // ---- add form → appends to manifest YAML, PUTs it; ratify afterward
   const add = section('Add a routine',
-    'Writes an amendment to the manifest — re-ratify in the Manifest tab afterward. Times are in the zone you pick; cron is standard 5-field (min hour day month weekday, Sunday = 0).');
+    'Writes an amendment to the manifest — re-ratify in Configuration afterward. Times are in the zone you pick; cron is standard 5-field (min hour day month weekday, Sunday = 0).');
   const fName = el('input'); fName.placeholder = 'name (e.g. morning-brief)';
   const fKind = el('select');
   for (const [v, t] of [['when', 'cron'], ['every', 'every (15m, 2h, 1d)'], ['at', 'once at (YYYY-MM-DDTHH:MM)']]) { const o = el('option', null, t); o.value = v; fKind.append(o); }
@@ -940,7 +1029,7 @@ async function renderRoutines(c) {
     else if (/^routines:/m.test(yaml)) yaml += '\n' + entry;
     else yaml += '\nroutines:\n' + entry;
     const r = await j(api('/manifest'), { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ yaml }) });
-    st.textContent = r.ok ? `added ${name} — now ratify in the Manifest tab` : 'failed: ' + r.error;
+    st.textContent = r.ok ? `added ${name} — now ratify in Configuration` : 'failed: ' + r.error;
     if (r.ok) { loadRoster(); setTimeout(render, 800); }
   };
 }
@@ -953,7 +1042,7 @@ async function renderConnectors(c) {
 
   // ---- this agent's grants
   const gSec = section('Grants',
-    'A grant copies a host-library entry into this agent’s manifest, sealing any secret to this agent alone. Every grant or revoke is an amendment — re-ratify in the Manifest tab afterward.');
+    'A grant copies a host-library entry into this agent’s manifest, sealing any secret to this agent alone. Every grant or revoke is an amendment — re-ratify in Configuration afterward.');
   const grants = (d.manifest.connectors || []);
   if (!grants.length) gSec.append(kv('grants', 'none — the agent can think and speak, not act'));
   const kindLabel = { obsidian: 'Obsidian vault', 'markdown-vault': 'Markdown folder', mcp: 'MCP server', 'nostr-publish': 'Nostr publish', 'mock-echo': 'mock' };
@@ -968,13 +1057,13 @@ async function renderConnectors(c) {
     box.append(row);
     connectorDetails(box, g.type, g.caps || {}, async (on, lab) => {
       const r = await j(api('/connectors/' + encodeURIComponent(g.type) + '/caps'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ caps: { write: on } }) });
-      gStatus.textContent = r.ok ? `${on ? 'write enabled' : 'read-only'} — re-ratify in the Manifest tab` : 'failed: ' + r.error;
+      gStatus.textContent = r.ok ? `${on ? 'write enabled' : 'read-only'} — re-ratify in Configuration` : 'failed: ' + r.error;
       lab.lastChild.textContent = on ? ' read + write — the agent may create and edit notes' : ' read-only — tick to allow the agent to write notes';
       if (r.ok) loadRoster();
     });
     rv.onclick = async () => {
       const r = await j(api('/connectors/' + encodeURIComponent(g.type)), { method: 'DELETE' });
-      gStatus.textContent = r.ok ? `revoked ${g.type} — re-ratify in the Manifest tab` : 'failed: ' + r.error;
+      gStatus.textContent = r.ok ? `revoked ${g.type} — re-ratify in Configuration` : 'failed: ' + r.error;
       loadRoster(); render();
     };
     if (g.type === 'mcp') {
@@ -1006,7 +1095,7 @@ async function renderConnectors(c) {
         toolsBox.append(aRow);
         apply.onclick = async () => {
           const rr = await j(api('/connectors/mcp/allowed_tools'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tools: [...picked] }) });
-          aSt.textContent = rr.ok ? 'applied — re-ratify in the Manifest tab' : 'failed: ' + rr.error;
+          aSt.textContent = rr.ok ? 'applied — re-ratify in Configuration' : 'failed: ' + rr.error;
           if (rr.ok) { loadRoster(); setTimeout(render, 800); }
         };
       };
@@ -1048,7 +1137,7 @@ async function renderConnectors(c) {
         const d2 = await j(api('/manifest'));
         if (d2.ok && (d2.manifest.connectors || []).length > before) {
           clearInterval(poll);
-          gStatus.textContent = 'granted via OAuth — re-ratify in the Manifest tab';
+          gStatus.textContent = 'granted via OAuth — re-ratify in Configuration';
           loadRoster(); render();
         }
       }, 3000);
@@ -1059,7 +1148,7 @@ async function renderConnectors(c) {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ name: gSel.value, credential: gCred.value || null }),
     });
-    gStatus.textContent = r.ok ? `granted ${r.kind} — re-ratify in the Manifest tab` : 'failed: ' + r.error;
+    gStatus.textContent = r.ok ? `granted ${r.kind} — re-ratify in Configuration` : 'failed: ' + r.error;
     gCred.value = '';
     loadRoster(); if (r.ok) render();
   };
@@ -1115,7 +1204,7 @@ function capsSummary(kind, caps) {
 }
 
 async function renderLibrary(c) {
-  c.append(help('Host-scoped: named connector configurations (kind + caps — never secrets), shared by all agents. Grant from an agent’s Connectors tab; each grant is a ratified amendment for that agent alone.'));
+  c.append(help('Host-scoped: named connector configurations (kind + caps — never secrets), shared by all agents. Grant from an agent’s Capabilities; each grant is a ratified amendment for that agent alone.'));
   const lib = await j('/api/connectors');
   if (!lib.ok) { c.append(el('div', 'ev err', 'error: ' + lib.error)); return; }
 
@@ -1157,7 +1246,7 @@ async function renderLibrary(c) {
       connectorDetails(card, e.kind, caps, async (on, lab) => {
         caps.write = on; e.caps = caps;
         lab.lastChild.textContent = on ? ' read + write — the agent may create and edit notes' : ' read-only — tick to allow the agent to write notes';
-        window.__libFlash = `${e.name}: ${on ? 'writable' : 'read-only'} for future grants (existing grants keep their own setting — change it on the agent’s Connectors tab)`;
+        window.__libFlash = `${e.name}: ${on ? 'writable' : 'read-only'} for future grants (existing grants keep their own setting — change it on the agent’s Capabilities)`;
         await saveLib();
       });
       // Who has it, and grant from here.
@@ -1175,16 +1264,16 @@ async function renderLibrary(c) {
       gBtn.onclick = async () => {
         const npub = sel.value; if (!npub) return;
         const needsSecret = e.kind === 'mcp' && caps.transport === 'http' && !caps.oauth_client_id;
-        if (needsSecret) { gSt.textContent = 'this one needs an API key sealed to the agent — grant it from the agent’s Connectors tab'; return; }
+        if (needsSecret) { gSt.textContent = 'this one needs an API key sealed to the agent — grant it from the agent’s Capabilities'; return; }
         gBtn.disabled = true; gSt.textContent = 'granting…';
         const r = await j(`/api/agents/${encodeURIComponent(npub)}/connectors`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: e.name }) });
         gBtn.disabled = false;
         if (r.ok) {
           const who = (agents.find(a => a.npub === npub) || {}).name || npub.slice(0, 12);
-          window.__libFlash = `granted ${e.name} to ${who} — ratify on ${who}’s Manifest tab before it takes effect`;
+          window.__libFlash = `granted ${e.name} to ${who} — ratify on ${who}’s Configuration before it takes effect`;
           loadRoster(); render();
         } else if (r.oauth_url || (r.error && /oauth/i.test(r.error))) {
-          gSt.textContent = 'needs OAuth sign-in — grant from the agent’s Connectors tab (it opens the flow)';
+          gSt.textContent = 'needs OAuth sign-in — grant from the agent’s Capabilities (it opens the flow)';
         } else gSt.textContent = 'failed: ' + r.error;
       };
     });
@@ -1269,7 +1358,7 @@ async function renderLibrary(c) {
     const oauth = el('input'); oauth.placeholder = 'OAuth client id (if the server uses OAuth)';
     const bearer = el('input'); bearer.type = 'password'; bearer.placeholder = 'API key / bearer for discovery only (not stored)';
     const r2 = el('div', 'row'); r2.append(url); const r2b = el('div', 'row'); r2b.append(oauth, bearer);
-    httpBox.append(r2, r2b, help('OAuth servers: leave the key blank; when you GRANT this to an agent the cockpit runs the sign-in and seals the tokens to that agent. Then use “Discover tools” on the agent’s Connectors tab. API-key servers: the key is sealed at grant time; you can paste it here just to discover.'));
+    httpBox.append(r2, r2b, help('OAuth servers: leave the key blank; when you GRANT this to an agent the cockpit runs the sign-in and seals the tokens to that agent. Then use “Discover tools” on the agent’s Capabilities. API-key servers: the key is sealed at grant time; you can paste it here just to discover.'));
     const disc = el('button', 'btn', 'DISCOVER TOOLS');
     const dStatus = el('span', 'meta', '');
     const toolsBox = el('div');
@@ -1307,7 +1396,7 @@ async function renderLibrary(c) {
       const caps = buildCaps();
       const r = await j('/api/connectors/discover', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ caps, bearer: bearer.value || undefined }) });
       if (r.ok) { known = r.tools || []; dStatus.textContent = `${known.length} tools`; drawTools(); }
-      else if (r.auth_required) { dStatus.textContent = 'server wants OAuth — save the entry, grant it to an agent (that runs the sign-in), then discover from the agent’s Connectors tab'; }
+      else if (r.auth_required) { dStatus.textContent = 'server wants OAuth — save the entry, grant it to an agent (that runs the sign-in), then discover from the agent’s Capabilities'; }
       else dStatus.textContent = 'failed: ' + r.error;
     };
     current = {
@@ -1366,7 +1455,7 @@ async function renderLibrary(c) {
     if (entries.some(e => e.name === name)) { flag(nName, `“${name}” already exists in the library`); return; }
     nGo.disabled = true; nGo.textContent = 'ADDING…';
     entries.push({ name, kind: nKind.value, caps });
-    window.__libFlash = `added ${name} (${nKind.value}) — now GRANT it from an agent’s Connectors tab, then ratify`;
+    window.__libFlash = `added ${name} (${nKind.value}) — now GRANT it from an agent’s Capabilities, then ratify`;
     await saveLib();
     nGo.disabled = false; nGo.textContent = 'ADD TO LIBRARY';
   };
@@ -1448,38 +1537,68 @@ document.getElementById('importtoggle').onclick = () => {
 // ------------------------------------------------------------ found (pane)
 
 function renderFound(c) {
-  const sec = section('Found a new agent',
-    'Founding generates a fresh keypair and drafts a constitution for human review. Founding is the moment of maximum ignorance — drafts start minimal and conservative, and nothing runs until you ratify.');
-  const fName = el('input'); fName.placeholder = 'name (e.g. scribe)';
-  const fPurpose = el('textarea'); fPurpose.rows = 3; fPurpose.placeholder = 'purpose — what is this agent for?';
-  const fSuspend = el('input', 'grow'); fSuspend.placeholder = 'human suspend key (npub or hex) — your key';
+  if (!owners.length) {
+    const setup = section('Create an approval identity',
+      'Before creating another agent, add the human identity that will review its configuration and permissions.');
+    const ownerName = el('input'); ownerName.placeholder = 'Your name';
+    const ownerGo = el('button', 'btn solid', 'Create approval identity');
+    const ownerSt = el('span', 'meta', '');
+    const ownerRow = el('div', 'row'); ownerRow.append(ownerGo, ownerSt);
+    setup.append(field('Local label', ownerName), ownerRow,
+      help('This encrypted key is separate from every agent and is never shown as a runnable agent.'));
+    c.append(setup);
+    ownerGo.onclick = async () => {
+      if (!ownerName.value.trim()) { ownerSt.textContent = 'Enter a name.'; ownerName.focus(); return; }
+      ownerGo.disabled = true; ownerSt.textContent = 'Creating encrypted identity…';
+      const r = await j('/api/owners', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: ownerName.value.trim() }) });
+      ownerGo.disabled = false;
+      if (!r.ok) { ownerSt.textContent = 'Could not create identity: ' + r.error; return; }
+      await loadOwners(); render();
+    };
+    return;
+  }
+  const sec = section('Create a new agent',
+    'Describe a clear job. Apiary creates a conservative configuration for you to review before anything can run.');
+  const fName = el('input'); fName.placeholder = 'e.g. Research assistant';
+  const fPurpose = el('textarea'); fPurpose.rows = 4; fPurpose.placeholder = 'What should this agent reliably help you do?';
+  const fSuspend = el('select', 'grow');
+  for (const identity of owners) {
+    const option = el('option', null, identity.name || identity.npub.slice(0, 16));
+    option.value = identity.npub; fSuspend.append(option);
+  }
+  if (!owners.length) {
+    const option = el('option', null, 'No local approval identity'); option.value = ''; fSuspend.append(option);
+  }
   const fDraft = el('input'); fDraft.type = 'checkbox'; fDraft.style.width = 'auto';
-  const draftLabel = el('label', null, ' let a model write the draft constitution'); draftLabel.prepend(fDraft);
-  const go = el('button', 'btn solid', 'FOUND');
+  fDraft.checked = !!hostStatus.anthropic_key_present;
+  fDraft.disabled = !hostStatus.anthropic_key_present;
+  const draftLabel = el('label', null, ' Tailor the draft with the connected model'); draftLabel.prepend(fDraft);
+  const go = el('button', 'btn solid', 'Create draft');
   const st = el('span', 'meta', '');
-  const r1 = el('div', 'row'); r1.append(fName);
-  const r3 = el('div', 'row'); r3.append(fSuspend);
   const r4 = el('div', 'row'); r4.append(draftLabel, go, st);
-  sec.append(r1, help('A label for humans; the identity is the generated keypair.'),
-    fPurpose, help('Seeds the draft constitution.'),
-    r3, help('Suspension authority never rests with the agent’s own key — at least one human governor is required.'),
-    r4, help('Checked: Claude reads the purpose and tailors the draft (inference slots, routing, budgets); an invalid draft falls back to the template. ' +
-      'Unchecked: the stock template — one Anthropic slot, no connectors, local memory, 100k tokens/day. ' +
-      'Either way the draft is a hypothesis: review it in the Manifest tab, then ratify.'));
+  sec.append(field('Agent name', fName), field('Purpose', fPurpose),
+    field('Approved by', fSuspend, owners.length ? 'The agent cannot approve its own permissions.' : 'Create an approval identity during first-run setup or use the CLI for an external key.'),
+    r4, help(hostStatus.anthropic_key_present
+      ? 'The model can tailor routing and budgets to the purpose. You will review all changes before approval.'
+      : 'No host model credential is configured, so Apiary will use its conservative template.'));
   c.append(sec);
   go.onclick = async () => {
-    st.textContent = 'founding… (keygen + NIP-49 encryption; slow by design)';
+    if (!fName.value.trim()) { st.textContent = 'Enter an agent name.'; fName.focus(); return; }
+    if (!fPurpose.value.trim()) { st.textContent = 'Describe the agent’s purpose.'; fPurpose.focus(); return; }
+    if (!fSuspend.value) { st.textContent = 'No approval identity is available on this host.'; fSuspend.focus(); return; }
+    go.disabled = true; st.textContent = 'Creating the identity and draft configuration…';
     const r = await j('/api/agents/found', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         name: fName.value.trim(),
         purpose: fPurpose.value.trim(),
-        suspend_keys: [fSuspend.value.trim()],
+        suspend_keys: [fSuspend.value],
         draft_with: fDraft.checked ? 'anthropic' : null,
       }),
     });
-    if (!r.ok) { st.textContent = 'refused: ' + r.error; return; }
-    st.textContent = `founded — drafted by ${r.drafted_by}`;
+    go.disabled = false;
+    if (!r.ok) { st.textContent = 'Could not create the draft: ' + r.error; return; }
+    st.textContent = `Draft created with ${r.drafted_by}.`;
     hostView = null; sel = r.npub; tab = 'manifest';
     document.querySelectorAll('nav button').forEach(x => x.classList.toggle('sel', x.dataset.tab === 'manifest'));
     await loadRoster(); render();
@@ -1490,30 +1609,44 @@ function renderFound(c) {
 
 function renderImport(c) {
   const sec = section('Import an agent',
-    'Paste an export bundle (or a sealed kind-4602 envelope). Everything verifies before anything lands: the key must decrypt, the manifest must match it, every log signature and the chain must hold, and the constitution must be ratified. The key is re-encrypted under THIS keystore’s passphrase; the agent arrives INACTIVE and the lease referees any host overlap.');
+    'Choose an Apiary export bundle. Apiary verifies its identity, configuration, signatures, and history before saving anything. Imported agents arrive inactive.');
+  const file = el('input'); file.type = 'file'; file.accept = '.json,.apiary.json,application/json';
   const bundle = el('textarea'); bundle.rows = 8; bundle.placeholder = 'paste .apiary.json bundle or sealed envelope';
+  bundle.setAttribute('aria-label', 'Bundle JSON');
   const pass = el('input', 'grow'); pass.type = 'password';
-  pass.placeholder = 'bundle passphrase (if handoff-locked; sealed envelopes need none)';
-  const go = el('button', 'btn solid', 'IMPORT');
+  pass.placeholder = 'Only needed for a passphrase-protected handoff';
+  const paste = el('details', 'technical'); paste.append(el('summary', null, 'Or paste bundle JSON'), bundle);
+  const go = el('button', 'btn solid', 'Verify and import');
   const st = el('div', 'meta', '');
   const row = el('div', 'row'); row.append(pass, go);
-  sec.append(bundle, row, st);
+  sec.append(field('Export bundle', file), paste, field('Handoff passphrase', pass), row, st,
+    help('Sealed recipient bundles do not need a handoff passphrase. The imported private key is re-encrypted for this workspace.'));
   c.append(sec);
+  file.onchange = async () => {
+    const chosen = file.files && file.files[0];
+    if (!chosen) return;
+    try { bundle.value = await chosen.text(); st.textContent = `Loaded ${chosen.name}.`; }
+    catch (err) { st.textContent = 'Could not read the file: ' + err; }
+  };
   go.onclick = async () => {
     let parsed;
     try { parsed = JSON.parse(bundle.value); }
-    catch { st.textContent = 'not valid JSON'; return; }
-    st.textContent = 'verifying and importing… (key decrypt is deliberately slow)';
+    catch { st.textContent = 'The selected bundle is not valid JSON.'; return; }
+    go.disabled = true; st.textContent = 'Verifying identity, signatures, and history…';
     const r = await j('/api/agents/import', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ bundle: parsed, bundle_passphrase: pass.value || null }),
     });
+    go.disabled = false;
     st.textContent = r.ok
-      ? `imported ${r.name || r.npub.slice(0, 12)} · ${r.log_entries} log entries · ${r.index_rows} index rows${r.index_dropped ? ` (${r.index_dropped} dropped: disagreed with the signed log)` : ''} · ${r.ratified ? 'ratified' : 'NOT ratified'} — arrives inactive`
-      : 'refused: ' + r.error;
-    if (r.ok) { bundle.value = ''; loadRoster(); }
+      ? `Imported ${r.name || r.npub.slice(0, 12)} with ${r.log_entries} signed history entries. It is inactive on this host.`
+      : 'Could not import: ' + r.error;
+    if (r.ok) {
+      bundle.value = ''; file.value = ''; hostView = null; sel = r.npub; tab = 'overview';
+      await loadRoster(); openTab('overview');
+    }
   };
 }
 
-loadStatus().then(loadRoster).then(render);
+loadStatus().then(loadOwners).then(loadRoster).then(render);
 setInterval(loadStatus, 15000);

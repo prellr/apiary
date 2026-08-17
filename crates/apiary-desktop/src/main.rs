@@ -108,7 +108,7 @@ fn main() {
             )
             .title("Apiary")
             .inner_size(1360.0, 900.0)
-            .min_inner_size(900.0, 600.0)
+            .min_inner_size(720.0, 520.0)
             .build()?;
             Ok(())
         })

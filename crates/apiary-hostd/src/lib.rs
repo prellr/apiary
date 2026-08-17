@@ -85,6 +85,7 @@ pub fn build_router(state: App) -> Router {
         .route("/api/status", get(ops::status))
         .route("/api/unlock", post(ops::unlock))
         .route("/api/lock", post(ops::lock))
+        .route("/api/owners", get(ops::owners_get).post(ops::owners_create))
         .route("/api/key", get(ops::key_normalize))
         .route(
             "/api/connectors",
@@ -235,6 +236,17 @@ pub fn load_manifest(
     Ok((raw, m))
 }
 
+fn snapshot_approved_manifest(dir: &std::path::Path, raw: &str) -> std::io::Result<()> {
+    let path = dir.join("manifest.approved.yaml");
+    std::fs::write(&path, raw)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 pub fn suspend_pks(manifest: &Manifest) -> Vec<PublicKey> {
     manifest
         .governance
@@ -326,6 +338,7 @@ async fn get_manifest(
                 "ok": true,
                 "npub": npub,
                 "yaml": raw,
+                "approved_yaml": std::fs::read_to_string(dir.join("manifest.approved.yaml")).ok(),
                 "manifest": serde_json::to_value(&m).unwrap_or_default(),
                 "ratified": ratified(&dir, &npub, &raw, &m),
                 "manifest_sha256": ceremony::manifest_hash(&raw),
@@ -545,14 +558,22 @@ async fn ratify_agent(
     let result = ceremony::sign_manifest(&custody, &agent_handle, &log, &raw)
         .and_then(|s| ceremony::ratify(&custody, &human_handle, &log, &npub, &raw).map(|r| (s, r)));
     match result {
-        Ok((signed, ratified)) => Json(json!({
-            "ok": true,
-            "npub": npub,
-            "ratified_by": as_key,
-            "manifest_sha256": ceremony::manifest_hash(&raw),
-            "events": {"signed": signed.id.to_hex(), "ratified": ratified.id.to_hex()},
-        }))
-        .into_response(),
+        Ok((signed, ratified)) => {
+            // The signatures are authoritative. A failed review snapshot
+            // must not report the already-completed ceremony as failed.
+            let snapshot_warning = snapshot_approved_manifest(&dir, &raw)
+                .err()
+                .map(|e| e.to_string());
+            Json(json!({
+                "ok": true,
+                "npub": npub,
+                "ratified_by": as_key,
+                "manifest_sha256": ceremony::manifest_hash(&raw),
+                "events": {"signed": signed.id.to_hex(), "ratified": ratified.id.to_hex()},
+                "snapshot_warning": snapshot_warning,
+            }))
+            .into_response()
+        }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
