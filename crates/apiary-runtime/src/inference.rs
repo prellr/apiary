@@ -392,15 +392,28 @@ impl AnthropicProvider {
             let msg = payload["error"]["message"].as_str().unwrap_or("unknown");
             return Err(crate::Error::Provider(format!("anthropic {status}: {msg}")));
         }
+        assemble_sse(resp, body["model"].as_str().unwrap_or(""), on_delta)
+    }
+}
+
+/// Assemble a Messages SSE stream into the non-streaming payload shape.
+/// Public within the crate for tests; `request_streaming` is the caller.
+pub(crate) fn assemble_sse(
+    reader: impl std::io::Read,
+    model: &str,
+    on_delta: &mut dyn FnMut(&str),
+) -> Result<serde_json::Value, crate::Error> {
+    use std::io::BufRead;
+    {
         // Assembly state.
         let mut blocks: Vec<serde_json::Value> = Vec::new();
         let mut json_bufs: std::collections::HashMap<usize, String> = Default::default();
-        let mut used_model = body["model"].as_str().unwrap_or("").to_string();
+        let mut used_model = model.to_string();
         let mut input_tokens = 0u64;
         let mut output_tokens = 0u64;
         let mut stop_reason = "unknown".to_string();
         let mut error: Option<String> = None;
-        let reader = std::io::BufReader::new(resp);
+        let reader = std::io::BufReader::new(reader);
         for line in reader.lines() {
             let line =
                 line.map_err(|e| crate::Error::Provider(format!("anthropic stream: {e}")))?;
@@ -451,6 +464,24 @@ impl AnthropicProvider {
                                 json_bufs.entry(idx).or_default().push_str(pj);
                             }
                         }
+                        // Extended-thinking blocks: the model's reasoning
+                        // arrives as thinking_delta + a signature_delta, and
+                        // the block must be replayed INTACT (text + signature)
+                        // in the tool loop or the API rejects the turn.
+                        "thinking_delta" => {
+                            if let Some(t) = ev["delta"]["thinking"].as_str() {
+                                let cur =
+                                    blocks[idx]["thinking"].as_str().unwrap_or("").to_string();
+                                blocks[idx]["thinking"] = json!(cur + t);
+                            }
+                        }
+                        "signature_delta" => {
+                            if let Some(sig) = ev["delta"]["signature"].as_str() {
+                                let cur =
+                                    blocks[idx]["signature"].as_str().unwrap_or("").to_string();
+                                blocks[idx]["signature"] = json!(cur + sig);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -489,6 +520,14 @@ impl AnthropicProvider {
         if let Some(e) = error {
             return Err(crate::Error::Provider(format!("anthropic stream: {e}")));
         }
+        // A block that never got content (an empty thinking or text block)
+        // must not be replayed — the API rejects "thinking must contain
+        // thinking"; an empty text block is noise.
+        blocks.retain(|b| match b["type"].as_str() {
+            Some("thinking") => !b["thinking"].as_str().unwrap_or("").is_empty(),
+            Some("text") => !b["text"].as_str().unwrap_or("").is_empty(),
+            _ => true,
+        });
         Ok(json!({
             "content": blocks,
             "stop_reason": stop_reason,
@@ -496,7 +535,9 @@ impl AnthropicProvider {
             "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
         }))
     }
+}
 
+impl AnthropicProvider {
     #[allow(clippy::too_many_arguments)]
     fn tool_loop(
         &self,
@@ -1036,6 +1077,46 @@ impl Provider for OpenAiCompatProvider {
 #[cfg(test)]
 mod openai_tests {
     use super::*;
+
+    #[test]
+    fn sse_assembler_keeps_thinking_intact_and_drops_empty_blocks() {
+        // Feed the assembler a stream by hand: thinking + text + tool_use.
+        let frames = [
+            r#"{"type":"message_start","message":{"model":"m","usage":{"input_tokens":7}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm "}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"ok"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"SIG"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hi"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"t1","name":"f","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"a\":"}}"#,
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"1}"}}"#,
+            r#"{"type":"content_block_stop","index":2}"#,
+            r#"{"type":"content_block_start","index":3,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_stop","index":3}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}"#,
+        ];
+        let body: String = frames.iter().map(|f| format!("data: {f}\n")).collect();
+        let mut got = String::new();
+        let payload =
+            assemble_sse(std::io::Cursor::new(body), "m", &mut |t| got.push_str(t)).unwrap();
+        assert_eq!(got, "hi");
+        let content = payload["content"].as_array().unwrap();
+        assert_eq!(
+            content.len(),
+            3,
+            "empty trailing text block dropped: {content:?}"
+        );
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "hmm ok");
+        assert_eq!(content[0]["signature"], "SIG");
+        assert_eq!(content[2]["input"], json!({"a": 1}));
+        assert_eq!(payload["stop_reason"], "tool_use");
+        assert_eq!(payload["usage"]["output_tokens"], 5);
+    }
 
     #[test]
     fn image_content_shapes_per_dialect() {
