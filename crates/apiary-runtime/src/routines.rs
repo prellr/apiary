@@ -20,6 +20,7 @@ pub const MIN_EVERY_SECS: i64 = 60;
 pub const JITTER_SECS: i64 = 20;
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // cron::Schedule is big; three variants, one instance per routine
 pub enum Schedule {
     Cron {
         expr: cron::Schedule,
@@ -183,7 +184,7 @@ impl Schedule {
                 let base = anchor.unwrap_or(after);
                 let mut t = base + *d;
                 while t <= after {
-                    t = t + *d;
+                    t += *d;
                 }
                 Some(t)
             }
