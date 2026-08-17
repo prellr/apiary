@@ -236,7 +236,17 @@ pub fn run_task_observed(
                             Ok(_) => "ok".into(),
                             Err(e) => format!("error: {e}"),
                         },
-                        detail: Some(json!({ "tool": name, "args": args })),
+                        detail: Some(json!({
+                            "tool": name,
+                            "args": args,
+                            // What the tool said back (bounded): a voice
+                            // downgrade or a refusal should be legible in
+                            // the record, not only in the model's context.
+                            "result": match &result {
+                                Ok(r) => r.chars().take(300).collect::<String>(),
+                                Err(e) => e.to_string(),
+                            },
+                        })),
                     },
                 )?;
                 result

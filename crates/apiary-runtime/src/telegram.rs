@@ -393,19 +393,38 @@ impl crate::connector::Connector for TelegramSend {
         }
         let text: String = text.chars().take(4096).collect();
         let want_voice = args["as_voice"].as_bool().unwrap_or(false);
+        // Voice is best-effort — the text always goes — but a downgrade is
+        // REPORTED in the tool result, never silent: the model (and the
+        // operator reading the log) should know why a voice note came out
+        // as text.
+        let mut voice_note: Option<String> = None;
         let audio = match (&self.speaker, want_voice) {
-            (Some(sp), true) if text.chars().count() <= crate::speak::MAX_SPEAK_CHARS => sp
-                .speak(&text)
-                .and_then(|s| crate::speak::to_ogg_opus(&s))
-                .ok()
-                .map(|s| {
+            (None, true) => {
+                voice_note = Some("no speak slot bound on this host".into());
+                None
+            }
+            (Some(_), true) if text.chars().count() > crate::speak::MAX_SPEAK_CHARS => {
+                voice_note = Some(format!(
+                    "text is {} chars, over the {} voice ceiling",
+                    text.chars().count(),
+                    crate::speak::MAX_SPEAK_CHARS
+                ));
+                None
+            }
+            (Some(sp), true) => match sp.speak(&text).and_then(|s| crate::speak::to_ogg_opus(&s)) {
+                Ok(s) => {
                     use base64::Engine;
-                    crate::presence::Attachment::Audio {
+                    Some(crate::presence::Attachment::Audio {
                         media_type: s.media_type,
                         base64: base64::engine::general_purpose::STANDARD.encode(&s.bytes),
                         duration_secs: s.duration_secs,
-                    }
-                }),
+                    })
+                }
+                Err(e) => {
+                    voice_note = Some(format!("speech synthesis failed: {e}"));
+                    None
+                }
+            },
             _ => None,
         };
         let token = custody.open(agent, &self.credential)?;
@@ -421,10 +440,15 @@ impl crate::connector::Connector for TelegramSend {
             None,
             &crate::presence::Reply { text, audio },
         )?;
-        Ok(format!(
-            "sent to chat {chat} as {} (message_id {id})",
-            if voiced { "voice+caption" } else { "text" }
-        ))
+        Ok(match voice_note {
+            Some(why) => format!(
+                "sent to chat {chat} as TEXT (voice requested but unavailable: {why}) (message_id {id})"
+            ),
+            None => format!(
+                "sent to chat {chat} as {} (message_id {id})",
+                if voiced { "voice+caption" } else { "text" }
+            ),
+        })
     }
 }
 
