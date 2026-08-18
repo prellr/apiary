@@ -3671,14 +3671,24 @@ pub struct AgentPresence {
     pub manifest_sha: String,
     pub keeper: Option<KeeperHandle>,
     pub channels: std::collections::HashMap<String, ChannelHandle>,
+    /// Threads from the previous manifest generation. A replacement must not
+    /// start until these have left their in-flight channel/model calls, or two
+    /// Telegram long polls can claim the same update.
+    pub retiring: Vec<Arc<AtomicBool>>,
+}
+
+fn stop_channels(p: &mut AgentPresence) {
+    for (_, ch) in p.channels.drain() {
+        ch.stop.store(true, Ordering::Relaxed);
+        p.retiring.push(ch.done);
+    }
 }
 
 fn stop_all(p: &mut AgentPresence) {
-    for (_, ch) in p.channels.drain() {
-        ch.stop.store(true, Ordering::Relaxed);
-    }
+    stop_channels(p);
     if let Some(k) = p.keeper.take() {
         k.stop.store(true, Ordering::Relaxed);
+        p.retiring.push(k.done);
     }
 }
 
@@ -3953,6 +3963,9 @@ fn reconcile(state: &App, backoff: &mut std::collections::HashMap<String, u64>) 
         let manifest = apiary_core::manifest::Manifest::from_yaml(&raw).ok();
         let mut map = state.listeners.lock().unwrap_or_else(|e| e.into_inner());
         let presence = map.entry(npub.clone()).or_default();
+        presence
+            .retiring
+            .retain(|done| !done.load(Ordering::Relaxed));
 
         // Inactive, unparseable, or amended: everything stops.
         let declared: Vec<String> = manifest
@@ -3967,7 +3980,12 @@ fn reconcile(state: &App, backoff: &mut std::collections::HashMap<String, u64>) 
             .unwrap_or(false);
         if !active || manifest.is_none() || (declared.is_empty() && !has_routines) {
             stop_all(presence);
-            map.remove(&npub);
+            presence
+                .retiring
+                .retain(|done| !done.load(Ordering::Relaxed));
+            if presence.retiring.is_empty() {
+                map.remove(&npub);
+            }
             continue;
         }
         if !presence.channels.is_empty() && presence.manifest_sha != disk_sha {
@@ -3975,6 +3993,9 @@ fn reconcile(state: &App, backoff: &mut std::collections::HashMap<String, u64>) 
             stop_all(presence);
             presence.manifest_sha.clear();
             continue; // restart next tick, ratification permitting
+        }
+        if !presence.retiring.is_empty() {
+            continue; // never overlap two generations of a channel adapter
         }
         let manifest = manifest.expect("checked above");
 
@@ -4008,6 +4029,7 @@ fn reconcile(state: &App, backoff: &mut std::collections::HashMap<String, u64>) 
         let mut keeper_lost = None;
         if let Some(k) = &presence.keeper {
             if k.lost.load(Ordering::Relaxed) {
+                let keeper_done = k.done.load(Ordering::Relaxed);
                 // Contested or superseded: stop channels; retry the claim
                 // after backoff (a released/expired foreign lease clears it).
                 let note = k
@@ -4021,10 +4043,8 @@ fn reconcile(state: &App, backoff: &mut std::collections::HashMap<String, u64>) 
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(npub.clone(), note);
-                for (_, ch) in presence.channels.drain() {
-                    ch.stop.store(true, Ordering::Relaxed);
-                }
-                if k.done.load(Ordering::Relaxed)
+                stop_channels(presence);
+                if keeper_done
                     && now_secs().saturating_sub(*backoff.get(&npub).unwrap_or(&0))
                         >= RETRY_BACKOFF_SECS
                 {
