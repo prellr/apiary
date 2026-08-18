@@ -148,14 +148,8 @@ pub fn run_task_observed(
         .and_then(|v| v.as_str())
         .map(String::from);
     let auth = slot.requires.get("auth").and_then(|v| v.as_str());
-    let oauth_profile = slot.requires.get("oauth_profile").and_then(|v| v.as_str());
-    let provider = prep!(bind(
-        &slot.provider,
-        credential,
-        base_url,
-        auth,
-        oauth_profile
-    ));
+    let provider = prep!(bind(&slot.provider, credential, base_url, auth));
+    let inference_harness = provider.harness().to_string();
 
     emit(RunEvent::Started {
         slot: slot_name.clone(),
@@ -258,7 +252,7 @@ pub fn run_task_observed(
                         action: "tool.call".into(),
                         model: Some(model.clone()),
                         cost: None,
-                        harness: Some("native".into()),
+                        harness: Some(inference_harness.clone()),
                         outcome: match &result {
                             Ok(_) => "ok".into(),
                             Err(e) => format!("error: {e}"),
@@ -318,7 +312,7 @@ pub fn run_task_observed(
                 input_tokens: completion.input_tokens,
                 output_tokens: completion.output_tokens,
             }),
-            harness: Some("native".into()),
+            harness: Some(inference_harness.clone()),
             outcome: completion.outcome.clone(),
             detail: Some(json!({
                 "task": task,
@@ -344,7 +338,7 @@ pub fn run_task_observed(
                 action: "budget.overrun".into(),
                 model: Some(completion.model.clone()),
                 cost: None,
-                harness: Some("native".into()),
+                harness: Some(inference_harness),
                 outcome: "recorded".into(),
                 detail: Some(json!({
                     "reserved": reservation.amount,

@@ -61,8 +61,9 @@ pub struct Identity {
 pub struct InferenceSlot {
     /// Pool-local name routing rules refer to: "workhorse", "fast", "local", "embed".
     pub name: String,
-    /// "anthropic" | "openai" | "xai" | "ollama" | "mock". The openai and
-    /// xai providers speak the OpenAI-compatible dialect; `requires.
+    /// "claude-code" | "anthropic" | "openai" | "xai" | "ollama" | "mock".
+    /// Claude Code uses subscription auth through the guarded local CLI. The
+    /// openai and xai providers speak the OpenAI-compatible dialect; `requires.
     /// base_url` points either at any compatible endpoint (Groq, Together,
     /// llama.cpp, LM Studio, ollama /v1 — keyless when local).
     pub provider: String,

@@ -630,7 +630,7 @@ function inferenceRoleForName(name) {
 }
 
 const inferenceProviders = {
-  language: [['anthropic', 'Anthropic'], ['openai', 'OpenAI compatible'], ['xai', 'xAI'], ['ollama', 'Ollama (local)']],
+  language: [['claude-code', 'Claude Code (subscription)'], ['anthropic', 'Anthropic API'], ['openai', 'OpenAI compatible'], ['xai', 'xAI'], ['ollama', 'Ollama (local)']],
   embedding: [['ollama', 'Ollama (local)'], ['hash', 'Built-in lexical index']],
   transcription: [['apple-speech', 'Apple Speech (local)'], ['whisper-cpp', 'whisper.cpp (local)'], ['openai', 'OpenAI compatible']],
   speech: [['openai', 'OpenAI compatible / Kokoro'], ['apple-speech', 'Apple Speech (local)'], ['macos-say', 'macOS voices']],
@@ -641,6 +641,12 @@ const inferenceProviders = {
 // vary; local engines especially may use any installed model identifier.
 const inferenceModels = {
   language: {
+    'claude-code': [
+      ['claude-sonnet-5', 'Claude Sonnet 5 · balanced (recommended)'],
+      ['claude-opus-5', 'Claude Opus 5 · complex work'],
+      ['claude-haiku-4-5-20251001', 'Claude Haiku 4.5 · fastest'],
+      ['claude-fable-5', 'Claude Fable 5 · highest capability'],
+    ],
     anthropic: [
       ['claude-sonnet-5', 'Claude Sonnet 5 · balanced (recommended)'],
       ['claude-opus-5', 'Claude Opus 5 · complex work'],
@@ -678,6 +684,7 @@ function inferenceProviderLabel(provider) {
 function inferenceEndpoint(slot) {
   const configured = ((slot.requires || {}).base_url || '').replace(/\/$/, '');
   if (configured) return configured;
+  if (slot.provider === 'claude-code') return 'local Claude Code runtime';
   if (slot.provider === 'anthropic') return 'api.anthropic.com';
   if (slot.provider === 'xai') return 'api.x.ai';
   if (slot.provider === 'openai') return 'api.openai.com';
@@ -697,6 +704,8 @@ function inferenceForm(slot, afterSave, allSlots = []) {
   const name = el('input'); name.value = slot ? slot.name : '';
   name.placeholder = 'e.g. workhorse or fast';
   const provider = el('select');
+  const legacyClaude = !!(slot && slot.provider === 'anthropic' && (slot.requires || {}).auth === 'oauth');
+  const initialProvider = legacyClaude ? 'claude-code' : (slot && slot.provider);
   const model = el('select');
   const customModel = el('input'); customModel.placeholder = 'Custom model identifier'; customModel.style.display = 'none';
   const modelControls = el('div'); modelControls.style.display = 'grid'; modelControls.style.gap = '6px'; modelControls.append(model, customModel);
@@ -705,13 +714,19 @@ function inferenceForm(slot, afterSave, allSlots = []) {
   endpoint.dataset.auto = endpoint.value ? '0' : '1';
   endpoint.oninput = () => { endpoint.dataset.auto = '0'; };
   const auth = el('select');
-  for (const [value, label] of [['api-key', 'API key'], ['platform-oauth', 'Claude Platform (OAuth)']]) {
+  for (const [value, label] of [['api-key', 'API key']]) {
     const option = el('option', null, label); option.value = value; auth.append(option);
   }
-  const savedAuth = (slot && slot.requires && slot.requires.auth) || 'api-key';
-  // Claude Code setup tokens were previously offered here, but cannot call
-  // the native Messages API. Open old connections directly in migration mode.
-  auth.value = savedAuth === 'oauth' ? 'platform-oauth' : savedAuth;
+  auth.value = 'api-key';
+  const oauthReuse = el('select');
+  oauthReuse.append(Object.assign(el('option', null, 'Choose another Claude subscription…'), { value: '' }));
+  const oauthSources = allSlots.filter(source =>
+    source.name !== (slot && slot.name) &&
+    (source.provider === 'claude-code' || (source.provider === 'anthropic' && (source.requires || {}).auth === 'oauth')) &&
+    source.credential_source === 'sealed Claude subscription token');
+  for (const source of oauthSources) oauthReuse.append(Object.assign(el('option', null, source.name), { value: source.name }));
+  const oauthReuseField = field('Use subscription from', oauthReuse,
+    'Reuses the already-sealed setup token within this agent. The token is never shown.');
   const credential = el('input'); credential.type = 'password'; credential.autocomplete = 'off';
   credential.placeholder = slot && slot.credential_source && slot.credential_source.startsWith('sealed') ? 'Leave blank to keep current credential' : 'API key, if required';
   const voice = el('input'); voice.value = (slot && slot.requires && slot.requires.voice) || '';
@@ -722,13 +737,13 @@ function inferenceForm(slot, afterSave, allSlots = []) {
   const makeDefaultLabel = el('label'); makeDefaultLabel.append(makeDefault, document.createTextNode(' Use as the default task model'));
   const clear = el('input'); clear.type = 'checkbox';
   const clearLabel = el('label'); clearLabel.append(clear, document.createTextNode(' Remove the stored credential'));
-  const oauthConnect = el('button', 'btn solid', 'Sign in to Claude Platform');
+  const oauthConnect = el('button', 'btn solid', 'Create headless setup token');
   oauthConnect.style.display = 'none';
 
   let modelInitialized = false;
   const refreshModelChoices = () => {
     const choices = ((inferenceModels[role.value] || {})[provider.value] || []);
-    const initial = !modelInitialized && slot && slot.provider === provider.value ? (slot.model || '') : '';
+    const initial = !modelInitialized && slot && initialProvider === provider.value ? (slot.model || '') : '';
     model.replaceChildren();
     for (const [value, label] of choices) { const option = el('option', null, label); option.value = value; model.append(option); }
     const custom = el('option', null, 'Custom model…'); custom.value = '__custom__'; model.append(custom);
@@ -755,16 +770,17 @@ function inferenceForm(slot, afterSave, allSlots = []) {
   const refreshAuth = () => {
     const anthropic = role.value === 'language' && provider.value === 'anthropic';
     auth.closest('.field').style.display = anthropic ? '' : 'none';
-    const oauth = anthropic && auth.value === 'platform-oauth';
-    oauthConnect.style.display = oauth ? '' : 'none';
-    credential.closest('.field').style.display = anthropic && oauth ? 'none' : '';
+    const claude = role.value === 'language' && provider.value === 'claude-code';
+    oauthConnect.style.display = 'none';
+    oauthReuseField.style.display = 'none';
+    credential.closest('.field').style.display = claude ? 'none' : '';
     credential.placeholder = slot && slot.credential_source === 'sealed API key'
       ? 'Leave blank to keep current API key'
       : 'API key, if required';
   };
 
   const refreshProviderChoices = () => {
-    const current = provider.value || (slot && slot.provider);
+    const current = provider.value || initialProvider;
     provider.replaceChildren();
     for (const [value, label] of inferenceProviders[role.value]) {
       const option = el('option', null, label); option.value = value; provider.append(option);
@@ -785,15 +801,16 @@ function inferenceForm(slot, afterSave, allSlots = []) {
   form.append(field('Role', role), field('Connection name', name, 'Routing refers to this stable name.'),
     field('Provider', provider), field('Model', modelControls),
     field('Base URL', endpoint, 'Provider defaults are prefilled. OpenAI-compatible and local endpoints remain editable.'),
-    field('Authentication', auth, 'Claude Platform OAuth signs in to a Console workspace through Anthropic’s official ant CLI. Usage is billed to that workspace.'),
+    field('Authentication', auth, 'Anthropic API connections use API billing. Claude Code uses the account already signed in to the Claude CLI on this Mac.'),
+    oauthReuseField,
     field('Credential', credential, 'API keys are encrypted to this agent before they are written.'),
     field('Voice', voice), field('Locale', locale));
   const flags = el('div', 'wide row'); flags.append(makeDefaultLabel);
-  if (slot && slot.credential_source === 'sealed API key') flags.append(clearLabel);
+  if (slot && slot.credential_source && slot.credential_source.startsWith('sealed')) flags.append(clearLabel);
   form.append(flags);
   const actions = el('div', 'connection-actions');
   const save = el('button', 'btn solid', slot ? 'Save connection' : 'Add connection');
-  const status = el('span', 'meta', ''); actions.append(oauthConnect, save, status);
+  const status = el('span', 'meta', legacyClaude ? 'Ready to migrate to this Mac’s Claude Code sign-in.' : ''); actions.append(save, status);
   if (slot) {
     const remove = el('button', 'btn danger', 'Remove'); let armed = false;
     remove.onclick = async () => {
@@ -810,7 +827,8 @@ function inferenceForm(slot, afterSave, allSlots = []) {
   role.onchange = () => { endpoint.dataset.auto = '1'; refreshProviderChoices(); };
   provider.onchange = () => { endpoint.dataset.auto = '1'; refreshProviderChoices(); };
   auth.onchange = refreshAuth;
-  provider.value = (slot && slot.provider) || inferenceProviders[role.value][0][0];
+  oauthReuse.onchange = () => { if (oauthReuse.value) { credential.value = ''; clear.checked = false; } };
+  provider.value = initialProvider || inferenceProviders[role.value][0][0];
   refreshProviderChoices();
 
   const persist = async (setupOauth = false) => {
@@ -820,32 +838,29 @@ function inferenceForm(slot, afterSave, allSlots = []) {
     name.value = connectionName;
     const chosenModel = model.value === '__custom__' ? customModel.value.trim() : model.value;
     if (role.value === 'language' && !chosenModel) { status.textContent = 'Choose a model or enter a custom model identifier.'; customModel.focus(); return; }
-    const initialAuth = (slot && slot.requires && slot.requires.auth) || 'api-key';
-    if (!setupOauth && slot && slot.provider === 'anthropic' && provider.value === 'anthropic' && auth.value !== initialAuth && !credential.value && !clear.checked) {
-      status.textContent = 'Authentication changed—enter the matching credential again.'; credential.focus(); return;
-    }
     const requires = Object.assign({}, (slot && slot.requires) || {});
     if (endpoint.value.trim()) requires.base_url = endpoint.value.trim(); else delete requires.base_url;
     if (provider.value === 'anthropic') {
-      requires.auth = auth.value;
-      if (auth.value === 'platform-oauth') requires.oauth_profile = 'apiary'; else delete requires.oauth_profile;
+      requires.auth = 'api-key';
+      delete requires.oauth_profile;
     } else { delete requires.auth; delete requires.oauth_profile; }
+    if (provider.value === 'claude-code') delete requires.base_url;
     if (voice.value.trim()) requires.voice = voice.value.trim(); else delete requires.voice;
     if (locale.value.trim()) requires.locale = locale.value.trim(); else delete requires.locale;
     save.disabled = true; oauthConnect.disabled = true;
-    status.textContent = setupOauth ? 'Opening Claude Platform sign-in… this can take a minute.' : (credential.value ? 'Encrypting credential…' : 'Saving…');
+    status.textContent = setupOauth ? 'Opening Claude subscription sign-in… this can take a minute.' : (oauthReuse.value ? 'Applying stored subscription…' : (credential.value ? 'Encrypting credential…' : 'Saving…'));
     const r = await j(api('/inference'), {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         original_name: slot ? slot.name : null,
         name: connectionName, provider: provider.value, model: chosenModel || null,
-        credential: credential.value || null, clear_credential: clear.checked,
-        credential_from: null,
+        credential: credential.value || null, clear_credential: clear.checked || legacyClaude,
+        credential_from: setupOauth ? null : (oauthReuse.value || null),
         requires, set_default: makeDefault.checked, setup_oauth: setupOauth,
       }),
     });
     credential.value = ''; save.disabled = false; oauthConnect.disabled = false;
-    status.textContent = r.ok ? (setupOauth ? 'Claude Platform connected. Review and approve the change.' : 'Saved. Review and approve the change.') : 'Could not save: ' + r.error;
+    status.textContent = r.ok ? (setupOauth ? 'Claude subscription connected. Review and approve the change.' : 'Saved. Review and approve the change.') : 'Could not save: ' + r.error;
     if (r.ok) { await loadRoster(); afterSave(); }
   };
   save.onclick = () => persist(false);

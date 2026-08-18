@@ -23,7 +23,8 @@ Logs: `~/.apiary/logs/{desktop,kokoro}.log`. Restart after a rebuild:
 `launchctl kickstart -k gui/$(id -u)/wine.wisco.apiary.desktop`.
 
 Inference API keys belong sealed in the agent's manifest (Inference tab /
-`apiary credential seal`), not in this environment. Claude Platform OAuth is
-the exception: Anthropic's `ant` CLI keeps its refresh credential in the
-named local profile, and Apiary requests only a short-lived access token when
-it makes a call. A relaunch otherwise needs nothing but the passphrase.
+`apiary credential seal`), not in the launch environment. Claude Code
+subscription sources use the host's existing `claude auth login` session; an
+optional sealed setup token is supported for headless hosts. Apiary disables
+Claude Code's own tools and dispatches only the connectors granted to the
+agent. A relaunch otherwise needs nothing but the keystore passphrase.
