@@ -401,7 +401,7 @@ impl McpClient {
                     serde_json::from_str(&body).map_err(|e| {
                         crate::Error::Provider(format!(
                             "mcp: non-JSON response ({e}): {}",
-                            &body.chars().take(200).collect::<String>()
+                            body.chars().take(200).collect::<String>()
                         ))
                     })
                 }
