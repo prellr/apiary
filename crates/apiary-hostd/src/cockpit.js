@@ -546,6 +546,44 @@ async function renderOverview(c) {
     quick('Manage inference', 'Models, memory, speech, and routing.', 'inference'));
   c.append(shortcuts);
 
+  const constitution = m.constitution || {};
+  const character = section('Role and personality',
+    'This is the agent’s durable, approved operating character. It guides every response but cannot grant capabilities or override limits.');
+  const purpose = el('textarea'); purpose.rows = 4; purpose.value = constitution.purpose || '';
+  purpose.placeholder = 'What should this agent reliably help people accomplish?';
+  const role = el('input'); role.value = constitution.role || ''; role.placeholder = 'e.g. Research analyst';
+  const voice = el('textarea'); voice.rows = 2; voice.value = constitution.voice || '';
+  voice.placeholder = 'e.g. Clear, curious, candid, and concise';
+  const principles = el('textarea', 'address-list'); principles.rows = 4;
+  principles.value = (constitution.principles || []).join('\n');
+  principles.placeholder = 'One operating principle per line';
+  const boundaries = el('textarea', 'address-list'); boundaries.rows = 4;
+  boundaries.value = (constitution.boundaries || []).join('\n');
+  boundaries.placeholder = 'One behavioral boundary per line';
+  const saveCharacter = el('button', 'btn', 'Save role and personality');
+  const characterStatus = el('span', 'meta', '');
+  const characterRow = el('div', 'row'); characterRow.append(saveCharacter, characterStatus);
+  character.append(field('Purpose', purpose), field('Role', role), field('Voice', voice),
+    field('Operating principles', principles, 'One per line. These tell the agent how to approach its work.'),
+    field('Boundaries', boundaries, 'One per line. Technical permissions are still enforced separately under Capabilities.'),
+    help('Saving is a constitutional amendment: the agent pauses until a manager reviews and approves it.'),
+    characterRow);
+  saveCharacter.onclick = async () => {
+    saveCharacter.disabled = true; characterStatus.textContent = 'Saving amendment…';
+    const lines = value => value.split('\n').map(item => item.trim()).filter(Boolean);
+    const result = await j(api('/constitution'), {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+        purpose: purpose.value.trim(), role: role.value.trim(), voice: voice.value.trim(),
+        principles: lines(principles.value), boundaries: lines(boundaries.value),
+      }),
+    });
+    saveCharacter.disabled = false;
+    if (!result.ok) { characterStatus.textContent = 'Could not save: ' + result.error; return; }
+    characterStatus.textContent = 'Saved. Review and approve the amendment before this agent can run.';
+    await loadRoster(); render();
+  };
+  c.append(character);
+
   const governorKeys = ((m.governance || {}).suspend_keys || []);
   const people = approvalPeople();
   const knownKeys = new Set(people.map(person => person.npub));
@@ -1172,6 +1210,7 @@ async function renderManifest(c) {
   const g = el('div');
   const rows = [
     ['identity.npub', 'the agent’s public key — immutable; the host refuses an amendment that changes it'],
+    ['constitution', 'the agent’s durable purpose, role, voice, operating principles, and behavioral boundaries. These are authoritative instructions, but never grant capabilities or override enforced limits.'],
     ['inference[]', 'agent-owned inference connections. Task-model names are routing targets; reserved names embed, transcribe, and speak provide semantic memory and voice equipment. Manage ordinary changes from Inference. Per-slot credentials are NIP-44-sealed.'],
     ['routing.default', 'slot used when no rule matches'],
     ['routing.rules[]', 'conditional slot choices, e.g. {when: task.class == "reasoning", to: workhorse}'],

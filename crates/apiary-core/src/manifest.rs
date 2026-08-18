@@ -16,6 +16,11 @@ pub const MANIFEST_VERSION: u32 = 1;
 pub struct Manifest {
     pub manifest_version: u32,
     pub identity: Identity,
+    /// The durable, human-ratified description of who this agent is and how
+    /// it should behave. Capabilities remain separate: this can guide use of
+    /// a connector, but can never grant one.
+    #[serde(default, skip_serializing_if = "Constitution::is_empty")]
+    pub constitution: Constitution,
     /// Inference is a POOL, not a scalar — each entry is a full connection
     /// ("inference in" is itself a credentialed connection, SPEC §1/§7).
     #[serde(default)]
@@ -54,6 +59,61 @@ pub struct Identity {
     /// compatible with whatever rotation NIP the ecosystem lands on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub successor: Option<String>,
+}
+
+/// Human-owned operating character. These fields are injected as
+/// authoritative instructions on every run and travel with the agent as part
+/// of the ratified manifest.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Constitution {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub purpose: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub role: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub voice: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub principles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub boundaries: Vec<String>,
+}
+
+impl Constitution {
+    pub fn is_empty(&self) -> bool {
+        self.purpose.is_empty()
+            && self.role.is_empty()
+            && self.voice.is_empty()
+            && self.principles.is_empty()
+            && self.boundaries.is_empty()
+    }
+
+    /// Stable, readable form for the runtime's authoritative system prompt.
+    pub fn prompt_text(&self) -> String {
+        let mut sections = Vec::new();
+        if !self.purpose.is_empty() {
+            sections.push(format!("Purpose: {}", self.purpose));
+        }
+        if !self.role.is_empty() {
+            sections.push(format!("Role: {}", self.role));
+        }
+        if !self.voice.is_empty() {
+            sections.push(format!("Voice: {}", self.voice));
+        }
+        if !self.principles.is_empty() {
+            sections.push(format!(
+                "Operating principles:\n- {}",
+                self.principles.join("\n- ")
+            ));
+        }
+        if !self.boundaries.is_empty() {
+            sections.push(format!(
+                "Behavioral boundaries:\n- {}",
+                self.boundaries.join("\n- ")
+            ));
+        }
+        sections.join("\n")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -489,5 +549,45 @@ impl Manifest {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity;
+    use nostr::prelude::Keys;
+
+    fn minimal_yaml() -> String {
+        let agent = identity::to_npub(&Keys::generate().public_key()).unwrap();
+        let human = identity::to_npub(&Keys::generate().public_key()).unwrap();
+        format!(
+            "manifest_version: 1\nidentity:\n  npub: {agent}\nmemory:\n  log: local\n\
+             governance:\n  suspend_keys:\n    - {human}\n"
+        )
+    }
+
+    #[test]
+    fn manifests_without_a_constitution_remain_valid() {
+        let manifest = Manifest::from_yaml(&minimal_yaml()).unwrap();
+        assert!(manifest.constitution.is_empty());
+        assert!(!manifest.to_yaml().unwrap().contains("constitution:"));
+    }
+
+    #[test]
+    fn constitution_prompt_text_keeps_each_operating_layer() {
+        let constitution = Constitution {
+            purpose: "Help customers".into(),
+            role: "Support specialist".into(),
+            voice: "Warm and direct".into(),
+            principles: vec!["Verify account details".into()],
+            boundaries: vec!["Do not issue refunds".into()],
+        };
+        let prompt = constitution.prompt_text();
+        assert!(prompt.contains("Purpose: Help customers"));
+        assert!(prompt.contains("Role: Support specialist"));
+        assert!(prompt.contains("Voice: Warm and direct"));
+        assert!(prompt.contains("Operating principles:\n- Verify account details"));
+        assert!(prompt.contains("Behavioral boundaries:\n- Do not issue refunds"));
     }
 }

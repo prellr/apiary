@@ -3,10 +3,12 @@
 A host for **portable agents** — durable principals with self-owned cryptographic
 identity (nostr), not sessions welded to a platform.
 
-An agent is four things, none of which is the model: **identity** (a nostr
-keypair), **skillset** (manifest-declared connectors), **memory** (signed log +
-semantic index), and **permissions** (human-owned floors + encrypted credential
-grants). The model is rented, swappable cognition: *inference in, connections out*.
+An agent is five things, none of which is the model: **identity** (a nostr
+keypair), **constitution** (ratified purpose, role, voice, principles, and
+boundaries), **skillset** (manifest-declared connectors), **memory** (signed log
+and semantic index), and **permissions** (human-owned floors + encrypted
+credential grants). The model is rented, swappable cognition: *inference in,
+connections out*.
 
 Read the full design: [docs/SPEC.md](docs/SPEC.md).
 
@@ -18,8 +20,9 @@ model runs). What exists today:
 
 **The substrate** (`apiary-core`)
 
-- Manifest schema v1 — the agent's constitution: identity, inference pool,
-  routing, connectors, memory, presence, governance, lease
+- Manifest schema v1 — the agent's constitution: identity, operating
+  character, inference pool, routing, connectors, memory, presence,
+  governance, lease
 - Identity: nostr keypair (BIP-340); custody with NIP-44 seal/open,
   per-agent isolation, JIT decrypt, zeroizing buffers
 - Dev keystore: NIP-49 (ncryptsec) encrypted keys at rest, 0600/0700 modes
@@ -41,6 +44,9 @@ model runs). What exists today:
   reservations taken before every model call
 - Governed run loop: budget → route → hydrate memory (semantic index +
   recency tail) → infer → tool loop → signed checkpoint entries
+- Durable role and personality: purpose, role, voice, principles, and
+  boundaries are manifest fields injected into every run. Editing them is a
+  constitutional amendment that pauses the agent until manager approval
 - Provenance framing: memory, tool results, and workspace messages are
   DATA in the working set; instructions come only from the constitution
   and the operator's task (proven live: a channel mention asking an agent

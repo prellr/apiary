@@ -80,6 +80,12 @@ identity:
   npub: npub1…
   signer: nip46://…            # master key custody
   successor: npub1…            # signed successor statement
+constitution:                  # authoritative operating character, human-ratified
+  purpose: Produce source-backed research briefs
+  role: Research analyst
+  voice: Clear, curious, candid, and concise
+  principles: [Distinguish facts from inference, Cite sources]
+  boundaries: [Never publish without approval]
 inference:                      # a POOL, not a scalar — each entry is a full connection
   - name: workhorse            # hard reasoning, tool orchestration
     provider: anthropic

@@ -392,6 +392,70 @@ pub async fn governors_set(
     .into_response()
 }
 
+#[derive(serde::Deserialize)]
+pub struct ConstitutionBody {
+    #[serde(default)]
+    purpose: String,
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    voice: String,
+    #[serde(default)]
+    principles: Vec<String>,
+    #[serde(default)]
+    boundaries: Vec<String>,
+}
+
+/// Replace the agent's ratified operating character. This changes only how
+/// the agent should behave; it cannot add tools or loosen connector caps.
+pub async fn constitution_set(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    let body: ConstitutionBody = match serde_json::from_slice(&raw_body) {
+        Ok(body) => body,
+        Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let clean_list = |items: Vec<String>| {
+        items
+            .into_iter()
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect()
+    };
+    manifest.constitution = apiary_core::manifest::Constitution {
+        purpose: body.purpose.trim().to_string(),
+        role: body.role.trim().to_string(),
+        voice: body.voice.trim().to_string(),
+        principles: clean_list(body.principles),
+        boundaries: clean_list(body.boundaries),
+    };
+    let yaml = match manifest.to_yaml() {
+        Ok(yaml) => yaml,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    if let Err(error) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "constitution": manifest.constitution,
+        "manifest_sha256": ceremony::manifest_hash(&yaml),
+        "ratified": false,
+        "note": "role and personality changed — review and approve before the agent runs",
+    }))
+    .into_response()
+}
+
 // ---------------------------------------------------------------- owners
 
 #[derive(serde::Deserialize)]

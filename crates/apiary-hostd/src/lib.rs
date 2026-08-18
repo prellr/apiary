@@ -16,7 +16,11 @@ pub mod ops;
 pub mod routines;
 
 use apiary_core::{
-    ceremony, custody::Custody, keystore::Keystore, log::EpisodicLog, manifest::Manifest,
+    ceremony,
+    custody::Custody,
+    keystore::Keystore,
+    log::EpisodicLog,
+    manifest::{Constitution, Manifest},
 };
 use axum::{
     extract::{OriginalUri, Path as AxPath, Query, State},
@@ -134,6 +138,10 @@ pub fn build_router(state: App) -> Router {
             get(get_manifest).put(put_manifest),
         )
         .route("/api/agents/{npub}/ratify", post(ratify_agent))
+        .route(
+            "/api/agents/{npub}/constitution",
+            post(ops::constitution_set),
+        )
         .route("/api/agents/{npub}/ratify/export", post(ops::ratify_export))
         .route("/api/agents/{npub}/ratify/import", post(ops::ratify_import))
         .route("/api/agents/{npub}/log", get(get_log))
@@ -651,6 +659,9 @@ async fn found_agent(
         Ok(b) => b,
         Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
     };
+    if body.purpose.trim().is_empty() {
+        return err(StatusCode::BAD_REQUEST, "agent purpose is required").into_response();
+    }
     if body.suspend_keys.is_empty() {
         return err(
             StatusCode::BAD_REQUEST,
@@ -701,8 +712,9 @@ async fn found_agent(
         return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
 
-    let template = template_manifest(&npub, &suspend);
-    let (yaml, drafted_by) = if body.draft_with.as_deref() == Some("anthropic") {
+    let purpose = body.purpose.trim().to_string();
+    let template = template_manifest(&npub, &suspend, &purpose);
+    let (draft, drafted_by) = if body.draft_with.as_deref() == Some("anthropic") {
         match draft_manifest_with_model(&npub, &body.purpose, &suspend, &template).await {
             Ok(y) => (y, "anthropic"),
             Err(e) => {
@@ -715,10 +727,20 @@ async fn found_agent(
     };
     // Whatever drafted it, it must parse and pass invariants — or we fall
     // back to the template rather than storing an invalid constitution.
-    let (yaml, drafted_by) = match Manifest::from_yaml(&yaml) {
-        Ok(_) => (yaml, drafted_by),
-        Err(_) => (template, "template (model draft invalid)"),
+    let (mut manifest, drafted_by) = match Manifest::from_yaml(&draft) {
+        Ok(manifest) => (manifest, drafted_by),
+        Err(_) => (
+            Manifest::from_yaml(&template).expect("founding template must be valid"),
+            "template (model draft invalid)",
+        ),
     };
+    // The user's purpose is authoritative input, not something the drafting
+    // model may paraphrase away. Model-authored role/voice details remain a
+    // reviewable proposal around that fixed purpose.
+    manifest.constitution.purpose = purpose;
+    let yaml = manifest
+        .to_yaml()
+        .expect("validated founding manifest must serialize");
     let dir = ks.agent_dir(&npub);
     if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml)
         .and_then(|_| std::fs::write(dir.join("name"), &body.name))
@@ -737,11 +759,21 @@ async fn found_agent(
     .into_response()
 }
 
-fn template_manifest(npub: &str, suspend: &[String]) -> String {
+fn template_manifest(npub: &str, suspend: &[String], purpose: &str) -> String {
     let keys: String = suspend.iter().map(|k| format!("    - {k}\n")).collect();
+    let constitution = serde_yaml::to_string(&Constitution {
+        purpose: purpose.to_string(),
+        ..Default::default()
+    })
+    .expect("constitution must serialize");
+    let constitution = constitution
+        .lines()
+        .map(|line| format!("  {line}\n"))
+        .collect::<String>();
     format!(
         "manifest_version: 1\n\
          identity:\n  npub: {npub}\n\
+         constitution:\n{constitution}\
          inference:\n\
          - name: workhorse\n  provider: anthropic\n  model: claude-opus-5\n\
          routing:\n  default: workhorse\n\
@@ -772,7 +804,9 @@ async fn draft_manifest_with_model(
                       no fences, no commentary. Constraints: manifest_version 1; identity.npub \
                       exactly as given; suspend_keys exactly as given; connectors only from: \
                       nostr-publish (needs caps.relays list). Budgets conservative. The routing \
-                      pool may use providers: anthropic, ollama. Follow the template's shape.";
+                      pool may use providers: anthropic, ollama. Preserve constitution.purpose \
+                      exactly; add a concise role, voice, principles, and boundaries that fit it. \
+                      Follow the template's shape.";
         let prompt = format!(
             "Template:\n{template}\nAgent npub: {npub}\nSuspend keys: {suspend:?}\n\
              Purpose of this agent: {purpose}\n\nDraft the manifest YAML."
@@ -824,4 +858,21 @@ pub fn admit_agent(
     let mut custody = Custody::new();
     let handle = custody.admit(keys);
     Ok((custody, handle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apiary_core::identity;
+    use nostr::prelude::Keys;
+
+    #[test]
+    fn founding_template_persists_the_exact_purpose() {
+        let agent = identity::to_npub(&Keys::generate().public_key()).unwrap();
+        let human = identity::to_npub(&Keys::generate().public_key()).unwrap();
+        let purpose = "Research markets: distinguish facts from inference\nand cite sources.";
+        let yaml = template_manifest(&agent, &[human], purpose);
+        let manifest = Manifest::from_yaml(&yaml).unwrap();
+        assert_eq!(manifest.constitution.purpose, purpose);
+    }
 }
