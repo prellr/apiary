@@ -67,6 +67,9 @@ async fn main() {
     let state = Arc::new(AppState {
         home: args.home.clone(),
         passphrase: std::sync::RwLock::new(args.passphrase.clone()),
+        remember_passphrase: None,
+        forget_passphrase: None,
+        automatic_unlock: std::sync::atomic::AtomicBool::new(false),
         auth,
         origin: args
             .origin

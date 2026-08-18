@@ -8,7 +8,6 @@
   <key>EnvironmentVariables</key><dict>
     <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
     <key>HOME</key><string>$HOME</string>
-    <key>APIARY_PASSPHRASE</key><string>YOUR-KEYSTORE-PASSPHRASE</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>

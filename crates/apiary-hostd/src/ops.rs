@@ -15,10 +15,9 @@ use nostr::prelude::*;
 use serde_json::json;
 use sha2::Digest;
 use std::collections::VecDeque;
-use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 type Resp = (StatusCode, Json<serde_json::Value>);
 
@@ -201,6 +200,9 @@ pub async fn status(
         "auth": match state.auth { crate::AuthMode::Open => "open", crate::AuthMode::Nip98 => "nip98" },
         "token_gated": state.token.is_some(),
         "unlocked": unlocked,
+        "automatic_unlock": state.automatic_unlock.load(Ordering::Relaxed),
+        "can_remember_unlock": state.remember_passphrase.is_some(),
+        "can_forget_unlock": state.forget_passphrase.is_some(),
         "agents": agents,
         "owners": owners,
         "listeners": listeners,
@@ -308,6 +310,8 @@ pub async fn owners_create(
 #[derive(serde::Deserialize)]
 pub struct UnlockBody {
     passphrase: String,
+    #[serde(default)]
+    remember: bool,
 }
 
 /// Unlock the keystore for this daemon's lifetime. Verified against a real
@@ -357,11 +361,30 @@ pub async fn unlock(
     .unwrap_or_else(|e| Err(e.to_string()));
     match verified {
         Ok(checked) => {
+            let mut remember_warning = None;
+            if body.remember {
+                match state.remember_passphrase.as_ref() {
+                    Some(remember) => match remember(&body.passphrase) {
+                        Ok(()) => state.automatic_unlock.store(true, Ordering::Relaxed),
+                        Err(error) => remember_warning = Some(error),
+                    },
+                    None => {
+                        remember_warning =
+                            Some("automatic unlock is not available in this host build".to_string())
+                    }
+                }
+            }
             if let Ok(mut g) = state.passphrase.write() {
                 *g = Some(body.passphrase);
             }
-            Json(json!({"ok": true, "unlocked": true, "verified_against_key": checked}))
-                .into_response()
+            Json(json!({
+                "ok": true,
+                "unlocked": true,
+                "verified_against_key": checked,
+                "automatic_unlock": state.automatic_unlock.load(Ordering::Relaxed),
+                "remember_warning": remember_warning,
+            }))
+            .into_response()
         }
         Err(e) => err(StatusCode::UNAUTHORIZED, e).into_response(),
     }
@@ -390,6 +413,36 @@ pub async fn lock(
         *g = None;
     }
     Json(json!({"ok": true, "unlocked": false})).into_response()
+}
+
+pub async fn forget_automatic_unlock(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let pq = uri
+        .path_and_query()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| uri.path().to_string());
+    let signer = match nip98::check(&state, &headers, "POST", &pq, None) {
+        Ok(sig) => sig,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = nip98::authorize_admin(&state, signer) {
+        return e.into_response();
+    }
+    let Some(forget) = state.forget_passphrase.as_ref() else {
+        return err(
+            StatusCode::NOT_IMPLEMENTED,
+            "automatic unlock is not available in this host build",
+        )
+        .into_response();
+    };
+    if let Err(error) = forget() {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
+    state.automatic_unlock.store(false, Ordering::Relaxed);
+    Json(json!({"ok": true, "automatic_unlock": false})).into_response()
 }
 
 // ---------------------------------------------------------------- key tool
@@ -496,18 +549,11 @@ fn nonempty_env(name: &str) -> bool {
 }
 
 fn credential_source(slot: &apiary_core::manifest::InferenceSlot) -> String {
-    if slot.provider == "claude-code" && slot.credential.is_none() {
+    if slot.provider == "claude-code" {
         return "local Claude Code sign-in".into();
     }
     if slot.credential.is_some() {
-        return if slot.provider == "claude-code"
-            || (slot.provider == "anthropic"
-                && slot.requires.get("auth").and_then(|v| v.as_str()) == Some("oauth"))
-        {
-            "sealed Claude subscription token".into()
-        } else {
-            "sealed API key".into()
-        };
+        return "sealed API key".into();
     }
     let env = match slot.provider.as_str() {
         "anthropic" => nonempty_env("ANTHROPIC_API_KEY") || nonempty_env("ANTHROPIC_AUTH_TOKEN"),
@@ -616,11 +662,6 @@ fn probe_inference_slot(slot: &apiary_core::manifest::InferenceSlot) -> serde_js
         "claude-code" => {
             if !apiary_runtime::inference::claude_code_is_installed() {
                 result("unavailable", "Claude Code is not installed".into())
-            } else if slot.credential.is_some() {
-                result(
-                    "configured",
-                    "Claude Code and a sealed headless credential are available".into(),
-                )
             } else {
                 match apiary_runtime::inference::claude_code_auth_status() {
                     Ok(account) => result(
@@ -751,19 +792,12 @@ pub struct InferenceUpsertBody {
     model: Option<String>,
     #[serde(default)]
     credential: Option<String>,
-    /// Copy an already-sealed Claude Code setup token from another
-    /// connection in this same agent manifest. The host never decrypts it.
-    #[serde(default)]
-    credential_from: Option<String>,
     #[serde(default)]
     clear_credential: bool,
     #[serde(default)]
     requires: std::collections::BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     set_default: bool,
-    /// Ask the official Claude Code CLI for a subscription setup token.
-    #[serde(default)]
-    setup_oauth: bool,
 }
 
 fn validate_inference_name(name: &str) -> bool {
@@ -772,203 +806,6 @@ fn validate_inference_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-}
-
-fn stored_claude_code_credential(
-    slots: &[apiary_core::manifest::InferenceSlot],
-    source_name: &str,
-) -> Result<apiary_core::manifest::EncryptedBlob, String> {
-    let source = slots
-        .iter()
-        .find(|slot| slot.name == source_name)
-        .ok_or_else(|| format!("stored credential source '{source_name}' does not exist"))?;
-    let source_auth = source
-        .requires
-        .get("auth")
-        .and_then(serde_json::Value::as_str);
-    let is_legacy = source.provider == "anthropic" && source_auth == Some("oauth");
-    if source.provider != "claude-code" && !is_legacy {
-        return Err(format!(
-            "connection '{source_name}' is not a Claude Code subscription source"
-        ));
-    }
-    source
-        .credential
-        .clone()
-        .ok_or_else(|| format!("connection '{source_name}' has no stored subscription credential"))
-}
-
-fn claude_binary() -> Option<std::path::PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(std::path::PathBuf::from(home).join(".local/bin/claude"));
-    }
-    candidates.extend([
-        std::path::PathBuf::from("/opt/homebrew/bin/claude"),
-        std::path::PathBuf::from("/usr/local/bin/claude"),
-    ]);
-    if let Ok(path) = std::env::var("PATH") {
-        candidates.extend(std::env::split_paths(&path).map(|dir| dir.join("claude")));
-    }
-    candidates.into_iter().find(|path| path.is_file())
-}
-
-fn extract_claude_oauth_token(bytes: &[u8]) -> Option<Zeroizing<String>> {
-    let text = String::from_utf8_lossy(bytes);
-    let start = text.find("sk-ant-oat")?;
-    let token: String = text[start..]
-        .chars()
-        .take_while(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '#')
-        })
-        .collect();
-    (token.len() >= 32).then(|| Zeroizing::new(token))
-}
-
-fn drain_claude_output<R: Read + Send + 'static>(
-    mut output: R,
-    found: std::sync::mpsc::Sender<Zeroizing<String>>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let mut rolling = Vec::new();
-        let mut chunk = [0_u8; 4096];
-        let mut longest_sent = 0;
-        loop {
-            let count = match output.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(count) => count,
-            };
-            rolling.extend_from_slice(&chunk[..count]);
-            if let Some(token) = extract_claude_oauth_token(&rolling) {
-                if token.len() > longest_sent {
-                    longest_sent = token.len();
-                    let _ = found.send(token);
-                }
-            }
-            if rolling.len() > 65_536 {
-                let keep_from = rolling.len() - 16_384;
-                rolling[..keep_from].zeroize();
-                rolling.drain(..keep_from);
-            }
-        }
-        rolling.zeroize();
-        chunk.zeroize();
-    })
-}
-
-fn finish_claude_setup(
-    mut child: std::process::Child,
-    timeout: std::time::Duration,
-) -> Result<Zeroizing<String>, String> {
-    let (token_tx, token_rx) = std::sync::mpsc::channel();
-    let stdout_reader = child
-        .stdout
-        .take()
-        .map(|stdout| drain_claude_output(stdout, token_tx.clone()));
-    let stderr_reader = child
-        .stderr
-        .take()
-        .map(|stderr| drain_claude_output(stderr, token_tx));
-    let deadline = std::time::Instant::now() + timeout;
-    let mut token = None;
-    let mut token_grew_at = None;
-    let status = loop {
-        while let Ok(found) = token_rx.try_recv() {
-            if token
-                .as_ref()
-                .is_none_or(|current: &Zeroizing<String>| found.len() > current.len())
-            {
-                token = Some(found);
-                token_grew_at = Some(std::time::Instant::now());
-            }
-        }
-        if token.is_some()
-            && token_grew_at.is_some_and(|at| at.elapsed() >= std::time::Duration::from_millis(300))
-        {
-            let _ = child.kill();
-            break child.wait().ok();
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("could not wait for Claude Code sign-in: {error}"));
-            }
-        }
-    };
-    if let Some(token) = token {
-        return Ok(token);
-    }
-    if let Some(reader) = stdout_reader {
-        let _ = reader.join();
-    }
-    if let Some(reader) = stderr_reader {
-        let _ = reader.join();
-    }
-    while let Ok(found) = token_rx.try_recv() {
-        if token
-            .as_ref()
-            .is_none_or(|current: &Zeroizing<String>| found.len() > current.len())
-        {
-            token = Some(found);
-        }
-    }
-    if let Some(token) = token {
-        return Ok(token);
-    }
-    let Some(status) = status else {
-        return Err("Claude subscription sign-in timed out after five minutes".into());
-    };
-    if !status.success() {
-        return Err("Claude Code could not complete subscription sign-in".into());
-    }
-    Err("Claude Code completed without returning a setup token".into())
-}
-
-fn claude_setup_oauth_token() -> Result<Zeroizing<String>, String> {
-    let binary = claude_binary().ok_or(
-        "Claude Code is not installed. Install it before connecting a Claude subscription.",
-    )?;
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = std::process::Command::new("/usr/bin/script");
-        command
-            .args([
-                "-qF",
-                "/dev/null",
-                "/bin/sh",
-                "-c",
-                "stty cols 1000 rows 50; exec \"$@\"",
-                "apiary-claude-oauth",
-            ])
-            .arg(binary)
-            .arg("setup-token");
-        command
-    };
-    #[cfg(not(target_os = "macos"))]
-    let mut command = {
-        let mut command = std::process::Command::new(binary);
-        command.arg("setup-token");
-        command
-    };
-    let child = command
-        .env("NO_COLOR", "1")
-        .env("TERM", "xterm-256color")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("could not start Claude subscription sign-in: {error}"))?;
-    finish_claude_setup(child, std::time::Duration::from_secs(300))
 }
 
 pub async fn inference_upsert(
@@ -1009,7 +846,7 @@ pub async fn inference_upsert(
         .filter(|m| !m.trim().is_empty())
         .map(|m| m.trim().to_string());
     let auth = body.requires.get("auth").and_then(|value| value.as_str());
-    if provider == "anthropic" && !matches!(auth, None | Some("api-key") | Some("oauth")) {
+    if provider == "anthropic" && !matches!(auth, None | Some("api-key")) {
         return err(
             StatusCode::BAD_REQUEST,
             "Anthropic API authentication must use an API key",
@@ -1023,47 +860,7 @@ pub async fn inference_upsert(
         )
         .into_response();
     }
-    if body.setup_oauth && provider != "claude-code" {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "Claude subscription sign-in requires the Claude Code provider",
-        )
-        .into_response();
-    }
-    if body.setup_oauth && body.clear_credential {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "cannot connect an account and remove its credential at the same time",
-        )
-        .into_response();
-    }
-    let credential_from = body
-        .credential_from
-        .as_deref()
-        .map(str::trim)
-        .filter(|source| !source.is_empty());
-    if credential_from.is_some() && provider != "claude-code" {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "stored subscription credentials may only be used by a Claude Code connection",
-        )
-        .into_response();
-    }
-    if credential_from.is_some() && body.setup_oauth {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "use either a stored Claude subscription or a new sign-in, not both",
-        )
-        .into_response();
-    }
-    if credential_from.is_some() && body.clear_credential {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "cannot use and remove a stored credential at the same time",
-        )
-        .into_response();
-    }
-    if credential_from.is_some()
+    if provider == "claude-code"
         && body
             .credential
             .as_deref()
@@ -1071,26 +868,7 @@ pub async fn inference_upsert(
     {
         return err(
             StatusCode::BAD_REQUEST,
-            "use either a stored subscription credential or a pasted setup token, not both",
-        )
-        .into_response();
-    }
-    if body.setup_oauth
-        && body
-            .credential
-            .as_deref()
-            .is_some_and(|secret| !secret.trim().is_empty())
-    {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "use either Claude subscription sign-in or a pasted setup token, not both",
-        )
-        .into_response();
-    }
-    if body.setup_oauth && state.passphrase_clone().is_none() {
-        return err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "unlock the keystore first — the subscription token is sealed directly to this agent",
+            "Claude Code uses the account signed in on this Mac; it does not accept a per-route credential",
         )
         .into_response();
     }
@@ -1114,27 +892,11 @@ pub async fn inference_upsert(
         )
         .into_response();
     }
-    let reused_credential = match credential_from {
-        Some(source_name) => {
-            match stored_claude_code_credential(&manifest.inference, source_name) {
-                Ok(credential) => Some(credential),
-                Err(message) => return err(StatusCode::BAD_REQUEST, message).into_response(),
-            }
-        }
-        None => None,
-    };
-    let supplied_secret = if body.setup_oauth {
-        match tokio::task::spawn_blocking(claude_setup_oauth_token).await {
-            Ok(Ok(token)) => Some(token),
-            Ok(Err(error)) => return err(StatusCode::BAD_GATEWAY, error).into_response(),
-            Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
-        }
-    } else {
-        body.credential
-            .filter(|secret| !secret.trim().is_empty())
-            .map(|secret| Zeroizing::new(secret.trim().to_string()))
-    };
-    let credential = if body.clear_credential {
+    let supplied_secret = body
+        .credential
+        .filter(|secret| !secret.trim().is_empty())
+        .map(|secret| Zeroizing::new(secret.trim().to_string()));
+    let credential = if provider == "claude-code" || body.clear_credential {
         None
     } else if let Some(secret) = supplied_secret {
         let pass = match require_pass(&state) {
@@ -1154,21 +916,13 @@ pub async fn inference_upsert(
             Ok(blob) => Some(blob),
             Err(e) => return e.into_response(),
         }
-    } else if let Some(credential) = reused_credential {
-        Some(credential)
     } else {
         let auth_unchanged = existing
             .as_ref()
             .is_none_or(|slot| slot.requires.get("auth").and_then(|value| value.as_str()) == auth);
         existing
             .as_ref()
-            .filter(|slot| {
-                (slot.provider == provider && auth_unchanged)
-                    || (provider == "claude-code"
-                        && slot.provider == "anthropic"
-                        && slot.requires.get("auth").and_then(|value| value.as_str())
-                            == Some("oauth"))
-            })
+            .filter(|slot| slot.provider == provider && auth_unchanged)
             .and_then(|s| s.credential.clone())
     };
     let slot = apiary_core::manifest::InferenceSlot {
@@ -1344,55 +1098,6 @@ mod inference_setup_tests {
         assert!(loopback_url("http://[::1]:8080/v1").is_some());
         assert!(loopback_url("https://localhost.example.com/v1").is_none());
         assert!(loopback_url("https://api.openai.com/v1").is_none());
-    }
-
-    #[test]
-    fn copies_legacy_claude_oauth_credentials_for_migration() {
-        let oauth = apiary_core::manifest::InferenceSlot {
-            name: "claude-account".into(),
-            provider: "anthropic".into(),
-            model: Some("claude-sonnet-5".into()),
-            credential: Some(apiary_core::manifest::EncryptedBlob {
-                nip44: "sealed-token".into(),
-            }),
-            requires: std::collections::BTreeMap::from([(
-                "auth".into(),
-                serde_json::Value::String("oauth".into()),
-            )]),
-        };
-        let copied = stored_claude_code_credential(&[oauth], "claude-account").unwrap();
-        assert_eq!(copied.nip44, "sealed-token");
-    }
-
-    #[test]
-    fn extracts_only_claude_setup_tokens() {
-        let token = "sk-ant-oat01-abc_DEF-012345678901234#refresh_0123456789";
-        let transcript = format!("Sign-in complete\nToken: \u{1b}[32m{token}\u{1b}[0m\n");
-        assert_eq!(
-            extract_claude_oauth_token(transcript.as_bytes())
-                .as_deref()
-                .map(String::as_str),
-            Some(token)
-        );
-        assert!(extract_claude_oauth_token(b"sk-ant-api03-not-a-setup-token").is_none());
-    }
-
-    #[test]
-    fn rejects_api_keys_as_stored_oauth_sources() {
-        let api_key = apiary_core::manifest::InferenceSlot {
-            name: "fast".into(),
-            provider: "anthropic".into(),
-            model: Some("claude-haiku-4-5-20251001".into()),
-            credential: Some(apiary_core::manifest::EncryptedBlob {
-                nip44: "sealed-key".into(),
-            }),
-            requires: std::collections::BTreeMap::from([(
-                "auth".into(),
-                serde_json::Value::String("api-key".into()),
-            )]),
-        };
-        let error = stored_claude_code_credential(&[api_key], "fast").unwrap_err();
-        assert!(error.contains("not a Claude Code subscription source"));
     }
 
     #[test]

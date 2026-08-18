@@ -29,11 +29,19 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub type RememberPassphrase = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync + 'static>;
+pub type ForgetPassphrase = Arc<dyn Fn() -> Result<(), String> + Send + Sync + 'static>;
+
 pub struct AppState {
     pub home: PathBuf,
     /// Unlockable at runtime (GUI unlock screen) — None means locked:
     /// reads work, anything needing key material refuses.
     pub passphrase: std::sync::RwLock<Option<String>>,
+    /// Desktop-only Keychain writer. The daemon remains portable and keeps
+    /// its existing explicit-unlock behavior when this is absent.
+    pub remember_passphrase: Option<RememberPassphrase>,
+    pub forget_passphrase: Option<ForgetPassphrase>,
+    pub automatic_unlock: std::sync::atomic::AtomicBool,
     pub auth: AuthMode,
     /// Canonical origin for exact NIP-98 URL matching.
     pub origin: String,
@@ -84,6 +92,7 @@ pub fn build_router(state: App) -> Router {
         .route("/app.js", get(cockpit_js))
         .route("/api/status", get(ops::status))
         .route("/api/unlock", post(ops::unlock))
+        .route("/api/unlock/forget", post(ops::forget_automatic_unlock))
         .route("/api/lock", post(ops::lock))
         .route("/api/owners", get(ops::owners_get).post(ops::owners_create))
         .route("/api/key", get(ops::key_normalize))

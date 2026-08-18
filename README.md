@@ -153,7 +153,7 @@ Or the CLI:
 ```bash
 cargo build
 
-export APIARY_PASSPHRASE=…   # dev keystore passphrase (NIP-49)
+export APIARY_PASSPHRASE=…   # dev-only keystore passphrase (desktop uses macOS Keychain)
 
 # Found an agent (requires a human suspend key — suspension authority
 # never rests with the agent's own key)
@@ -220,8 +220,8 @@ explanations:
   each entry), with curated setup templates for built-in Web, Files, Git,
   and GitHub, plus advanced MCP servers and OAuth-granted remotes
 - **Credentials** — NIP-44 seal/open against the agent's key
-- **Header** — host status chips, keystore lock/unlock (passphrase lives in
-  memory only), npub⇄hex key tool
+- **Header** — host status chips, keystore lock/unlock (memory for the
+  session, with optional macOS Keychain automatic unlock), npub⇄hex key tool
 
 Runtime governance is supervised, not scripted: activate an agent whose
 manifest declares `presence.buzz` and the host starts its listener, restarts
@@ -232,9 +232,10 @@ taking over a live agent is always a human act.
 
 Security posture: the embedded daemon binds `127.0.0.1` on an ephemeral port
 and requires a per-launch random token that only the app's own webview
-receives — other local processes can't drive it. The keystore starts locked
-unless `APIARY_PASSPHRASE` is set. `ANTHROPIC_API_KEY` in the app's
-environment enables anthropic-routed runs and model-drafted foundings.
+receives — other local processes can't drive it. The desktop can retrieve its
+keystore passphrase from macOS Keychain; `APIARY_PASSPHRASE` remains a
+development/headless option. `ANTHROPIC_API_KEY` in the app's environment
+enables anthropic-routed runs and model-drafted foundings.
 
 The plain daemon (`apiary-hostd`) serves the same cockpit at `--bind` for
 headless hosts; add `--auth nip98` beyond localhost.

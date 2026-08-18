@@ -175,6 +175,9 @@ mod tests {
         AppState {
             home: PathBuf::from("/tmp"),
             passphrase: std::sync::RwLock::new(None),
+            remember_passphrase: None,
+            forget_passphrase: None,
+            automatic_unlock: std::sync::atomic::AtomicBool::new(false),
             auth,
             origin: "http://127.0.0.1:7777".into(),
             token: None,

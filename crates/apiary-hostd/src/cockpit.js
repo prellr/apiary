@@ -124,8 +124,12 @@ async function loadStatus() {
   const unlocked = !!hostStatus.unlocked;
   document.getElementById('u-pass').style.display = unlocked ? 'none' : '';
   document.getElementById('u-go').style.display = unlocked ? 'none' : '';
+  document.getElementById('u-remember-row').style.display = !unlocked && hostStatus.can_remember_unlock ? '' : 'none';
+  document.getElementById('u-forget').style.display = hostStatus.automatic_unlock && hostStatus.can_forget_unlock ? '' : 'none';
   document.getElementById('u-help').textContent = unlocked
-    ? 'keystore unlocked for this session — LOCK to forget the passphrase'
+    ? (hostStatus.automatic_unlock
+      ? 'keystore unlocked · automatic launch unlock is protected by macOS Keychain'
+      : 'keystore unlocked for this session — LOCK to forget the passphrase')
     : 'passphrase unlocks the NIP-49 keystore for this session — needed to run, ratify, found, post, seal:';
 }
 
@@ -151,10 +155,15 @@ document.getElementById('u-go').onclick = async () => {
   st.textContent = 'unlocking… (NIP-49 scrypt is deliberately slow)';
   const r = await j('/api/unlock', {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ passphrase: document.getElementById('u-pass').value }),
+    body: JSON.stringify({
+      passphrase: document.getElementById('u-pass').value,
+      remember: !!document.getElementById('u-remember').checked,
+    }),
   });
   st.textContent = r.ok
-    ? (r.verified_against_key ? 'unlocked ✓ (verified against a stored key)' : 'unlocked ✓ (empty keystore — nothing to verify against)')
+    ? ((r.verified_against_key ? 'unlocked ✓' : 'unlocked ✓ (empty keystore)')
+      + (r.automatic_unlock ? ' · saved in macOS Keychain' : '')
+      + (r.remember_warning ? ' · could not remember: ' + r.remember_warning : ''))
     : 'refused: ' + r.error;
   if (r.ok) {
     document.getElementById('u-pass').value = '';
@@ -165,8 +174,17 @@ document.getElementById('u-go').onclick = async () => {
 };
 document.getElementById('u-lock').onclick = async () => {
   await j('/api/lock', { method: 'POST' });
-  document.getElementById('u-status').textContent = 'locked — passphrase forgotten';
+  document.getElementById('u-status').textContent = hostStatus.automatic_unlock
+    ? 'locked for this session · automatic unlock remains saved'
+    : 'locked — passphrase forgotten';
   loadStatus();
+};
+document.getElementById('u-forget').onclick = async () => {
+  const r = await j('/api/unlock/forget', { method: 'POST' });
+  document.getElementById('u-status').textContent = r.ok
+    ? 'automatic unlock removed from macOS Keychain'
+    : 'could not remove automatic unlock: ' + r.error;
+  await loadStatus();
 };
 document.getElementById('k-go').onclick = async () => {
   const r = await j('/api/key?key=' + encodeURIComponent(document.getElementById('k-in').value.trim()));
@@ -692,7 +710,7 @@ function inferenceEndpoint(slot) {
   return 'on this device';
 }
 
-function inferenceForm(slot, afterSave, allSlots = []) {
+function inferenceForm(slot, afterSave) {
   const form = el('div', 'connection-form');
   const role = el('select');
   for (const value of ['language', 'embedding', 'transcription', 'speech']) {
@@ -718,15 +736,6 @@ function inferenceForm(slot, afterSave, allSlots = []) {
     const option = el('option', null, label); option.value = value; auth.append(option);
   }
   auth.value = 'api-key';
-  const oauthReuse = el('select');
-  oauthReuse.append(Object.assign(el('option', null, 'Choose another Claude subscription…'), { value: '' }));
-  const oauthSources = allSlots.filter(source =>
-    source.name !== (slot && slot.name) &&
-    (source.provider === 'claude-code' || (source.provider === 'anthropic' && (source.requires || {}).auth === 'oauth')) &&
-    source.credential_source === 'sealed Claude subscription token');
-  for (const source of oauthSources) oauthReuse.append(Object.assign(el('option', null, source.name), { value: source.name }));
-  const oauthReuseField = field('Use subscription from', oauthReuse,
-    'Reuses the already-sealed setup token within this agent. The token is never shown.');
   const credential = el('input'); credential.type = 'password'; credential.autocomplete = 'off';
   credential.placeholder = slot && slot.credential_source && slot.credential_source.startsWith('sealed') ? 'Leave blank to keep current credential' : 'API key, if required';
   const voice = el('input'); voice.value = (slot && slot.requires && slot.requires.voice) || '';
@@ -737,8 +746,6 @@ function inferenceForm(slot, afterSave, allSlots = []) {
   const makeDefaultLabel = el('label'); makeDefaultLabel.append(makeDefault, document.createTextNode(' Use as the default task model'));
   const clear = el('input'); clear.type = 'checkbox';
   const clearLabel = el('label'); clearLabel.append(clear, document.createTextNode(' Remove the stored credential'));
-  const oauthConnect = el('button', 'btn solid', 'Create headless setup token');
-  oauthConnect.style.display = 'none';
 
   let modelInitialized = false;
   const refreshModelChoices = () => {
@@ -771,8 +778,6 @@ function inferenceForm(slot, afterSave, allSlots = []) {
     const anthropic = role.value === 'language' && provider.value === 'anthropic';
     auth.closest('.field').style.display = anthropic ? '' : 'none';
     const claude = role.value === 'language' && provider.value === 'claude-code';
-    oauthConnect.style.display = 'none';
-    oauthReuseField.style.display = 'none';
     credential.closest('.field').style.display = claude ? 'none' : '';
     credential.placeholder = slot && slot.credential_source === 'sealed API key'
       ? 'Leave blank to keep current API key'
@@ -802,7 +807,6 @@ function inferenceForm(slot, afterSave, allSlots = []) {
     field('Provider', provider), field('Model', modelControls),
     field('Base URL', endpoint, 'Provider defaults are prefilled. OpenAI-compatible and local endpoints remain editable.'),
     field('Authentication', auth, 'Anthropic API connections use API billing. Claude Code uses the account already signed in to the Claude CLI on this Mac.'),
-    oauthReuseField,
     field('Credential', credential, 'API keys are encrypted to this agent before they are written.'),
     field('Voice', voice), field('Locale', locale));
   const flags = el('div', 'wide row'); flags.append(makeDefaultLabel);
@@ -827,11 +831,10 @@ function inferenceForm(slot, afterSave, allSlots = []) {
   role.onchange = () => { endpoint.dataset.auto = '1'; refreshProviderChoices(); };
   provider.onchange = () => { endpoint.dataset.auto = '1'; refreshProviderChoices(); };
   auth.onchange = refreshAuth;
-  oauthReuse.onchange = () => { if (oauthReuse.value) { credential.value = ''; clear.checked = false; } };
   provider.value = initialProvider || inferenceProviders[role.value][0][0];
   refreshProviderChoices();
 
-  const persist = async (setupOauth = false) => {
+  const persist = async () => {
     const connectionName = name.value.trim().replace(/\s+/g, '-');
     if (!connectionName) { status.textContent = 'Give this connection a name.'; name.focus(); return; }
     if (!/^[A-Za-z0-9_-]{1,40}$/.test(connectionName)) { status.textContent = 'Use only letters, numbers, dashes, or underscores in the connection name.'; name.focus(); return; }
@@ -847,28 +850,26 @@ function inferenceForm(slot, afterSave, allSlots = []) {
     if (provider.value === 'claude-code') delete requires.base_url;
     if (voice.value.trim()) requires.voice = voice.value.trim(); else delete requires.voice;
     if (locale.value.trim()) requires.locale = locale.value.trim(); else delete requires.locale;
-    save.disabled = true; oauthConnect.disabled = true;
-    status.textContent = setupOauth ? 'Opening Claude subscription sign-in… this can take a minute.' : (oauthReuse.value ? 'Applying stored subscription…' : (credential.value ? 'Encrypting credential…' : 'Saving…'));
+    save.disabled = true;
+    status.textContent = credential.value ? 'Encrypting credential…' : 'Saving…';
     const r = await j(api('/inference'), {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         original_name: slot ? slot.name : null,
         name: connectionName, provider: provider.value, model: chosenModel || null,
         credential: credential.value || null, clear_credential: clear.checked || legacyClaude,
-        credential_from: setupOauth ? null : (oauthReuse.value || null),
-        requires, set_default: makeDefault.checked, setup_oauth: setupOauth,
+        requires, set_default: makeDefault.checked,
       }),
     });
-    credential.value = ''; save.disabled = false; oauthConnect.disabled = false;
-    status.textContent = r.ok ? (setupOauth ? 'Claude subscription connected. Review and approve the change.' : 'Saved. Review and approve the change.') : 'Could not save: ' + r.error;
+    credential.value = ''; save.disabled = false;
+    status.textContent = r.ok ? 'Saved. Review and approve the change.' : 'Could not save: ' + r.error;
     if (r.ok) { await loadRoster(); afterSave(); }
   };
-  save.onclick = () => persist(false);
-  oauthConnect.onclick = () => persist(true);
+  save.onclick = persist;
   return form;
 }
 
-function inferenceSource(slot, routing, rerender, allSlots) {
+function inferenceSource(slot, routing, rerender) {
   const item = el('article', 'source-item');
   const head = el('div', 'source-head');
   const identity = el('div');
@@ -882,7 +883,7 @@ function inferenceSource(slot, routing, rerender, allSlots) {
   state.append(el('span', 'state ' + stateName, stateName === 'ready' ? 'Verified locally' : stateName));
   state.append(el('div', 'source-detail', (slot.status && slot.status.detail) || 'No diagnostic available'));
   head.append(identity, detail, state); item.append(head);
-  const edit = el('details'); edit.append(el('summary', null, 'Edit connection'), inferenceForm(slot, rerender, allSlots));
+  const edit = el('details'); edit.append(el('summary', null, 'Edit route'), inferenceForm(slot, rerender));
   item.append(edit);
   return item;
 }
@@ -890,9 +891,9 @@ function inferenceSource(slot, routing, rerender, allSlots) {
 async function renderInference(c) {
   const d = await j(api('/inference'));
   const head = el('div', 'page-head');
-  head.append(el('div', 'eyebrow', 'Agent-owned connections'),
+  head.append(el('div', 'eyebrow', 'Model routing'),
     el('h2', 'page-title', 'Inference'),
-    el('p', 'page-lede', 'Choose the engines this agent uses to think, remember, hear, and speak. Credentials are sealed to the agent; local diagnostics never send a paid model request.'));
+    el('p', 'page-lede', 'Choose which models this agent uses to think, remember, hear, and speak. Claude Code routes share the account signed in on this Mac; API providers keep agent-sealed credentials.'));
   c.append(head);
   if (!d.ok) { c.append(el('div', 'ev err', 'Could not load inference setup: ' + d.error)); return; }
   const slots = d.slots || [], routing = d.routing || {};
@@ -901,10 +902,19 @@ async function renderInference(c) {
   const verified = slots.filter(s => s.status && s.status.state === 'ready').length;
   c.append((() => { const m = el('div', 'metrics'); m.append(metric('Task models', language.length), metric('Supporting engines', support.length), metric('Verified locally', verified), metric('Default route', routing.default || 'Not set')); return m; })());
 
+  const claudeRoutes = language.filter(s => s.provider === 'claude-code');
+  if (claudeRoutes.length) {
+    const account = section('Claude Code on this Mac', 'One host account serves every Claude Code route. Each route only chooses a model and routing name.');
+    const status = claudeRoutes.find(s => s.status && s.status.state === 'ready') || claudeRoutes[0];
+    account.append(kv('Account', (status.status && status.status.detail) || 'Claude Code sign-in is unavailable'),
+      kv('Used by', claudeRoutes.map(s => s.name).join(', ')));
+    c.append(account);
+  }
+
   const rerender = () => setTimeout(render, 350);
   const task = section('Task models', 'Language models receive prompts and may call granted capabilities. “Configured” means a credential is present; Apiary avoids a billable probe.');
   const taskList = el('div', 'source-list');
-  for (const slot of language) taskList.append(inferenceSource(slot, routing, rerender, slots));
+  for (const slot of language) taskList.append(inferenceSource(slot, routing, rerender));
   if (!language.length) taskList.append(el('div', 'none', 'No task model is configured.'));
   task.append(taskList);
   if (language.length) {
@@ -920,12 +930,12 @@ async function renderInference(c) {
       if (r.ok) { await loadRoster(); rerender(); }
     };
   }
-  const add = el('details', 'technical'); add.append(el('summary', null, 'Add an inference connection'), inferenceForm(null, rerender, slots));
+  const add = el('details', 'technical'); add.append(el('summary', null, 'Add a model route'), inferenceForm(null, rerender));
   task.append(add); c.append(task);
 
   const equipment = section('Memory and voice', 'Supporting engines have reserved roles: embed builds semantic memory, transcribe hears audio, and speak renders voice replies.');
   const supportList = el('div', 'source-list');
-  for (const slot of support) supportList.append(inferenceSource(slot, routing, rerender, slots));
+  for (const slot of support) supportList.append(inferenceSource(slot, routing, rerender));
   if (!support.length) supportList.append(el('div', 'none', 'No supporting engines are configured.'));
   equipment.append(supportList); c.append(equipment);
 

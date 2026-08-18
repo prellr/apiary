@@ -327,19 +327,16 @@ fn parse_claude_action(raw: &str) -> Option<serde_json::Value> {
 }
 
 /// Subscription-backed inference through the official Claude Code runtime.
-/// By default this uses the host's existing Claude Code sign-in; an optional
-/// setup token supports headless hosts. Project, plugin, MCP, filesystem,
-/// shell, and browser tools are all disabled, so Apiary remains the sole
-/// capability dispatcher.
+/// This uses the host's existing Claude Code sign-in. Project, plugin, MCP,
+/// filesystem, shell, and browser tools are all disabled, so Apiary remains
+/// the sole capability dispatcher.
 pub struct ClaudeCodeProvider {
-    oauth_token: Option<Zeroizing<String>>,
     config_dir: ClaudeTempDir,
 }
 
 impl ClaudeCodeProvider {
-    pub fn new(oauth_token: Option<Zeroizing<String>>) -> Result<Self, crate::Error> {
+    pub fn new() -> Result<Self, crate::Error> {
         Ok(Self {
-            oauth_token,
             config_dir: ClaudeTempDir::create()?,
         })
     }
@@ -390,14 +387,6 @@ impl ClaudeCodeProvider {
                 command.env_remove(key);
             }
         }
-        if let Some(token) = self.oauth_token.as_ref() {
-            command
-                .env("HOME", &self.config_dir.0)
-                .env("XDG_CONFIG_HOME", &self.config_dir.0)
-                .env("CLAUDE_CONFIG_DIR", &self.config_dir.0)
-                .env("CLAUDE_CODE_OAUTH_TOKEN", token.as_str());
-        }
-
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -1340,10 +1329,8 @@ pub fn bind(
 ) -> Result<Box<dyn Provider>, crate::Error> {
     match provider_name {
         "claude-code" => {
-            if credential.is_none() {
-                claude_code_auth_status()?;
-            }
-            Ok(Box::new(ClaudeCodeProvider::new(credential)?))
+            claude_code_auth_status()?;
+            Ok(Box::new(ClaudeCodeProvider::new()?))
         }
         "anthropic" => {
             let provider = match auth.unwrap_or("api-key") {

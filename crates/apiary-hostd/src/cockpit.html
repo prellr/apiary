@@ -218,8 +218,10 @@
 <div id="unlockbar">
   <span class="meta" id="u-help">passphrase unlocks the NIP-49 keystore for this session — needed to run, ratify, found, post, seal:</span>
   <input id="u-pass" type="password" placeholder="workspace passphrase" aria-label="Workspace passphrase">
+  <label class="meta" id="u-remember-row"><input id="u-remember" type="checkbox" checked> remember in macOS Keychain</label>
   <button class="btn solid" id="u-go">Unlock</button>
   <button class="btn" id="u-lock" title="forget the passphrase; reads keep working">Lock</button>
+  <button class="btn" id="u-forget" title="remove the saved passphrase from macOS Keychain">Forget automatic unlock</button>
   <span class="meta" id="u-status" role="status" aria-live="polite"></span>
 </div>
 <div id="keybar">
