@@ -17,6 +17,7 @@ use sha2::Digest;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use zeroize::Zeroizing;
 
 type Resp = (StatusCode, Json<serde_json::Value>);
 
@@ -493,9 +494,25 @@ fn nonempty_env(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| !value.is_empty())
 }
 
-fn credential_source(slot: &apiary_core::manifest::InferenceSlot) -> &'static str {
+fn credential_source(slot: &apiary_core::manifest::InferenceSlot) -> String {
+    if slot.provider == "anthropic"
+        && slot.requires.get("auth").and_then(|v| v.as_str()) == Some("platform-oauth")
+    {
+        let profile = slot
+            .requires
+            .get("oauth_profile")
+            .and_then(|value| value.as_str())
+            .unwrap_or(apiary_runtime::inference::DEFAULT_ANTHROPIC_PLATFORM_PROFILE);
+        return format!("Claude Platform profile {profile}");
+    }
     if slot.credential.is_some() {
-        return "sealed to agent";
+        return if slot.provider == "anthropic"
+            && slot.requires.get("auth").and_then(|v| v.as_str()) == Some("oauth")
+        {
+            "legacy Claude Code token".into()
+        } else {
+            "sealed API key".into()
+        };
     }
     let env = match slot.provider.as_str() {
         "anthropic" => nonempty_env("ANTHROPIC_API_KEY") || nonempty_env("ANTHROPIC_AUTH_TOKEN"),
@@ -504,9 +521,9 @@ fn credential_source(slot: &apiary_core::manifest::InferenceSlot) -> &'static st
         _ => false,
     };
     if env {
-        "host environment"
+        "host environment".into()
     } else {
-        "none"
+        "none".into()
     }
 }
 
@@ -601,6 +618,23 @@ fn probe_inference_slot(slot: &apiary_core::manifest::InferenceSlot) -> serde_js
             "configured",
             "Local whisper.cpp is checked when audio is received".into(),
         ),
+        "anthropic"
+            if slot.requires.get("auth").and_then(|value| value.as_str())
+                == Some("platform-oauth") =>
+        {
+            let profile = slot
+                .requires
+                .get("oauth_profile")
+                .and_then(|value| value.as_str())
+                .unwrap_or(apiary_runtime::inference::DEFAULT_ANTHROPIC_PLATFORM_PROFILE);
+            match apiary_runtime::inference::anthropic_platform_access_token(profile) {
+                Ok(_) => result(
+                    "configured",
+                    format!("Claude Platform profile '{profile}' is signed in; no billable test request was sent"),
+                ),
+                Err(error) => result("unavailable", error.to_string()),
+            }
+        }
         "anthropic" | "xai" => {
             if configured {
                 result(
@@ -712,12 +746,20 @@ pub struct InferenceUpsertBody {
     model: Option<String>,
     #[serde(default)]
     credential: Option<String>,
+    /// Copy an already-sealed Anthropic OAuth credential from another
+    /// connection in this same agent manifest. The host never decrypts it.
+    #[serde(default)]
+    credential_from: Option<String>,
     #[serde(default)]
     clear_credential: bool,
     #[serde(default)]
     requires: std::collections::BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     set_default: bool,
+    /// Ask Anthropic's official `ant` CLI to open Claude Platform OAuth.
+    /// Refresh credentials remain in the named local `ant` profile.
+    #[serde(default)]
+    setup_oauth: bool,
 }
 
 fn validate_inference_name(name: &str) -> bool {
@@ -726,6 +768,61 @@ fn validate_inference_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
+fn stored_anthropic_oauth_credential(
+    slots: &[apiary_core::manifest::InferenceSlot],
+    source_name: &str,
+) -> Result<apiary_core::manifest::EncryptedBlob, String> {
+    let source = slots
+        .iter()
+        .find(|slot| slot.name == source_name)
+        .ok_or_else(|| format!("stored credential source '{source_name}' does not exist"))?;
+    let source_auth = source
+        .requires
+        .get("auth")
+        .and_then(serde_json::Value::as_str);
+    if source.provider != "anthropic" || source_auth != Some("oauth") {
+        return Err(format!(
+            "connection '{source_name}' is not an Anthropic OAuth source"
+        ));
+    }
+    source
+        .credential
+        .clone()
+        .ok_or_else(|| format!("connection '{source_name}' has no stored OAuth credential"))
+}
+
+/// Verify the Platform bearer without generating a model response. `ant`
+/// retains the refresh credential; this short-lived access token is wiped by
+/// its caller after the check.
+fn validate_anthropic_platform_token(token: &str, model: &str) -> Result<(), String> {
+    let response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("could not prepare Claude credential check: {e}"))?
+        .post("https://api.anthropic.com/v1/messages/count_tokens")
+        .header("authorization", format!("Bearer {token}"))
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "Apiary credential check"}],
+        }))
+        .send()
+        .map_err(|e| format!("could not verify Claude account authorization: {e}"))?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let message = response
+        .json::<serde_json::Value>()
+        .ok()
+        .and_then(|payload| payload["error"]["message"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| "the provider rejected the credential check".into());
+    Err(format!(
+        "Claude Platform authorization was not saved ({status}): {message}"
+    ))
 }
 
 pub async fn inference_upsert(
@@ -765,6 +862,102 @@ pub async fn inference_upsert(
         .model
         .filter(|m| !m.trim().is_empty())
         .map(|m| m.trim().to_string());
+    let auth = body.requires.get("auth").and_then(|value| value.as_str());
+    if provider == "anthropic"
+        && !matches!(
+            auth,
+            None | Some("api-key") | Some("platform-oauth") | Some("oauth")
+        )
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "Anthropic authentication must be api-key or platform-oauth",
+        )
+        .into_response();
+    }
+    if provider != "anthropic" && auth.is_some() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "requires.auth is only supported for Anthropic connections",
+        )
+        .into_response();
+    }
+    if body.setup_oauth && (provider != "anthropic" || auth != Some("platform-oauth")) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "Claude Platform sign-in requires an Anthropic connection using Platform OAuth",
+        )
+        .into_response();
+    }
+    if body.setup_oauth && body.clear_credential {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "cannot connect an account and remove its credential at the same time",
+        )
+        .into_response();
+    }
+    let credential_from = body
+        .credential_from
+        .as_deref()
+        .map(str::trim)
+        .filter(|source| !source.is_empty());
+    if credential_from.is_some() && (provider != "anthropic" || auth != Some("oauth")) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "stored OAuth credentials may only be used by an Anthropic OAuth connection",
+        )
+        .into_response();
+    }
+    if credential_from.is_some() && body.setup_oauth {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "stored legacy tokens cannot be combined with Claude Platform sign-in",
+        )
+        .into_response();
+    }
+    if credential_from.is_some() && body.clear_credential {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "cannot use and remove a stored credential at the same time",
+        )
+        .into_response();
+    }
+    if credential_from.is_some()
+        && body
+            .credential
+            .as_deref()
+            .is_some_and(|secret| !secret.trim().is_empty())
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "use either a stored OAuth credential or a pasted credential, not both",
+        )
+        .into_response();
+    }
+    if body.setup_oauth
+        && body
+            .credential
+            .as_deref()
+            .is_some_and(|secret| !secret.trim().is_empty())
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "Claude Platform OAuth is managed by ant and does not accept a pasted credential",
+        )
+        .into_response();
+    }
+    if auth == Some("platform-oauth")
+        && body
+            .credential
+            .as_deref()
+            .is_some_and(|secret| !secret.trim().is_empty())
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "Claude Platform OAuth credentials are managed by ant; do not paste an access token",
+        )
+        .into_response();
+    }
     if role == "language" && model.is_none() {
         return err(
             StatusCode::BAD_REQUEST,
@@ -785,9 +978,44 @@ pub async fn inference_upsert(
         )
         .into_response();
     }
-    let credential = if body.clear_credential {
+    let reused_credential = match credential_from {
+        Some(source_name) => {
+            match stored_anthropic_oauth_credential(&manifest.inference, source_name) {
+                Ok(credential) => Some(credential),
+                Err(message) => return err(StatusCode::BAD_REQUEST, message).into_response(),
+            }
+        }
+        None => None,
+    };
+    if body.setup_oauth {
+        let validation_model = model.clone().expect("language model checked above");
+        let profile = body
+            .requires
+            .get("oauth_profile")
+            .and_then(|value| value.as_str())
+            .unwrap_or(apiary_runtime::inference::DEFAULT_ANTHROPIC_PLATFORM_PROFILE)
+            .to_string();
+        match tokio::task::spawn_blocking(move || {
+            apiary_runtime::inference::anthropic_platform_login(&profile)
+                .map_err(|error| error.to_string())?;
+            let token = apiary_runtime::inference::anthropic_platform_access_token(&profile)
+                .map_err(|error| error.to_string())?;
+            validate_anthropic_platform_token(token.as_str(), &validation_model)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return err(StatusCode::BAD_GATEWAY, e).into_response(),
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        }
+    }
+    let supplied_secret = body
+        .credential
+        .filter(|secret| !secret.trim().is_empty())
+        .map(|secret| Zeroizing::new(secret.trim().to_string()));
+    let credential = if auth == Some("platform-oauth") || body.clear_credential {
         None
-    } else if let Some(secret) = body.credential.filter(|s| !s.trim().is_empty()) {
+    } else if let Some(secret) = supplied_secret {
         let pass = match require_pass(&state) {
             Ok(p) => p,
             Err(e) => return e.into_response(),
@@ -796,7 +1024,7 @@ pub async fn inference_upsert(
         match tokio::task::spawn_blocking(move || {
             let (custody, handle) = admit(&ks, &npub2, &pass)?;
             custody
-                .seal(&handle, secret.trim())
+                .seal(&handle, secret.as_str())
                 .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
         })
         .await
@@ -805,10 +1033,15 @@ pub async fn inference_upsert(
             Ok(blob) => Some(blob),
             Err(e) => return e.into_response(),
         }
+    } else if let Some(credential) = reused_credential {
+        Some(credential)
     } else {
+        let auth_unchanged = existing
+            .as_ref()
+            .is_none_or(|slot| slot.requires.get("auth").and_then(|value| value.as_str()) == auth);
         existing
             .as_ref()
-            .filter(|s| s.provider == provider)
+            .filter(|s| s.provider == provider && auth_unchanged)
             .and_then(|s| s.credential.clone())
     };
     let slot = apiary_core::manifest::InferenceSlot {
@@ -983,6 +1216,42 @@ mod inference_setup_tests {
         assert!(loopback_url("http://[::1]:8080/v1").is_some());
         assert!(loopback_url("https://localhost.example.com/v1").is_none());
         assert!(loopback_url("https://api.openai.com/v1").is_none());
+    }
+
+    #[test]
+    fn copies_only_stored_anthropic_oauth_credentials() {
+        let oauth = apiary_core::manifest::InferenceSlot {
+            name: "claude-account".into(),
+            provider: "anthropic".into(),
+            model: Some("claude-sonnet-5".into()),
+            credential: Some(apiary_core::manifest::EncryptedBlob {
+                nip44: "sealed-token".into(),
+            }),
+            requires: std::collections::BTreeMap::from([(
+                "auth".into(),
+                serde_json::Value::String("oauth".into()),
+            )]),
+        };
+        let copied = stored_anthropic_oauth_credential(&[oauth], "claude-account").unwrap();
+        assert_eq!(copied.nip44, "sealed-token");
+    }
+
+    #[test]
+    fn rejects_api_keys_as_stored_oauth_sources() {
+        let api_key = apiary_core::manifest::InferenceSlot {
+            name: "fast".into(),
+            provider: "anthropic".into(),
+            model: Some("claude-haiku-4-5-20251001".into()),
+            credential: Some(apiary_core::manifest::EncryptedBlob {
+                nip44: "sealed-key".into(),
+            }),
+            requires: std::collections::BTreeMap::from([(
+                "auth".into(),
+                serde_json::Value::String("api-key".into()),
+            )]),
+        };
+        let error = stored_anthropic_oauth_credential(&[api_key], "fast").unwrap_err();
+        assert!(error.contains("not an Anthropic OAuth source"));
     }
 
     #[test]

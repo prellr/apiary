@@ -147,7 +147,15 @@ pub fn run_task_observed(
         .get("base_url")
         .and_then(|v| v.as_str())
         .map(String::from);
-    let provider = prep!(bind(&slot.provider, credential, base_url));
+    let auth = slot.requires.get("auth").and_then(|v| v.as_str());
+    let oauth_profile = slot.requires.get("oauth_profile").and_then(|v| v.as_str());
+    let provider = prep!(bind(
+        &slot.provider,
+        credential,
+        base_url,
+        auth,
+        oauth_profile
+    ));
 
     emit(RunEvent::Started {
         slot: slot_name.clone(),

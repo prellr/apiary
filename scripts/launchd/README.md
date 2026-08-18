@@ -22,6 +22,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/wine.wisco.apiary.deskto
 Logs: `~/.apiary/logs/{desktop,kokoro}.log`. Restart after a rebuild:
 `launchctl kickstart -k gui/$(id -u)/wine.wisco.apiary.desktop`.
 
-Inference credentials belong sealed in the agent's manifest (Credentials
-tab / `apiary credential seal`), not in this environment — then a
-relaunch needs nothing but the passphrase.
+Inference API keys belong sealed in the agent's manifest (Inference tab /
+`apiary credential seal`), not in this environment. Claude Platform OAuth is
+the exception: Anthropic's `ant` CLI keeps its refresh credential in the
+named local profile, and Apiary requests only a short-lived access token when
+it makes a call. A relaunch otherwise needs nothing but the passphrase.

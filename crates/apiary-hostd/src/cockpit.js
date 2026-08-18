@@ -636,6 +636,37 @@ const inferenceProviders = {
   speech: [['openai', 'OpenAI compatible / Kokoro'], ['apple-speech', 'Apple Speech (local)'], ['macos-say', 'macOS voices']],
 };
 
+// Curated, understandable defaults—not an availability claim. Every remote
+// provider still offers Custom because account access and compatible servers
+// vary; local engines especially may use any installed model identifier.
+const inferenceModels = {
+  language: {
+    anthropic: [
+      ['claude-sonnet-5', 'Claude Sonnet 5 · balanced (recommended)'],
+      ['claude-opus-5', 'Claude Opus 5 · complex work'],
+      ['claude-haiku-4-5-20251001', 'Claude Haiku 4.5 · fastest'],
+      ['claude-fable-5', 'Claude Fable 5 · highest capability / cost'],
+    ],
+    openai: [['gpt-5.6', 'GPT-5.6'], ['gpt-5.1', 'GPT-5.1'], ['gpt-5-mini', 'GPT-5 mini'], ['gpt-5-nano', 'GPT-5 nano']],
+    xai: [['grok-4.5', 'Grok 4.5'], ['grok-4.3', 'Grok 4.3'], ['grok-build-0.1', 'Grok Build 0.1']],
+    ollama: [['llama3.3', 'Llama 3.3'], ['qwen3', 'Qwen 3'], ['gemma3', 'Gemma 3']],
+  },
+  embedding: { ollama: [['nomic-embed-text', 'nomic-embed-text'], ['mxbai-embed-large', 'mxbai-embed-large'], ['all-minilm', 'all-minilm']] },
+  transcription: {
+    'whisper-cpp': [['base.en', 'Whisper base.en'], ['small.en', 'Whisper small.en'], ['medium.en', 'Whisper medium.en']],
+    openai: [['gpt-4o-transcribe', 'GPT-4o Transcribe'], ['gpt-4o-mini-transcribe', 'GPT-4o mini Transcribe'], ['whisper-1', 'Whisper 1']],
+  },
+  speech: { openai: [['gpt-4o-mini-tts', 'GPT-4o mini TTS'], ['tts-1', 'TTS-1'], ['tts-1-hd', 'TTS-1 HD']] },
+};
+
+function inferenceDefaultBaseURL(role, provider) {
+  if (provider === 'anthropic') return 'https://api.anthropic.com';
+  if (provider === 'xai') return 'https://api.x.ai/v1';
+  if (provider === 'openai') return 'https://api.openai.com/v1';
+  if (provider === 'ollama') return 'http://localhost:11434';
+  return '';
+}
+
 function inferenceProviderLabel(provider) {
   for (const choices of Object.values(inferenceProviders)) {
     const found = choices.find(([value]) => value === provider);
@@ -654,7 +685,7 @@ function inferenceEndpoint(slot) {
   return 'on this device';
 }
 
-function inferenceForm(slot, afterSave) {
+function inferenceForm(slot, afterSave, allSlots = []) {
   const form = el('div', 'connection-form');
   const role = el('select');
   for (const value of ['language', 'embedding', 'transcription', 'speech']) {
@@ -666,12 +697,23 @@ function inferenceForm(slot, afterSave) {
   const name = el('input'); name.value = slot ? slot.name : '';
   name.placeholder = 'e.g. workhorse or fast';
   const provider = el('select');
-  const model = el('input'); model.value = (slot && slot.model) || '';
-  model.placeholder = 'Model identifier';
+  const model = el('select');
+  const customModel = el('input'); customModel.placeholder = 'Custom model identifier'; customModel.style.display = 'none';
+  const modelControls = el('div'); modelControls.style.display = 'grid'; modelControls.style.gap = '6px'; modelControls.append(model, customModel);
   const endpoint = el('input'); endpoint.value = (slot && slot.requires && slot.requires.base_url) || '';
-  endpoint.placeholder = 'Optional compatible API base URL';
+  endpoint.placeholder = 'Provider API base URL';
+  endpoint.dataset.auto = endpoint.value ? '0' : '1';
+  endpoint.oninput = () => { endpoint.dataset.auto = '0'; };
+  const auth = el('select');
+  for (const [value, label] of [['api-key', 'API key'], ['platform-oauth', 'Claude Platform (OAuth)']]) {
+    const option = el('option', null, label); option.value = value; auth.append(option);
+  }
+  const savedAuth = (slot && slot.requires && slot.requires.auth) || 'api-key';
+  // Claude Code setup tokens were previously offered here, but cannot call
+  // the native Messages API. Open old connections directly in migration mode.
+  auth.value = savedAuth === 'oauth' ? 'platform-oauth' : savedAuth;
   const credential = el('input'); credential.type = 'password'; credential.autocomplete = 'off';
-  credential.placeholder = slot && slot.credential_source === 'sealed to agent' ? 'Leave blank to keep current key' : 'API key, if required';
+  credential.placeholder = slot && slot.credential_source && slot.credential_source.startsWith('sealed') ? 'Leave blank to keep current credential' : 'API key, if required';
   const voice = el('input'); voice.value = (slot && slot.requires && slot.requires.voice) || '';
   voice.placeholder = 'Voice, e.g. af_heart or alloy';
   const locale = el('input'); locale.value = (slot && slot.requires && slot.requires.locale) || '';
@@ -680,6 +722,46 @@ function inferenceForm(slot, afterSave) {
   const makeDefaultLabel = el('label'); makeDefaultLabel.append(makeDefault, document.createTextNode(' Use as the default task model'));
   const clear = el('input'); clear.type = 'checkbox';
   const clearLabel = el('label'); clearLabel.append(clear, document.createTextNode(' Remove the stored credential'));
+  const oauthConnect = el('button', 'btn solid', 'Sign in to Claude Platform');
+  oauthConnect.style.display = 'none';
+
+  let modelInitialized = false;
+  const refreshModelChoices = () => {
+    const choices = ((inferenceModels[role.value] || {})[provider.value] || []);
+    const initial = !modelInitialized && slot && slot.provider === provider.value ? (slot.model || '') : '';
+    model.replaceChildren();
+    for (const [value, label] of choices) { const option = el('option', null, label); option.value = value; model.append(option); }
+    const custom = el('option', null, 'Custom model…'); custom.value = '__custom__'; model.append(custom);
+    if (initial && choices.some(([value]) => value === initial)) model.value = initial;
+    else if (initial) { model.value = '__custom__'; customModel.value = initial; }
+    else if (choices.length) model.value = choices[0][0];
+    else model.value = '__custom__';
+    customModel.style.display = model.value === '__custom__' ? '' : 'none';
+    const needsModel = role.value === 'language' || choices.length > 0;
+    model.closest('.field').style.display = needsModel ? '' : 'none';
+    if (!needsModel) customModel.style.display = 'none';
+    modelInitialized = true;
+  };
+  model.onchange = () => { customModel.style.display = model.value === '__custom__' ? '' : 'none'; if (model.value === '__custom__') customModel.focus(); };
+
+  const refreshEndpoint = () => {
+    const defaultURL = inferenceDefaultBaseURL(role.value, provider.value);
+    if (endpoint.dataset.auto === '1' || !endpoint.value.trim()) { endpoint.value = defaultURL; endpoint.dataset.auto = '1'; }
+    endpoint.closest('.field').style.display = defaultURL ? '' : 'none';
+    endpoint.readOnly = provider.value !== 'openai' && !(role.value === 'embedding' && provider.value === 'ollama');
+    endpoint.title = endpoint.readOnly ? 'This provider uses its standard endpoint.' : 'Change this for an OpenAI-compatible or local server.';
+  };
+
+  const refreshAuth = () => {
+    const anthropic = role.value === 'language' && provider.value === 'anthropic';
+    auth.closest('.field').style.display = anthropic ? '' : 'none';
+    const oauth = anthropic && auth.value === 'platform-oauth';
+    oauthConnect.style.display = oauth ? '' : 'none';
+    credential.closest('.field').style.display = anthropic && oauth ? 'none' : '';
+    credential.placeholder = slot && slot.credential_source === 'sealed API key'
+      ? 'Leave blank to keep current API key'
+      : 'API key, if required';
+  };
 
   const refreshProviderChoices = () => {
     const current = provider.value || (slot && slot.provider);
@@ -694,19 +776,24 @@ function inferenceForm(slot, afterSave) {
     voice.closest('.field').style.display = role.value === 'speech' ? '' : 'none';
     locale.closest('.field').style.display = role.value === 'transcription' ? '' : 'none';
     makeDefaultLabel.style.display = role.value === 'language' ? '' : 'none';
+    modelInitialized = false;
+    refreshModelChoices();
+    refreshEndpoint();
+    refreshAuth();
   };
 
   form.append(field('Role', role), field('Connection name', name, 'Routing refers to this stable name.'),
-    field('Provider', provider), field('Model', model),
-    field('Base URL', endpoint, 'Leave blank for the provider default. Local compatible servers are keyless.'),
-    field('API credential', credential, 'Encrypted to this agent before it is written.'),
+    field('Provider', provider), field('Model', modelControls),
+    field('Base URL', endpoint, 'Provider defaults are prefilled. OpenAI-compatible and local endpoints remain editable.'),
+    field('Authentication', auth, 'Claude Platform OAuth signs in to a Console workspace through Anthropic’s official ant CLI. Usage is billed to that workspace.'),
+    field('Credential', credential, 'API keys are encrypted to this agent before they are written.'),
     field('Voice', voice), field('Locale', locale));
   const flags = el('div', 'wide row'); flags.append(makeDefaultLabel);
-  if (slot && slot.credential_source === 'sealed to agent') flags.append(clearLabel);
+  if (slot && slot.credential_source === 'sealed API key') flags.append(clearLabel);
   form.append(flags);
   const actions = el('div', 'connection-actions');
   const save = el('button', 'btn solid', slot ? 'Save connection' : 'Add connection');
-  const status = el('span', 'meta', ''); actions.append(save, status);
+  const status = el('span', 'meta', ''); actions.append(oauthConnect, save, status);
   if (slot) {
     const remove = el('button', 'btn danger', 'Remove'); let armed = false;
     remove.onclick = async () => {
@@ -720,34 +807,53 @@ function inferenceForm(slot, afterSave) {
     actions.append(remove);
   }
   form.append(actions);
-  role.onchange = refreshProviderChoices;
+  role.onchange = () => { endpoint.dataset.auto = '1'; refreshProviderChoices(); };
+  provider.onchange = () => { endpoint.dataset.auto = '1'; refreshProviderChoices(); };
+  auth.onchange = refreshAuth;
   provider.value = (slot && slot.provider) || inferenceProviders[role.value][0][0];
   refreshProviderChoices();
 
-  save.onclick = async () => {
-    if (!name.value.trim()) { status.textContent = 'Give this connection a name.'; name.focus(); return; }
+  const persist = async (setupOauth = false) => {
+    const connectionName = name.value.trim().replace(/\s+/g, '-');
+    if (!connectionName) { status.textContent = 'Give this connection a name.'; name.focus(); return; }
+    if (!/^[A-Za-z0-9_-]{1,40}$/.test(connectionName)) { status.textContent = 'Use only letters, numbers, dashes, or underscores in the connection name.'; name.focus(); return; }
+    name.value = connectionName;
+    const chosenModel = model.value === '__custom__' ? customModel.value.trim() : model.value;
+    if (role.value === 'language' && !chosenModel) { status.textContent = 'Choose a model or enter a custom model identifier.'; customModel.focus(); return; }
+    const initialAuth = (slot && slot.requires && slot.requires.auth) || 'api-key';
+    if (!setupOauth && slot && slot.provider === 'anthropic' && provider.value === 'anthropic' && auth.value !== initialAuth && !credential.value && !clear.checked) {
+      status.textContent = 'Authentication changed—enter the matching credential again.'; credential.focus(); return;
+    }
     const requires = Object.assign({}, (slot && slot.requires) || {});
     if (endpoint.value.trim()) requires.base_url = endpoint.value.trim(); else delete requires.base_url;
+    if (provider.value === 'anthropic') {
+      requires.auth = auth.value;
+      if (auth.value === 'platform-oauth') requires.oauth_profile = 'apiary'; else delete requires.oauth_profile;
+    } else { delete requires.auth; delete requires.oauth_profile; }
     if (voice.value.trim()) requires.voice = voice.value.trim(); else delete requires.voice;
     if (locale.value.trim()) requires.locale = locale.value.trim(); else delete requires.locale;
-    save.disabled = true; status.textContent = credential.value ? 'Encrypting credential…' : 'Saving…';
+    save.disabled = true; oauthConnect.disabled = true;
+    status.textContent = setupOauth ? 'Opening Claude Platform sign-in… this can take a minute.' : (credential.value ? 'Encrypting credential…' : 'Saving…');
     const r = await j(api('/inference'), {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         original_name: slot ? slot.name : null,
-        name: name.value.trim(), provider: provider.value, model: model.value.trim() || null,
+        name: connectionName, provider: provider.value, model: chosenModel || null,
         credential: credential.value || null, clear_credential: clear.checked,
-        requires, set_default: makeDefault.checked,
+        credential_from: null,
+        requires, set_default: makeDefault.checked, setup_oauth: setupOauth,
       }),
     });
-    credential.value = ''; save.disabled = false;
-    status.textContent = r.ok ? 'Saved. Review and approve the change.' : 'Could not save: ' + r.error;
+    credential.value = ''; save.disabled = false; oauthConnect.disabled = false;
+    status.textContent = r.ok ? (setupOauth ? 'Claude Platform connected. Review and approve the change.' : 'Saved. Review and approve the change.') : 'Could not save: ' + r.error;
     if (r.ok) { await loadRoster(); afterSave(); }
   };
+  save.onclick = () => persist(false);
+  oauthConnect.onclick = () => persist(true);
   return form;
 }
 
-function inferenceSource(slot, routing, rerender) {
+function inferenceSource(slot, routing, rerender, allSlots) {
   const item = el('article', 'source-item');
   const head = el('div', 'source-head');
   const identity = el('div');
@@ -761,7 +867,7 @@ function inferenceSource(slot, routing, rerender) {
   state.append(el('span', 'state ' + stateName, stateName === 'ready' ? 'Verified locally' : stateName));
   state.append(el('div', 'source-detail', (slot.status && slot.status.detail) || 'No diagnostic available'));
   head.append(identity, detail, state); item.append(head);
-  const edit = el('details'); edit.append(el('summary', null, 'Edit connection'), inferenceForm(slot, rerender));
+  const edit = el('details'); edit.append(el('summary', null, 'Edit connection'), inferenceForm(slot, rerender, allSlots));
   item.append(edit);
   return item;
 }
@@ -783,7 +889,7 @@ async function renderInference(c) {
   const rerender = () => setTimeout(render, 350);
   const task = section('Task models', 'Language models receive prompts and may call granted capabilities. “Configured” means a credential is present; Apiary avoids a billable probe.');
   const taskList = el('div', 'source-list');
-  for (const slot of language) taskList.append(inferenceSource(slot, routing, rerender));
+  for (const slot of language) taskList.append(inferenceSource(slot, routing, rerender, slots));
   if (!language.length) taskList.append(el('div', 'none', 'No task model is configured.'));
   task.append(taskList);
   if (language.length) {
@@ -799,12 +905,12 @@ async function renderInference(c) {
       if (r.ok) { await loadRoster(); rerender(); }
     };
   }
-  const add = el('details', 'technical'); add.append(el('summary', null, 'Add an inference connection'), inferenceForm(null, rerender));
+  const add = el('details', 'technical'); add.append(el('summary', null, 'Add an inference connection'), inferenceForm(null, rerender, slots));
   task.append(add); c.append(task);
 
   const equipment = section('Memory and voice', 'Supporting engines have reserved roles: embed builds semantic memory, transcribe hears audio, and speak renders voice replies.');
   const supportList = el('div', 'source-list');
-  for (const slot of support) supportList.append(inferenceSource(slot, routing, rerender));
+  for (const slot of support) supportList.append(inferenceSource(slot, routing, rerender, slots));
   if (!support.length) supportList.append(el('div', 'none', 'No supporting engines are configured.'));
   equipment.append(supportList); c.append(equipment);
 

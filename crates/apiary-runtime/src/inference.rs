@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Completion {
@@ -159,10 +159,131 @@ pub fn estimate_tokens(text: &str) -> u64 {
     (text.len() as u64) / 3 + 1
 }
 
+pub const DEFAULT_ANTHROPIC_PLATFORM_PROFILE: &str = "apiary";
+
+fn valid_anthropic_profile(profile: &str) -> bool {
+    !profile.is_empty()
+        && profile.len() <= 64
+        && profile
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
+fn ant_binary() -> Result<std::path::PathBuf, crate::Error> {
+    let mut candidates = vec![
+        std::path::PathBuf::from("/opt/homebrew/bin/ant"),
+        std::path::PathBuf::from("/usr/local/bin/ant"),
+    ];
+    if let Ok(path) = std::env::var("PATH") {
+        candidates.extend(
+            std::env::split_paths(&path)
+                .map(|dir| dir.join("ant"))
+                .collect::<Vec<_>>(),
+        );
+    }
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            crate::Error::Provider(
+                "Anthropic's ant CLI is not installed; install it with `brew install anthropics/tap/ant`"
+                    .into(),
+            )
+        })
+}
+
+fn ant_command(profile: &str) -> Result<std::process::Command, crate::Error> {
+    if !valid_anthropic_profile(profile) {
+        return Err(crate::Error::Provider(
+            "Claude Platform profile names may contain only letters, numbers, dashes, and underscores"
+                .into(),
+        ));
+    }
+    let mut command = std::process::Command::new(ant_binary()?);
+    command.args(["--profile", profile]);
+    // A launchd environment can carry a different Anthropic credential.
+    // Explicit profile selection must win so Apiary cannot silently charge
+    // or expose the wrong account.
+    for key in [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_CONSOLE_URL",
+        "ANTHROPIC_OAUTH_CLIENT_ID",
+        "ANTHROPIC_PROFILE",
+        "ANTHROPIC_IDENTITY_TOKEN",
+        "ANTHROPIC_IDENTITY_TOKEN_FILE",
+        "ANTHROPIC_FEDERATION_RULE_ID",
+        "ANTHROPIC_ORGANIZATION_ID",
+        "ANTHROPIC_SERVICE_ACCOUNT_ID",
+        "ANTHROPIC_WORKSPACE_ID",
+    ] {
+        command.env_remove(key);
+    }
+    Ok(command)
+}
+
+/// Open Anthropic's official Claude Platform browser login for a named local
+/// profile. Refresh credentials stay in the CLI's protected profile store;
+/// Apiary only requests an access token when it is about to make a call.
+pub fn anthropic_platform_login(profile: &str) -> Result<(), crate::Error> {
+    let mut command = ant_command(profile)?;
+    let mut output = command
+        .args(["auth", "login", "--timeout", "5m"])
+        .output()
+        .map_err(|e| {
+            crate::Error::Provider(format!("could not start Claude Platform sign-in: {e}"))
+        })?;
+    if output.status.success() {
+        output.stdout.zeroize();
+        output.stderr.zeroize();
+        return Ok(());
+    }
+    output.stdout.zeroize();
+    output.stderr.zeroize();
+    Err(crate::Error::Provider(
+        "Claude Platform sign-in did not complete; try again or run `ant --profile apiary auth login` in Terminal"
+            .into(),
+    ))
+}
+
+/// Ask `ant` for the active access token. The CLI refreshes it first when it
+/// is expired or near expiry. The token lives only in zeroizing memory.
+pub fn anthropic_platform_access_token(profile: &str) -> Result<Zeroizing<String>, crate::Error> {
+    let mut command = ant_command(profile)?;
+    let mut output = command
+        .args(["auth", "print-credentials", "--access-token"])
+        .output()
+        .map_err(|e| {
+            crate::Error::Provider(format!("could not read Claude Platform login: {e}"))
+        })?;
+    if !output.status.success() {
+        output.stdout.zeroize();
+        output.stderr.zeroize();
+        return Err(crate::Error::Provider(format!(
+            "Claude Platform profile '{profile}' is not signed in"
+        )));
+    }
+    output.stderr.zeroize();
+    let decoded = String::from_utf8(std::mem::take(&mut output.stdout)).map_err(|_| {
+        crate::Error::Provider("Claude Platform returned a non-text credential".into())
+    })?;
+    let decoded = Zeroizing::new(decoded);
+    let trimmed = decoded.trim();
+    if trimmed.is_empty() || trimmed.len() > 16_384 {
+        return Err(crate::Error::Provider(
+            "Claude Platform returned an invalid access credential".into(),
+        ));
+    }
+    Ok(Zeroizing::new(trimmed.to_string()))
+}
+
 /// Anthropic Messages API over raw HTTP.
 ///
-/// Auth is either an API key (`x-api-key`) or an OAuth bearer token
-/// (`Authorization: Bearer` + the `oauth-2025-04-20` beta header). Thinking
+/// Auth is an API key (`x-api-key`), a standard bearer token, or a named
+/// Claude Platform profile managed by Anthropic's `ant` CLI. Platform OAuth
+/// access tokens are deliberately fetched just in time so the official CLI
+/// can refresh them; they are never persisted in an agent manifest. Thinking
 /// is deliberately unconfigured — current models run adaptive thinking by
 /// default, and `budget_tokens`/sampling params are rejected on them.
 pub struct AnthropicProvider {
@@ -173,9 +294,14 @@ pub struct AnthropicProvider {
 pub enum AnthropicAuth {
     ApiKey(Zeroizing<String>),
     Bearer(Zeroizing<String>),
+    PlatformProfile(String),
 }
 
 impl AnthropicProvider {
+    pub fn from_platform_profile(profile: String) -> Self {
+        Self::new(AnthropicAuth::PlatformProfile(profile))
+    }
+
     pub fn new(auth: AnthropicAuth) -> Self {
         Self {
             auth,
@@ -199,6 +325,22 @@ impl AnthropicProvider {
         }
         None
     }
+
+    fn apply_auth(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+    ) -> Result<reqwest::blocking::RequestBuilder, crate::Error> {
+        match &self.auth {
+            AnthropicAuth::ApiKey(key) => Ok(request.header("x-api-key", key.as_str())),
+            AnthropicAuth::Bearer(token) => {
+                Ok(request.header("authorization", format!("Bearer {}", token.as_str())))
+            }
+            AnthropicAuth::PlatformProfile(profile) => {
+                let token = anthropic_platform_access_token(profile)?;
+                Ok(request.header("authorization", format!("Bearer {}", token.as_str())))
+            }
+        }
+    }
 }
 
 impl AnthropicProvider {
@@ -208,12 +350,7 @@ impl AnthropicProvider {
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json");
-        req = match &self.auth {
-            AnthropicAuth::ApiKey(k) => req.header("x-api-key", k.as_str()),
-            AnthropicAuth::Bearer(t) => req
-                .header("authorization", format!("Bearer {}", t.as_str()))
-                .header("anthropic-beta", "oauth-2025-04-20"),
-        };
+        req = self.apply_auth(req)?;
         let resp = req
             .json(body)
             .send()
@@ -242,6 +379,27 @@ fn extract_text(payload: &serde_json::Value) -> String {
                 .join("")
         })
         .unwrap_or_default()
+}
+
+/// Newer adaptive-thinking models default to `display: omitted`, which
+/// deliberately streams a signed thinking block with an empty `thinking`
+/// field. Asking for the summary keeps the replayed tool-loop turn valid and
+/// debuggable while preserving Anthropic's opaque signature unchanged.
+fn adaptive_thinking_config(model: &str) -> Option<serde_json::Value> {
+    const ADAPTIVE_PREFIXES: &[&str] = &[
+        "claude-fable-5",
+        "claude-mythos-5",
+        "claude-mythos-preview",
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-sonnet-5",
+        "claude-sonnet-4-6",
+    ];
+    ADAPTIVE_PREFIXES
+        .iter()
+        .any(|prefix| model.starts_with(prefix))
+        .then(|| json!({"type": "adaptive", "display": "summarized"}))
 }
 
 impl Provider for AnthropicProvider {
@@ -375,12 +533,7 @@ impl AnthropicProvider {
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .header("accept", "text/event-stream");
-        req = match &self.auth {
-            AnthropicAuth::ApiKey(k) => req.header("x-api-key", k.as_str()),
-            AnthropicAuth::Bearer(t) => req
-                .header("authorization", format!("Bearer {}", t.as_str()))
-                .header("anthropic-beta", "oauth-2025-04-20"),
-        };
+        req = self.apply_auth(req)?;
         let resp = req
             .json(&body)
             .send()
@@ -519,11 +672,11 @@ pub(crate) fn assemble_sse(
         if let Some(e) = error {
             return Err(crate::Error::Provider(format!("anthropic stream: {e}")));
         }
-        // A block that never got content (an empty thinking or text block)
-        // must not be replayed — the API rejects "thinking must contain
-        // thinking"; an empty text block is noise.
+        // Empty text placeholders are noise. Thinking blocks are different:
+        // `display: omitted` intentionally yields `thinking: ""` plus an
+        // opaque signature, and Anthropic requires that signed block to be
+        // replayed unchanged during tool use.
         blocks.retain(|b| match b["type"].as_str() {
-            Some("thinking") => !b["thinking"].as_str().unwrap_or("").is_empty(),
             Some("text") => !b["text"].as_str().unwrap_or("").is_empty(),
             _ => true,
         });
@@ -589,13 +742,16 @@ impl AnthropicProvider {
                     output_tokens: out_total,
                 });
             }
-            let body = json!({
+            let mut body = json!({
                 "model": model,
                 "max_tokens": remaining.clamp(1, 16000),
                 "system": system,
                 "messages": messages,
                 "tools": tool_defs,
             });
+            if let Some(thinking) = adaptive_thinking_config(model) {
+                body["thinking"] = thinking;
+            }
             let payload = match on_delta.as_mut() {
                 Some(cb) => self.request_streaming(&body, *cb)?,
                 None => self.request(&body)?,
@@ -799,18 +955,41 @@ pub fn bind(
     provider_name: &str,
     credential: Option<Zeroizing<String>>,
     base_url: Option<String>,
+    auth: Option<&str>,
+    oauth_profile: Option<&str>,
 ) -> Result<Box<dyn Provider>, crate::Error> {
     match provider_name {
         "anthropic" => {
-            let provider = match credential {
-                Some(secret) => AnthropicProvider::new(AnthropicAuth::ApiKey(secret)),
-                None => AnthropicProvider::from_env().ok_or_else(|| {
-                    crate::Error::Provider(
-                        "anthropic slot has no sealed credential and no \
-                         ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN in the environment"
+            let provider = match auth.unwrap_or("api-key") {
+                "platform-oauth" => AnthropicProvider::from_platform_profile(
+                    oauth_profile
+                        .unwrap_or(DEFAULT_ANTHROPIC_PLATFORM_PROFILE)
+                        .to_string(),
+                ),
+                "api-key" => match credential {
+                    Some(secret) => AnthropicProvider::new(AnthropicAuth::ApiKey(secret)),
+                    None => AnthropicProvider::from_env().ok_or_else(|| {
+                        crate::Error::Provider(
+                            "anthropic slot has no sealed credential and no \
+                             ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN in the environment"
+                                .into(),
+                        )
+                    })?,
+                },
+                // Kept only so an existing manifest produces an actionable
+                // migration error instead of silently treating a Claude Code
+                // setup token as a Claude Platform credential.
+                "oauth" => {
+                    return Err(crate::Error::Provider(
+                        "this connection uses legacy Claude Code OAuth; edit it and sign in with Claude Platform OAuth"
                             .into(),
-                    )
-                })?,
+                    ))
+                }
+                other => {
+                    return Err(crate::Error::Provider(format!(
+                        "anthropic auth '{other}' is unsupported (api-key | platform-oauth)"
+                    )))
+                }
             };
             Ok(Box::new(provider))
         }
@@ -1122,6 +1301,44 @@ mod openai_tests {
         assert_eq!(content[2]["input"], json!({"a": 1}));
         assert_eq!(payload["stop_reason"], "tool_use");
         assert_eq!(payload["usage"]["output_tokens"], 5);
+    }
+
+    #[test]
+    fn sse_assembler_preserves_signed_omitted_thinking_for_tool_replay() {
+        let frames = [
+            r#"{"type":"message_start","message":{"model":"claude-opus-5","usage":{"input_tokens":3}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"OPAQUE"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"lookup","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":4}}"#,
+        ];
+        let body: String = frames
+            .iter()
+            .map(|frame| format!("data: {frame}\n"))
+            .collect();
+        let payload =
+            assemble_sse(std::io::Cursor::new(body), "claude-opus-5", &mut |_| {}).unwrap();
+        let content = payload["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "");
+        assert_eq!(content[0]["signature"], "OPAQUE");
+        assert_eq!(content[1]["type"], "tool_use");
+    }
+
+    #[test]
+    fn adaptive_models_request_summarized_thinking_for_tool_loops() {
+        assert_eq!(
+            adaptive_thinking_config("claude-opus-5"),
+            Some(json!({"type": "adaptive", "display": "summarized"}))
+        );
+        assert!(adaptive_thinking_config("claude-sonnet-5").is_some());
+        assert!(adaptive_thinking_config("claude-fable-5").is_some());
+        assert!(adaptive_thinking_config("claude-haiku-4-5-20251001").is_none());
+        assert!(adaptive_thinking_config("custom-compatible-model").is_none());
     }
 
     #[test]
