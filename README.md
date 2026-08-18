@@ -125,10 +125,10 @@ model runs). What exists today:
   listener started, restarted on death, bounced on manifest amendment,
   stopped on deactivation — and lease-coordinated across hosts
 - NIP-98 signed-request auth for remote use; governor-bound authorization
-  (the signer must be a suspend key of the agent it touches), and a
-  **host administrator allowlist** (`--admin <npub>`) gating host-scoped
-  operations — founding, importing, the connector library, lock/unlock —
-  independently of any agent's governors
+  (the signer must be a suspend key of the agent it touches), and a persistent
+  **host manager allowlist** gating host-scoped operations — founding,
+  importing, the connector library, lock/unlock — independently of any
+  agent's governors. `--admin <npub>` bootstraps the first manager
 
 - **Relay pool**: one supervised worker per relay URL shared by the
   whole process — leases, publication, recovery, and connectors ride
@@ -280,6 +280,27 @@ refer to the server's filesystem; the Mac folder picker is intentionally off.
 Do not bind the headless daemon to a public interface in this mode. Use `open`
 auth only when the daemon remains on server loopback and the SSH account plus
 trusted processes on both machines form the operator boundary.
+
+### Multiple people and Nostr identities
+
+**People & access** separates two kinds of authority:
+
+- **Host managers** administer the Apiary installation: agents, integrations,
+  credentials, and lock state. Add them by public `npub` or hex key. Apiary
+  stores only the public identity in `~/.apiary/host-managers.json`; each person
+  keeps their private key in their own signer.
+- **Agent managers** are the `governance.suspend_keys` on one agent. They can
+  approve, stop, and operate that agent without automatically receiving access
+  to the rest of the host.
+
+New and existing agents can name multiple people. Each listed person has
+independent authority; this is an allowlist, not M-of-N approval. Changing an
+agent's managers pauses it until one of the new managers ratifies the amended
+configuration. The last persistent host manager cannot be removed, and a
+manager supplied by `--admin` remains until the daemon restarts without that
+flag. Host-manager Nostr signatures are enforced when the daemon uses
+`--auth nip98`; in local desktop and SSH-tunnel `open` mode, the per-launch
+token or SSH account remains the request boundary.
 
 ## Layout
 

@@ -138,8 +138,9 @@ pub fn authorize_governor(
 }
 
 /// Host-scoped authorization: in nip98 mode the signer must be a listed
-/// HOST ADMIN — being a valid nostr key (or even some agent's governor)
-/// grants nothing over the host itself. Open mode remains local trust.
+/// HOST MANAGER — being a valid nostr key (or even some agent's governor)
+/// grants nothing over the host itself. The registry combines bootstrap
+/// `--admin` keys with stored managers. Open mode remains local trust.
 pub fn authorize_admin(
     state: &AppState,
     signer: Option<PublicKey>,
@@ -147,17 +148,23 @@ pub fn authorize_admin(
     if state.auth == AuthMode::Open {
         return Ok(());
     }
-    if state.admins.is_empty() {
+    let managers = state.managers.read().map_err(|_| {
+        crate::err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "host manager registry is unavailable",
+        )
+    })?;
+    if managers.is_empty() {
         return Err(crate::err(
             StatusCode::FORBIDDEN,
-            "host-scoped operations need a host administrator — start the daemon with --admin <npub>",
+            "host-scoped operations need a host manager — start once with --admin <npub> to bootstrap one",
         ));
     }
     match signer {
-        Some(pk) if state.admins.contains(&pk) => Ok(()),
+        Some(pk) if managers.contains(&pk) => Ok(()),
         Some(_) => Err(crate::err(
             StatusCode::FORBIDDEN,
-            "signer is not a host administrator",
+            "signer is not a host manager",
         )),
         None => Err(crate::err(
             StatusCode::UNAUTHORIZED,
@@ -183,7 +190,7 @@ mod tests {
             token: None,
             listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
             pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
-            admins: Vec::new(),
+            managers: std::sync::RwLock::new(crate::access::ManagerRegistry::in_memory(Vec::new())),
             supervisor_notes: std::sync::Mutex::new(std::collections::HashMap::new()),
             admitted: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
@@ -310,5 +317,17 @@ mod tests {
         assert!(authorize_governor(&s, None, &[gov]).is_err());
         // Open mode: local trust, no binding.
         assert!(authorize_governor(&state(AuthMode::Open), None, &[gov]).is_ok());
+    }
+
+    #[test]
+    fn host_manager_registry_binds_admin_authority() {
+        let manager = Keys::generate().public_key();
+        let stranger = Keys::generate().public_key();
+        let mut s = state(AuthMode::Nip98);
+        s.managers =
+            std::sync::RwLock::new(crate::access::ManagerRegistry::in_memory(vec![manager]));
+        assert!(authorize_admin(&s, Some(manager)).is_ok());
+        assert!(authorize_admin(&s, Some(stranger)).is_err());
+        assert!(authorize_admin(&s, None).is_err());
     }
 }

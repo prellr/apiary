@@ -178,6 +178,8 @@ fn run_local(home: PathBuf) {
         .expect("nonblocking listener");
     let port = std_listener.local_addr().expect("local addr").port();
 
+    let managers = apiary_hostd::access::ManagerRegistry::load(&home, Vec::new())
+        .unwrap_or_else(|error| startup_error("Manager registry error", error, 2));
     let state = Arc::new(AppState {
         home,
         passphrase: std::sync::RwLock::new(startup_passphrase),
@@ -192,8 +194,9 @@ fn run_local(home: PathBuf) {
         supervisor_notes: std::sync::Mutex::new(std::collections::HashMap::new()),
         admitted: std::sync::Mutex::new(std::collections::HashMap::new()),
         // Desktop runs open-mode behind its per-launch token; the token
-        // IS the admin boundary there.
-        admins: Vec::new(),
+        // IS the request boundary there. Stored manager npubs become the
+        // NIP-98 allowlist when this home later runs headless.
+        managers: std::sync::RwLock::new(managers),
     });
 
     std::thread::spawn(move || {

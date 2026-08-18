@@ -205,10 +205,189 @@ pub async fn status(
         "can_forget_unlock": state.forget_passphrase.is_some(),
         "agents": agents,
         "owners": owners,
+        "managers": state.managers.read().map(|registry| registry.len()).unwrap_or(0),
         "listeners": listeners,
         "anthropic_key_present": nonempty_env("ANTHROPIC_API_KEY")
             || nonempty_env("ANTHROPIC_AUTH_TOKEN"),
         "relay_pool": apiary_runtime::relay::stats(),
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------- host managers
+
+#[derive(serde::Deserialize)]
+pub struct ManagerBody {
+    name: String,
+    npub: String,
+}
+
+/// List public Nostr identities with full host-scoped authority. Private keys
+/// are never accepted here; each person signs through their own Nostr signer.
+pub async fn managers_get(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = check_admin(&state, &headers, "GET", &uri, None) {
+        return e.into_response();
+    }
+    match state.managers.read() {
+        Ok(registry) => Json(json!({"ok": true, "managers": registry.views()})).into_response(),
+        Err(_) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "host manager registry is unavailable",
+        )
+        .into_response(),
+    }
+}
+
+/// Add a manager or update their local display name. Every manager has equal,
+/// independent host authority; this is deliberately not a role hierarchy.
+pub async fn managers_upsert(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    if let Err(e) = check_admin(&state, &headers, "POST", &uri, Some(&raw_body)) {
+        return e.into_response();
+    }
+    let body: ManagerBody = match serde_json::from_slice(&raw_body) {
+        Ok(body) => body,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    if let Err(error) = crate::access::validate_name(&body.name) {
+        return err(StatusCode::BAD_REQUEST, error).into_response();
+    }
+    let key = match apiary_core::identity::parse_npub(body.npub.trim()) {
+        Ok(key) => key,
+        Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let canonical = match apiary_core::identity::to_npub(&key) {
+        Ok(npub) => npub,
+        Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let mut registry = match state.managers.write() {
+        Ok(registry) => registry,
+        Err(_) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "host manager registry is unavailable",
+            )
+            .into_response()
+        }
+    };
+    if let Err(error) = registry.upsert(key, body.name.trim().to_string()) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
+    Json(json!({"ok": true, "npub": canonical, "managers": registry.views()})).into_response()
+}
+
+pub async fn managers_remove(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    AxPath(npub): AxPath<String>,
+) -> impl IntoResponse {
+    if let Err(e) = check_admin(&state, &headers, "DELETE", &uri, None) {
+        return e.into_response();
+    }
+    let key = match apiary_core::identity::parse_npub(&npub) {
+        Ok(key) => key,
+        Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let mut registry = match state.managers.write() {
+        Ok(registry) => registry,
+        Err(_) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "host manager registry is unavailable",
+            )
+            .into_response()
+        }
+    };
+    match registry.remove(&key) {
+        Ok(crate::access::RemoveOutcome::Removed) => {
+            Json(json!({"ok": true, "managers": registry.views()})).into_response()
+        }
+        Ok(crate::access::RemoveOutcome::NotFound) => {
+            err(StatusCode::NOT_FOUND, "host manager was not found").into_response()
+        }
+        Ok(crate::access::RemoveOutcome::StartupManager) => err(
+            StatusCode::CONFLICT,
+            "this manager came from --admin; restart without that flag before removing them",
+        )
+        .into_response(),
+        Ok(crate::access::RemoveOutcome::LastManager) => err(
+            StatusCode::CONFLICT,
+            "the last host manager cannot be removed; add a replacement first",
+        )
+        .into_response(),
+        Err(error) => err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct GovernorsBody {
+    npubs: Vec<String>,
+}
+
+/// Replace an agent's governor allowlist. Authorization is checked against the
+/// current manifest before the amendment is written; the changed manifest is
+/// inert until one of the newly listed governors ratifies it.
+pub async fn governors_set(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    let body: GovernorsBody = match serde_json::from_slice(&raw_body) {
+        Ok(body) => body,
+        Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    if body.npubs.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "at least one agent governor is required",
+        )
+        .into_response();
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut governors = Vec::new();
+    for raw in body.npubs {
+        let key = match apiary_core::identity::parse_npub(raw.trim()) {
+            Ok(key) => key,
+            Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+        };
+        if seen.insert(key) {
+            match apiary_core::identity::to_npub(&key) {
+                Ok(npub) => governors.push(npub),
+                Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+            }
+        }
+    }
+    manifest.governance.suspend_keys = governors.clone();
+    let yaml = match manifest.to_yaml() {
+        Ok(yaml) => yaml,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    if let Err(error) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "governors": governors,
+        "manifest_sha256": ceremony::manifest_hash(&yaml),
+        "ratified": false,
+        "note": "agent managers changed — the agent is paused until one of the newly listed governors ratifies",
     }))
     .into_response()
 }

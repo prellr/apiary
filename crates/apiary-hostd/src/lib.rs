@@ -8,6 +8,7 @@
 //! the Tauri desktop app build the same router — the GUI is a client
 //! (SPEC §2), never a second implementation.
 
+pub mod access;
 pub mod agui;
 pub mod events;
 pub mod nip98;
@@ -45,14 +46,15 @@ pub struct AppState {
     pub auth: AuthMode,
     /// Canonical origin for exact NIP-98 URL matching.
     pub origin: String,
-    /// HOST administrators (nip98 mode): only these keys may perform
+    /// HOST managers (nip98 mode): only these keys may perform
     /// host-scoped operations — founding/importing agents, editing the
     /// connector library, locking/unlocking. Per-agent operations stay
     /// governor-bound to that agent's suspend keys; this list is the
     /// authority over the HOST itself (its keystore slots, its inference
-    /// credentials, its configuration). Empty in nip98 mode = host-scoped
+    /// credentials, its configuration). CLI `--admin` entries bootstrap the
+    /// persistent manager registry. Empty in nip98 mode = host-scoped
     /// operations refuse, loudly.
-    pub admins: Vec<nostr::prelude::PublicKey>,
+    pub managers: std::sync::RwLock<access::ManagerRegistry>,
     /// Per-launch bearer token (desktop mode). When set, EVERY request must
     /// present it — the desktop webview gets it in its boot URL, so other
     /// local processes cannot drive the embedded daemon.
@@ -95,6 +97,14 @@ pub fn build_router(state: App) -> Router {
         .route("/api/unlock/forget", post(ops::forget_automatic_unlock))
         .route("/api/lock", post(ops::lock))
         .route("/api/owners", get(ops::owners_get).post(ops::owners_create))
+        .route(
+            "/api/managers",
+            get(ops::managers_get).post(ops::managers_upsert),
+        )
+        .route(
+            "/api/managers/{npub}",
+            axum::routing::delete(ops::managers_remove),
+        )
         .route("/api/key", get(ops::key_normalize))
         .route(
             "/api/connectors",
@@ -157,6 +167,7 @@ pub fn build_router(state: App) -> Router {
         .route("/api/agents/{npub}/buzz/profile", post(ops::buzz_profile))
         .route("/api/agents/{npub}/buzz/join", post(ops::buzz_join))
         .route("/api/agents/{npub}/active", post(ops::set_active))
+        .route("/api/agents/{npub}/governors", post(ops::governors_set))
         .route("/api/agents/{npub}/connectors", post(ops::connector_grant))
         .route(
             "/api/agents/{npub}/connectors/oauth",

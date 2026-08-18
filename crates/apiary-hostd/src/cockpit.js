@@ -4,7 +4,7 @@
 // no inline script, no external sources.)
 'use strict';
 
-let sel = null, tab = 'overview', agents = [], owners = [], hostStatus = {};
+let sel = null, tab = 'overview', agents = [], owners = [], managers = [], hostStatus = {};
 let hostView = null; // null | 'library' | 'found' | 'import'
 let listenerPoll = null;
 
@@ -49,6 +49,12 @@ function ownerHolders(keys) {
   const byNpub = new Map();
   for (const identity of [...owners, ...agents]) byNpub.set(identity.npub, identity);
   return [...byNpub.values()].filter(identity => keys.some(k => k === identity.npub));
+}
+
+function approvalPeople() {
+  const byNpub = new Map();
+  for (const identity of [...managers, ...owners]) byNpub.set(identity.npub, identity);
+  return [...byNpub.values()].sort((a, b) => (a.name || a.npub).localeCompare(b.name || b.npub));
 }
 
 function field(labelText, control, hint) {
@@ -142,6 +148,15 @@ async function loadOwners() {
     owners = d.ok ? (d.owners || []) : [];
   } catch {
     owners = [];
+  }
+}
+
+async function loadManagers() {
+  try {
+    const d = await j('/api/managers');
+    managers = d.ok ? (d.managers || []) : [];
+  } catch {
+    managers = [];
   }
 }
 
@@ -252,6 +267,7 @@ async function render() {
   const c = document.getElementById('content');
   c.replaceChildren();
   if (hostView === 'library') return renderLibrary(c);
+  if (hostView === 'managers') return renderManagers(c);
   if (hostView === 'found') return renderFound(c);
   if (hostView === 'import') return renderImport(c);
   if (!sel && !agents.length) return renderWelcome(c);
@@ -307,7 +323,7 @@ function renderWelcome(c) {
     return;
   }
 
-  if (!owners.length) {
+  if (!approvalPeople().length) {
     card.append(eyebrow, el('h2', null, 'Create your approval identity'),
       help('This is your human authority in Apiary. It approves agent configurations and can stop an agent. It is separate from every agent identity.'),
       setupProgress(2));
@@ -333,20 +349,27 @@ function renderWelcome(c) {
     setupProgress(3));
   const name = el('input'); name.placeholder = 'e.g. Morning brief';
   const purpose = el('textarea'); purpose.rows = 4; purpose.placeholder = 'What should this agent reliably help you do?';
-  const owner = el('select');
-  for (const identity of owners) { const option = el('option', null, identity.name); option.value = identity.npub; owner.append(option); }
+  const owner = el('select'); owner.multiple = true; owner.size = Math.min(5, Math.max(2, approvalPeople().length));
+  approvalPeople().forEach((identity, index) => {
+    const option = el('option', null, identity.name || identity.npub.slice(0, 16));
+    option.value = identity.npub; option.selected = index === 0; owner.append(option);
+  });
   const draft = el('input'); draft.type = 'checkbox'; draft.checked = !!hostStatus.anthropic_key_present; draft.disabled = !hostStatus.anthropic_key_present;
   const draftLabel = el('label', 'field'); const draftLine = el('span'); draftLine.append(draft, document.createTextNode(' Tailor the configuration with the connected model'));
   draftLabel.append(draftLine, el('small', null, hostStatus.anthropic_key_present ? 'You will review everything before approval.' : 'No host model credential is configured, so Apiary will use its conservative template.'));
   const go = el('button', 'btn solid', 'Create draft');
   const row = el('div', 'row'); row.append(go);
-  card.append(field('Agent name', name), field('Purpose', purpose), field('Approved by', owner), draftLabel, row, status);
+  card.append(field('Agent name', name), field('Purpose', purpose),
+    field('Managed by', owner, 'Choose one or more people. Each selected person can independently approve or stop this agent.'),
+    draftLabel, row, status);
   go.onclick = async () => {
     if (!name.value.trim()) { status.textContent = 'Give the agent a name.'; name.focus(); return; }
     if (!purpose.value.trim()) { status.textContent = 'Describe what the agent should do.'; purpose.focus(); return; }
+    const selectedManagers = [...owner.selectedOptions].map(option => option.value);
+    if (!selectedManagers.length) { status.textContent = 'Choose at least one manager.'; owner.focus(); return; }
     go.disabled = true; status.textContent = 'Creating the identity and draft configuration…';
     const r = await j('/api/agents/found', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({
-      name:name.value.trim(), purpose:purpose.value.trim(), suspend_keys:[owner.value], draft_with:draft.checked ? 'anthropic' : null,
+      name:name.value.trim(), purpose:purpose.value.trim(), suspend_keys:selectedManagers, draft_with:draft.checked ? 'anthropic' : null,
     }) });
     go.disabled = false;
     if (!r.ok) { status.textContent = 'Could not create the agent: ' + r.error; return; }
@@ -522,6 +545,46 @@ async function renderOverview(c) {
     quick('Manage capabilities', 'Choose what it can read or change.', 'connectors'),
     quick('Manage inference', 'Models, memory, speech, and routing.', 'inference'));
   c.append(shortcuts);
+
+  const governorKeys = ((m.governance || {}).suspend_keys || []);
+  const people = approvalPeople();
+  const knownKeys = new Set(people.map(person => person.npub));
+  const governance = section('Agent managers',
+    'These people can independently approve configuration changes, stop this agent, and ask it to act. Host access is separate; selecting someone here does not let them administer other agents.');
+  const checks = [];
+  for (const person of people) {
+    const checkbox = el('input'); checkbox.type = 'checkbox'; checkbox.style.width = 'auto';
+    checkbox.checked = governorKeys.includes(person.npub);
+    const label = el('label', 'row');
+    label.append(checkbox, el('span', null, person.name || person.npub.slice(0, 16)),
+      el('code', null, person.npub),
+      managers.some(manager => manager.npub === person.npub) ? el('span', 'meta', 'host manager') : el('span'));
+    governance.append(label); checks.push([checkbox, person.npub]);
+  }
+  const other = el('textarea', 'address-list'); other.rows = 3;
+  other.placeholder = 'npub1… (one per line)';
+  other.value = governorKeys.filter(key => !knownKeys.has(key)).join('\n');
+  const saveManagers = el('button', 'btn', 'Save agent managers');
+  const managerStatus = el('span', 'meta', '');
+  const managerRow = el('div', 'row'); managerRow.append(saveManagers, managerStatus);
+  governance.append(field('Other Nostr IDs', other, 'For people who should govern this agent without receiving host-wide access.'),
+    help('Changing this list is a constitutional amendment: Apiary pauses the agent until one of the newly listed managers approves it.'),
+    managerRow);
+  saveManagers.onclick = async () => {
+    const selected = checks.filter(([checkbox]) => checkbox.checked).map(([, npub]) => npub);
+    const additional = other.value.split(/[\n,]+/).map(value => value.trim()).filter(Boolean);
+    const npubs = [...new Set([...selected, ...additional])];
+    if (!npubs.length) { managerStatus.textContent = 'At least one agent manager is required.'; return; }
+    saveManagers.disabled = true; managerStatus.textContent = 'Saving amendment…';
+    const result = await j(api('/governors'), {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ npubs }),
+    });
+    saveManagers.disabled = false;
+    if (!result.ok) { managerStatus.textContent = 'Could not update managers: ' + result.error; return; }
+    managerStatus.textContent = 'Saved. Review and approve the amendment before this agent can run.';
+    await loadRoster(); render();
+  };
+  c.append(governance);
 
   const active = section('Always-on presence', declared.length
     ? 'Activation keeps declared channels available on this host. One-time tasks work while inactive.'
@@ -2160,6 +2223,11 @@ function renderCreds(c) {
 
 // ------------------------------------------------------------ founding
 
+document.getElementById('managerstoggle').onclick = () => {
+  hostView = 'managers';
+  document.querySelectorAll('nav button').forEach(x => x.classList.remove('sel'));
+  render();
+};
 document.getElementById('libtoggle').onclick = () => {
   hostView = 'library';
   document.querySelectorAll('nav button').forEach(x => x.classList.remove('sel'));
@@ -2176,10 +2244,101 @@ document.getElementById('importtoggle').onclick = () => {
   render();
 };
 
+// ------------------------------------------------------ people and access
+
+function renderManagers(c) {
+  const head = el('div', 'page-head');
+  head.append(el('div', 'eyebrow', 'Host settings'),
+    el('h2', 'page-title', 'People & access'),
+    el('p', 'page-lede', 'Host managers administer Apiary itself. Agent governors approve and operate only the agents that name them. A person may be both.'));
+  c.append(head);
+
+  const current = section('Host managers',
+    'Every person listed here has the same independent authority over this host: agents, integrations, credentials, lock state, and configuration. Apiary does not copy or store their private key.');
+  if (hostStatus.auth !== 'nip98') {
+    const boundary = el('div', 'attention');
+    boundary.append(el('b', null, 'Current access boundary: '),
+      document.createTextNode(hostStatus.token_gated
+        ? 'this desktop’s per-launch token. Nostr signatures are enforced when the host runs in NIP-98 mode.'
+        : 'local or SSH access. Nostr signatures are enforced when the host runs in NIP-98 mode.'));
+    current.append(boundary);
+  }
+  if (!managers.length) {
+    current.append(el('div', 'none', 'No persistent Nostr managers yet. Local token or SSH access is currently the host boundary.'));
+  }
+  for (const manager of managers) {
+    const row = el('div', 'lib');
+    row.append(el('b', null, manager.name || 'Manager'),
+      el('code', null, manager.npub),
+      el('span', 'meta', manager.source === 'startup' ? 'started with --admin' : 'stored on this host'),
+      el('span', 'spacer'));
+    if (manager.removable) {
+      const remove = el('button', 'btn danger', 'Remove');
+      remove.onclick = async () => {
+        if (!confirm(`Remove ${manager.name || manager.npub} as a host manager?`)) return;
+        remove.disabled = true;
+        const result = await j('/api/managers/' + encodeURIComponent(manager.npub), { method: 'DELETE' });
+        if (!result.ok) { remove.disabled = false; alert('Could not remove manager: ' + result.error); return; }
+        managers = result.managers || []; render();
+      };
+      row.append(remove);
+    }
+    current.append(row);
+  }
+  c.append(current);
+
+  const add = section('Add a person by Nostr ID',
+    'Paste an npub or public-key hex. They authenticate with their own signer; never ask them for an nsec or private key.');
+  const name = el('input', 'grow'); name.placeholder = 'Name or local label';
+  const npub = el('input', 'grow'); npub.placeholder = 'npub1… or 64-character public key';
+  const go = el('button', 'btn solid', 'Add host manager');
+  const status = el('span', 'meta', '');
+  const row = el('div', 'row'); row.append(go, status);
+  add.append(field('Name', name), field('Nostr ID', npub),
+    help('Granting access does not automatically add this person to existing agents. Add their npub to an agent’s governance.suspend_keys when they should govern that agent too.'),
+    row);
+  go.onclick = async () => {
+    if (!name.value.trim()) { status.textContent = 'Enter a name.'; name.focus(); return; }
+    if (!npub.value.trim()) { status.textContent = 'Enter a Nostr public identity.'; npub.focus(); return; }
+    go.disabled = true; status.textContent = 'Validating and saving…';
+    const result = await j('/api/managers', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: name.value.trim(), npub: npub.value.trim() }),
+    });
+    go.disabled = false;
+    if (!result.ok) { status.textContent = 'Could not add manager: ' + result.error; return; }
+    managers = result.managers || []; name.value = ''; npub.value = '';
+    status.textContent = 'Manager added.'; render();
+  };
+  c.append(add);
+
+  const localOnly = owners.filter(owner => !managers.some(manager => manager.npub === owner.npub));
+  if (localOnly.length) {
+    const local = section('Local approval identities',
+      'These encrypted keys can already approve agents on this host. Grant host access only if that human identity should also administer Apiary itself.');
+    for (const owner of localOnly) {
+      const row = el('div', 'lib');
+      row.append(el('b', null, owner.name), el('code', null, owner.npub), el('span', 'spacer'));
+      const grant = el('button', 'btn', 'Grant host access');
+      grant.onclick = async () => {
+        grant.disabled = true;
+        const result = await j('/api/managers', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ name: owner.name, npub: owner.npub }),
+        });
+        if (!result.ok) { grant.disabled = false; alert('Could not grant access: ' + result.error); return; }
+        managers = result.managers || []; render();
+      };
+      row.append(grant); local.append(row);
+    }
+    c.append(local);
+  }
+}
+
 // ------------------------------------------------------------ found (pane)
 
 function renderFound(c) {
-  if (!owners.length) {
+  if (!approvalPeople().length) {
     const setup = section('Create an approval identity',
       'Before creating another agent, add the human identity that will review its configuration and permissions.');
     const ownerName = el('input'); ownerName.placeholder = 'Your name';
@@ -2203,12 +2362,14 @@ function renderFound(c) {
     'Describe a clear job. Apiary creates a conservative configuration for you to review before anything can run.');
   const fName = el('input'); fName.placeholder = 'e.g. Research assistant';
   const fPurpose = el('textarea'); fPurpose.rows = 4; fPurpose.placeholder = 'What should this agent reliably help you do?';
-  const fSuspend = el('select', 'grow');
-  for (const identity of owners) {
+  const people = approvalPeople();
+  const fSuspend = el('select', 'grow'); fSuspend.multiple = true;
+  fSuspend.size = Math.min(6, Math.max(2, people.length));
+  people.forEach((identity, index) => {
     const option = el('option', null, identity.name || identity.npub.slice(0, 16));
-    option.value = identity.npub; fSuspend.append(option);
-  }
-  if (!owners.length) {
+    option.value = identity.npub; option.selected = index === 0; fSuspend.append(option);
+  });
+  if (!people.length) {
     const option = el('option', null, 'No local approval identity'); option.value = ''; fSuspend.append(option);
   }
   const fDraft = el('input'); fDraft.type = 'checkbox'; fDraft.style.width = 'auto';
@@ -2219,7 +2380,9 @@ function renderFound(c) {
   const st = el('span', 'meta', '');
   const r4 = el('div', 'row'); r4.append(draftLabel, go, st);
   sec.append(field('Agent name', fName), field('Purpose', fPurpose),
-    field('Approved by', fSuspend, owners.length ? 'The agent cannot approve its own permissions.' : 'Create an approval identity during first-run setup or use the CLI for an external key.'),
+    field('Managed by', fSuspend, people.length
+      ? 'Choose one or more people. Each selected person can independently approve or stop this agent.'
+      : 'Create an approval identity or add an external Nostr ID under People & access.'),
     r4, help(hostStatus.anthropic_key_present
       ? 'The model can tailor routing and budgets to the purpose. You will review all changes before approval.'
       : 'No host model credential is configured, so Apiary will use its conservative template.'));
@@ -2227,14 +2390,15 @@ function renderFound(c) {
   go.onclick = async () => {
     if (!fName.value.trim()) { st.textContent = 'Enter an agent name.'; fName.focus(); return; }
     if (!fPurpose.value.trim()) { st.textContent = 'Describe the agent’s purpose.'; fPurpose.focus(); return; }
-    if (!fSuspend.value) { st.textContent = 'No approval identity is available on this host.'; fSuspend.focus(); return; }
+    const selectedManagers = [...fSuspend.selectedOptions].map(option => option.value).filter(Boolean);
+    if (!selectedManagers.length) { st.textContent = 'Choose at least one manager.'; fSuspend.focus(); return; }
     go.disabled = true; st.textContent = 'Creating the identity and draft configuration…';
     const r = await j('/api/agents/found', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         name: fName.value.trim(),
         purpose: fPurpose.value.trim(),
-        suspend_keys: [fSuspend.value],
+        suspend_keys: selectedManagers,
         draft_with: fDraft.checked ? 'anthropic' : null,
       }),
     });
@@ -2290,5 +2454,5 @@ function renderImport(c) {
   };
 }
 
-loadStatus().then(loadOwners).then(loadRoster).then(render);
+loadStatus().then(() => Promise.all([loadOwners(), loadManagers()])).then(loadRoster).then(render);
 setInterval(loadStatus, 15000);

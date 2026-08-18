@@ -26,9 +26,9 @@ struct Args {
     /// (default: http://<bind>). Must match what clients see exactly.
     #[arg(long)]
     origin: Option<String>,
-    /// Host administrator npubs (nip98 mode): required for host-scoped
-    /// operations — founding, importing, connector library, lock/unlock.
-    /// Repeatable. Without any, those operations refuse in nip98 mode.
+    /// Bootstrap host-manager npubs (nip98 mode). Repeatable. Managers added
+    /// later in People & access persist, so this flag is only required for
+    /// first setup or recovery.
     #[arg(long = "admin")]
     admins: Vec<String>,
 }
@@ -64,6 +64,11 @@ async fn main() {
             eprintln!("error: --admin: {e}");
             std::process::exit(2);
         });
+    let managers =
+        apiary_hostd::access::ManagerRegistry::load(&args.home, admins).unwrap_or_else(|error| {
+            eprintln!("error: host manager registry: {error}");
+            std::process::exit(2);
+        });
     let state = Arc::new(AppState {
         home: args.home.clone(),
         passphrase: std::sync::RwLock::new(args.passphrase.clone()),
@@ -80,7 +85,7 @@ async fn main() {
         pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
         supervisor_notes: std::sync::Mutex::new(std::collections::HashMap::new()),
         admitted: std::sync::Mutex::new(std::collections::HashMap::new()),
-        admins,
+        managers: std::sync::RwLock::new(managers),
     });
     apiary_hostd::ops::spawn_supervisor(state.clone());
     let app = build_router(state);
