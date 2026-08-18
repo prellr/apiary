@@ -198,8 +198,9 @@ State lives in `~/.apiary` (`APIARY_HOME` to override). Never commit it.
 
 ## Desktop app (Tauri)
 
-The desktop app runs the full `apiary-hostd` router in-process on a loopback
-port and opens the cockpit in a native window. Tabs, each with inline
+In local mode the desktop app runs the full `apiary-hostd` router in-process on
+a loopback port and opens the cockpit in a native window. Remote mode connects
+the same cockpit to a headless host over SSH. Tabs, each with inline
 explanations:
 
 - **Overview** — identity (with rename), activation switch, governance
@@ -240,6 +241,46 @@ enables anthropic-routed runs and model-drafted foundings.
 The plain daemon (`apiary-hostd`) serves the same cockpit at `--bind` for
 headless hosts; add `--auth nip98` beyond localhost.
 
+### Remote desktop mode
+
+Apiary Desktop can operate a headless Apiary host over SSH. The daemon stays
+bound to the server's loopback interface, SSH supplies encryption and host/user
+authentication, and all agent keys, credentials, channels, and inference stay
+on the server.
+
+On the server, run the normal headless daemon without exposing its port:
+
+```bash
+apiary-hostd --bind 127.0.0.1:7777 --auth open
+```
+
+On the Mac, connect to the server once in Terminal so its host key is in
+`known_hosts`, then create `~/.apiary/desktop-config.json`:
+
+```json
+{
+  "mode": "remote",
+  "remote": {
+    "ssh_target": "apiary@example.com",
+    "remote_port": 7777,
+    "local_port": 7777
+  }
+}
+```
+
+Launch Apiary normally. It opens a noninteractive, loopback-only SSH tunnel and
+labels the cockpit with the connected server. SSH agent keys are used by
+default; `ssh_port` and `identity_file` are optional. Set `mode` to `local` (or
+remove the file) to return to the embedded host. The same port on each side is
+recommended because browser-based OAuth callbacks use the host's canonical
+origin. For a one-off remote launch, `APIARY_REMOTE_SSH=user@server` selects
+remote mode without a config file. File and vault paths entered in remote mode
+refer to the server's filesystem; the Mac folder picker is intentionally off.
+
+Do not bind the headless daemon to a public interface in this mode. Use `open`
+auth only when the daemon remains on server loopback and the SSH account plus
+trusted processes on both machines form the operator boundary.
+
 ## Layout
 
 ```
@@ -247,7 +288,7 @@ crates/apiary-core      manifest, identity, custody, keystore, log, ceremony —
 crates/apiary-runtime   inference providers, routing, spend authority, run loop
 crates/apiary-cli       `apiary` — the host's JSON front door
 crates/apiary-hostd     lib + daemon: REST + AG-UI SSE + NIP-98 auth + cockpit at /
-crates/apiary-desktop   Tauri app: the hostd router in-process, cockpit in a native window
+crates/apiary-desktop   Tauri app: embedded local host or SSH-connected remote cockpit
 docs/SPEC.md            the design: architecture, governance, failure modes, phases
 ```
 

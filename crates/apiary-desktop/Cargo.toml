@@ -1,6 +1,6 @@
 [package]
 name = "apiary-desktop"
-description = "Apiary desktop app: the hostd router in-process, the cockpit in a native window"
+description = "Apiary desktop app: local embedded host or SSH-connected remote host"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -16,6 +16,7 @@ tauri-build = { version = "2", features = [] }
 apiary-core = { path = "../apiary-core" }
 apiary-hostd = { path = "../apiary-hostd" }
 axum = "0.8"
+serde.workspace = true
 serde_json.workspace = true
 zeroize.workspace = true
 tauri = { version = "2", features = [] }

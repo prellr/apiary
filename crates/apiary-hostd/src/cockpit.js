@@ -11,6 +11,7 @@ let listenerPoll = null;
 // Desktop mode hands the per-launch token in the boot URL; every API call
 // echoes it back in a header. Without a token this is a no-op.
 const TOKEN = new URLSearchParams(location.search).get('token');
+const REMOTE = new URLSearchParams(location.search).get('remote');
 function hdrs(extra) {
   const h = Object.assign({}, extra);
   if (TOKEN) h['x-apiary-token'] = TOKEN;
@@ -111,7 +112,9 @@ async function loadStatus() {
   set('c-ver', 'Apiary v' + (hostStatus.version || '?'));
   document.getElementById('c-home').title = 'state directory: ' + (hostStatus.home || '?');
   set('c-home', 'State · ' + ((hostStatus.home || '?').split('/').filter(Boolean).pop() || '/'));
-  set('c-auth', 'Authentication · ' + (hostStatus.auth || '?') + (hostStatus.token_gated ? ' + token' : ''));
+  set('c-auth', 'Authentication · ' + (hostStatus.auth || '?')
+      + (hostStatus.token_gated ? ' + token' : '')
+      + (REMOTE ? ' · SSH → ' + REMOTE : ''));
   set('c-model', hostStatus.anthropic_key_present ? 'Drafting model ready' : 'Drafting model unavailable',
       'chip ' + (hostStatus.anthropic_key_present ? 'ok' : ''));
   document.getElementById('c-model').title = hostStatus.anthropic_key_present

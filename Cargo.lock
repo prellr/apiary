@@ -153,6 +153,7 @@ dependencies = [
  "apiary-hostd",
  "axum",
  "security-framework",
+ "serde",
  "serde_json",
  "tauri",
  "tauri-build",
