@@ -10,6 +10,7 @@
 //! caller must bind it to the operation (governorship) — see `authorize`.
 
 use crate::{AppState, AuthMode};
+use apiary_core::manifest::{ManagerRole, Manifest};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use base64::Engine;
@@ -20,6 +21,128 @@ const NIP98_KIND: u16 = 27235;
 const CONTROL_TOKEN_KIND: u16 = 27236;
 const FRESHNESS_SECS: u64 = 60;
 const MAX_CONTROL_TOKEN_SECS: u64 = 90 * 24 * 60 * 60;
+const CONTROL_TOKEN_REGISTRY: &str = "control-tokens.json";
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ControlTokenFile {
+    version: u32,
+    tokens: Vec<ControlTokenRecord>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlTokenRecord {
+    pub id: String,
+    pub agent: String,
+    pub label: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub revoked_at: Option<u64>,
+}
+
+fn load_control_tokens(state: &AppState) -> Result<ControlTokenFile, String> {
+    let path = state.home.join(CONTROL_TOKEN_REGISTRY);
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => {
+            let file: ControlTokenFile = serde_json::from_str(&raw)
+                .map_err(|error| format!("{} is invalid: {error}", path.display()))?;
+            if file.version != 1 {
+                return Err(format!(
+                    "{} has unsupported version {}",
+                    path.display(),
+                    file.version
+                ));
+            }
+            Ok(file)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ControlTokenFile {
+            version: 1,
+            tokens: Vec::new(),
+        }),
+        Err(error) => Err(format!("could not read {}: {error}", path.display())),
+    }
+}
+
+fn save_control_tokens(state: &AppState, file: &ControlTokenFile) -> Result<(), String> {
+    std::fs::create_dir_all(&state.home).map_err(|error| error.to_string())?;
+    let path = state.home.join(CONTROL_TOKEN_REGISTRY);
+    let temporary = state.home.join("control-tokens.json.tmp");
+    let body = serde_json::to_vec_pretty(file).map_err(|error| error.to_string())?;
+    std::fs::write(&temporary, body).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| error.to_string())?;
+    }
+    std::fs::rename(&temporary, &path).map_err(|error| error.to_string())
+}
+
+pub fn register_control_token(state: &AppState, record: ControlTokenRecord) -> Result<(), String> {
+    let _guard = state
+        .control_tokens
+        .lock()
+        .map_err(|_| "control-token registry is unavailable".to_string())?;
+    let mut file = load_control_tokens(state)?;
+    if file.tokens.iter().any(|token| token.id == record.id) {
+        return Err("control-token ID collision".into());
+    }
+    file.tokens.push(record);
+    save_control_tokens(state, &file)
+}
+
+pub fn list_control_tokens(
+    state: &AppState,
+    agent: &str,
+) -> Result<Vec<ControlTokenRecord>, String> {
+    let _guard = state
+        .control_tokens
+        .lock()
+        .map_err(|_| "control-token registry is unavailable".to_string())?;
+    let mut tokens = load_control_tokens(state)?
+        .tokens
+        .into_iter()
+        .filter(|token| token.agent == agent)
+        .collect::<Vec<_>>();
+    tokens.sort_by_key(|token| std::cmp::Reverse(token.created_at));
+    Ok(tokens)
+}
+
+pub fn list_all_control_tokens(state: &AppState) -> Result<Vec<ControlTokenRecord>, String> {
+    let _guard = state
+        .control_tokens
+        .lock()
+        .map_err(|_| "control-token registry is unavailable".to_string())?;
+    let mut tokens = load_control_tokens(state)?.tokens;
+    tokens.sort_by_key(|token| std::cmp::Reverse(token.created_at));
+    Ok(tokens)
+}
+
+pub fn revoke_control_token(
+    state: &AppState,
+    agent: &str,
+    id: &str,
+) -> Result<ControlTokenRecord, String> {
+    let _guard = state
+        .control_tokens
+        .lock()
+        .map_err(|_| "control-token registry is unavailable".to_string())?;
+    let mut file = load_control_tokens(state)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let token = file
+        .tokens
+        .iter_mut()
+        .find(|token| token.agent == agent && token.id == id)
+        .ok_or_else(|| "control token not found for this agent".to_string())?;
+    token.revoked_at.get_or_insert(now);
+    let result = token.clone();
+    save_control_tokens(state, &file)?;
+    Ok(result)
+}
 
 fn constant_time_eq(presented: &str, expected: &str) -> bool {
     presented.len() == expected.len()
@@ -56,7 +179,7 @@ pub fn issue_control_token(
     handle: &apiary_core::custody::AgentHandle,
     host_id: &str,
     expires_in_secs: u64,
-) -> Result<(String, u64), apiary_core::Error> {
+) -> Result<(String, ControlTokenRecord), apiary_core::Error> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -71,7 +194,18 @@ pub fn issue_control_token(
             .tag(Tag::custom("exp", vec![expires_at.to_string()])),
     )?;
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(event.as_json());
-    Ok((format!("apiary_{encoded}"), expires_at))
+    let agent = apiary_core::identity::to_npub(&event.pubkey)?;
+    Ok((
+        format!("apiary_{encoded}"),
+        ControlTokenRecord {
+            id: event.id.to_hex(),
+            agent,
+            label: String::new(),
+            created_at: event.created_at.as_secs(),
+            expires_at,
+            revoked_at: None,
+        },
+    ))
 }
 
 fn verify_control_token(
@@ -120,6 +254,22 @@ fn verify_control_token(
         || expires_at.saturating_sub(event.created_at.as_secs()) > MAX_CONTROL_TOKEN_SECS
     {
         return Err(fail("lifetime is invalid"));
+    }
+    let id = event.id.to_hex();
+    let agent = apiary_core::identity::to_npub(&event.pubkey)
+        .map_err(|_| fail("agent identity is invalid"))?;
+    let _guard = state
+        .control_tokens
+        .lock()
+        .map_err(|_| fail("registry is unavailable"))?;
+    let file = load_control_tokens(state).map_err(|_| fail("registry is unavailable"))?;
+    let registered = file
+        .tokens
+        .iter()
+        .find(|token| token.id == id && token.agent == agent && token.expires_at == expires_at)
+        .ok_or_else(|| fail("not registered or invalidated by an upgrade"))?;
+    if registered.revoked_at.is_some() {
+        return Err(fail("revoked"));
     }
     Ok(event.pubkey)
 }
@@ -256,6 +406,92 @@ pub fn authorize_governor(
     }
 }
 
+fn role_for(manifest: &Manifest, signer: &PublicKey) -> Option<ManagerRole> {
+    if manifest
+        .governance
+        .suspend_keys
+        .iter()
+        .filter_map(|value| apiary_core::identity::parse_npub(value).ok())
+        .any(|key| key == *signer)
+    {
+        return Some(ManagerRole::Governor);
+    }
+    manifest.governance.managers.iter().find_map(|manager| {
+        apiary_core::identity::parse_npub(&manager.npub)
+            .ok()
+            .filter(|key| key == signer)
+            .map(|_| manager.role)
+    })
+}
+
+pub fn required_agent_role(method: &str, path_and_query: &str) -> ManagerRole {
+    let path = path_and_query.split('?').next().unwrap_or(path_and_query);
+    if method == "GET" {
+        return if path.ends_with("/control-tokens") {
+            ManagerRole::Governor
+        } else {
+            ManagerRole::Viewer
+        };
+    }
+    let governor_only = path.ends_with("/manifest")
+        || path.contains("/ratify")
+        || path.ends_with("/governors")
+        || path.contains("/control-token")
+        || path.contains("/credential/")
+        || path.ends_with("/export")
+        || path.ends_with("/connectors/oauth");
+    if governor_only {
+        return ManagerRole::Governor;
+    }
+    let operator = path.ends_with("/run")
+        || path.ends_with("/active")
+        || path.ends_with("/log/publish")
+        || path.ends_with("/buzz/post")
+        || path.ends_with("/lease/takeover")
+        || path.ends_with("/listener")
+        || (path.contains("/routines/")
+            && (path.ends_with("/run") || path.ends_with("/pause") || path.ends_with("/resume")));
+    if operator {
+        ManagerRole::Operator
+    } else {
+        ManagerRole::Editor
+    }
+}
+
+/// Authorize one per-agent request at the minimum role required by its route.
+/// Local signer-less desktop calls retain operator trust; explicit identities
+/// are always bound to the target agent's manifest, including in open mode.
+pub fn authorize_agent_request(
+    state: &AppState,
+    signer: Option<PublicKey>,
+    manifest: &Manifest,
+    method: &str,
+    path_and_query: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if state.auth == AuthMode::Open && signer.is_none() {
+        return Ok(());
+    }
+    let required = required_agent_role(method, path_and_query);
+    match signer.and_then(|signer| role_for(manifest, &signer)) {
+        Some(actual) if actual >= required => Ok(()),
+        Some(actual) => Err(crate::err(
+            StatusCode::FORBIDDEN,
+            format!(
+                "agent manager role {actual:?} cannot perform this operation; {required:?} is required"
+            )
+            .to_ascii_lowercase(),
+        )),
+        None if signer.is_some() => Err(crate::err(
+            StatusCode::FORBIDDEN,
+            "signer is not a manager of this agent",
+        )),
+        None => Err(crate::err(
+            StatusCode::UNAUTHORIZED,
+            "authentication required",
+        )),
+    }
+}
+
 /// Host-scoped authorization: in nip98 mode the signer must be a listed
 /// HOST MANAGER — being a valid nostr key (or even some agent's governor)
 /// grants nothing over the host itself. The registry combines bootstrap
@@ -296,11 +532,19 @@ pub fn authorize_admin(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn state(auth: AuthMode) -> AppState {
+        let home = std::env::temp_dir().join(format!(
+            "apiary-nip98-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
         AppState {
-            home: PathBuf::from("/tmp"),
+            home,
             passphrase: std::sync::RwLock::new(None),
             remember_passphrase: None,
             forget_passphrase: None,
@@ -310,6 +554,7 @@ mod tests {
             token: None,
             internal_token: "test-internal-token".into(),
             control_audit: std::sync::Mutex::new(()),
+            control_tokens: std::sync::Mutex::new(()),
             listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
             pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             managers: std::sync::RwLock::new(crate::access::ManagerRegistry::in_memory(Vec::new())),
@@ -437,7 +682,10 @@ mod tests {
         let mut custody = apiary_core::custody::Custody::new();
         let handle = custody.admit(keys);
         let host_id = apiary_runtime::lease::host_id(&s.home);
-        let (token, _) = issue_control_token(&custody, &handle, &host_id, 3600).unwrap();
+        let (token, record) = issue_control_token(&custody, &handle, &host_id, 3600).unwrap();
+        let token_id = record.id.clone();
+        let agent_npub = record.agent.clone();
+        register_control_token(&s, record).unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
         assert_eq!(
@@ -449,6 +697,126 @@ mod tests {
         wrong_host.home =
             std::env::temp_dir().join(format!("apiary-wrong-control-host-{}", std::process::id()));
         assert!(check_control(&wrong_host, &headers, "POST", "/mcp", None).is_err());
+        revoke_control_token(&s, &agent_npub, &token_id).unwrap();
+        assert!(check_control(&s, &headers, "POST", "/mcp", None).is_err());
+        let _ = std::fs::remove_dir_all(&s.home);
+    }
+
+    #[test]
+    fn agent_manager_roles_are_hierarchical_and_route_specific() {
+        use apiary_core::manifest::{ManagerGrant, ManagerRole, Manifest};
+
+        let agent = Keys::generate();
+        let governor = Keys::generate();
+        let viewer = Keys::generate();
+        let operator = Keys::generate();
+        let editor = Keys::generate();
+        let mut manifest = Manifest::from_yaml(&format!(
+            "manifest_version: 1\nidentity:\n  npub: {}\nmemory:\n  log: local\ngovernance:\n  suspend_keys:\n    - {}\n",
+            apiary_core::identity::to_npub(&agent.public_key()).unwrap(),
+            apiary_core::identity::to_npub(&governor.public_key()).unwrap(),
+        ))
+        .unwrap();
+        manifest.governance.managers = vec![
+            ManagerGrant {
+                npub: apiary_core::identity::to_npub(&viewer.public_key()).unwrap(),
+                role: ManagerRole::Viewer,
+            },
+            ManagerGrant {
+                npub: apiary_core::identity::to_npub(&operator.public_key()).unwrap(),
+                role: ManagerRole::Operator,
+            },
+            ManagerGrant {
+                npub: apiary_core::identity::to_npub(&editor.public_key()).unwrap(),
+                role: ManagerRole::Editor,
+            },
+        ];
+        manifest.validate().unwrap();
+        let s = state(AuthMode::Open);
+        assert!(authorize_agent_request(
+            &s,
+            Some(viewer.public_key()),
+            &manifest,
+            "GET",
+            "/api/agents/x/manifest"
+        )
+        .is_ok());
+        assert!(authorize_agent_request(
+            &s,
+            Some(viewer.public_key()),
+            &manifest,
+            "POST",
+            "/api/agents/x/run"
+        )
+        .is_err());
+        assert!(authorize_agent_request(
+            &s,
+            Some(operator.public_key()),
+            &manifest,
+            "POST",
+            "/api/agents/x/run"
+        )
+        .is_ok());
+        assert!(authorize_agent_request(
+            &s,
+            Some(operator.public_key()),
+            &manifest,
+            "POST",
+            "/api/agents/x/harnesses"
+        )
+        .is_err());
+        assert!(authorize_agent_request(
+            &s,
+            Some(editor.public_key()),
+            &manifest,
+            "POST",
+            "/api/agents/x/harnesses"
+        )
+        .is_ok());
+        assert!(authorize_agent_request(
+            &s,
+            Some(editor.public_key()),
+            &manifest,
+            "PUT",
+            "/api/agents/x/manifest"
+        )
+        .is_err());
+        assert!(authorize_agent_request(
+            &s,
+            Some(governor.public_key()),
+            &manifest,
+            "PUT",
+            "/api/agents/x/manifest"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn sensitive_agent_routes_require_governor_role() {
+        use apiary_core::manifest::ManagerRole;
+
+        assert_eq!(
+            required_agent_role("GET", "/api/agents/x/manifest"),
+            ManagerRole::Viewer
+        );
+        assert_eq!(
+            required_agent_role("POST", "/api/agents/x/run"),
+            ManagerRole::Operator
+        );
+        assert_eq!(
+            required_agent_role("POST", "/api/agents/x/connectors"),
+            ManagerRole::Editor
+        );
+        for (method, path) in [
+            ("PUT", "/api/agents/x/manifest"),
+            ("POST", "/api/agents/x/ratify"),
+            ("POST", "/api/agents/x/credential/seal"),
+            ("POST", "/api/agents/x/control-token"),
+            ("GET", "/api/agents/x/control-tokens"),
+            ("DELETE", "/api/agents/x/control-tokens/deadbeef"),
+        ] {
+            assert_eq!(required_agent_role(method, path), ManagerRole::Governor);
+        }
     }
 
     #[test]

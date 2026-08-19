@@ -70,6 +70,8 @@ pub struct AppState {
     pub internal_token: String,
     /// Serializes the hash-chained MCP control audit file.
     pub control_audit: std::sync::Mutex<()>,
+    /// Serializes the persistent control-token registry and revocation checks.
+    pub control_tokens: std::sync::Mutex<()>,
     /// Managed Buzz mention listeners, one per agent.
     pub listeners: std::sync::Mutex<std::collections::HashMap<String, ops::AgentPresence>>,
     /// In-flight OAuth grants, keyed by the `state` parameter.
@@ -144,6 +146,7 @@ pub fn build_router(state: App) -> Router {
         .route("/api/host/pick-folder", post(ops::pick_folder))
         .route("/api/events", get(events::events))
         .route("/api/control/audit", get(ops::control_audit_get))
+        .route("/api/control/tokens", get(ops::control_tokens_all_get))
         .route("/mcp", post(control_mcp::handle))
         .route(
             "/api/agents/{npub}/connectors/{name}/discover",
@@ -169,6 +172,14 @@ pub fn build_router(state: App) -> Router {
         .route(
             "/api/agents/{npub}/control-token",
             post(ops::control_token_issue),
+        )
+        .route(
+            "/api/agents/{npub}/control-tokens",
+            get(ops::control_tokens_get),
+        )
+        .route(
+            "/api/agents/{npub}/control-tokens/{id}",
+            axum::routing::delete(ops::control_token_revoke),
         )
         .route(
             "/api/agents/{npub}/constitution",
@@ -336,12 +347,23 @@ fn snapshot_approved_manifest(dir: &std::path::Path, raw: &str) -> std::io::Resu
 }
 
 pub fn suspend_pks(manifest: &Manifest) -> Vec<PublicKey> {
-    manifest
+    let mut keys = manifest
         .governance
         .suspend_keys
         .iter()
         .filter_map(|k| apiary_core::identity::parse_npub(k).ok())
-        .collect()
+        .collect::<Vec<_>>();
+    keys.extend(
+        manifest
+            .governance
+            .managers
+            .iter()
+            .filter(|manager| manager.role == apiary_core::manifest::ManagerRole::Governor)
+            .filter_map(|manager| apiary_core::identity::parse_npub(&manager.npub).ok()),
+    );
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 fn ratified(dir: &std::path::Path, npub: &str, raw: &str, manifest: &Manifest) -> bool {
@@ -384,7 +406,8 @@ async fn list_agents(
             continue;
         };
         // In nip98 mode the roster shows only agents the signer governs.
-        if nip98::authorize_governor(&state, signer, &suspend_pks(&m)).is_err() {
+        if nip98::authorize_agent_request(&state, signer, &m, "GET", &path_and_query(&uri)).is_err()
+        {
             continue;
         }
         let entries = EpisodicLog::open(&dir)
@@ -419,7 +442,9 @@ async fn get_manifest(
     };
     match load_manifest(&dir) {
         Ok((raw, m)) => {
-            if let Err(e) = nip98::authorize_governor(&state, signer, &suspend_pks(&m)) {
+            if let Err(e) =
+                nip98::authorize_agent_request(&state, signer, &m, "GET", &path_and_query(&uri))
+            {
                 return e.into_response();
             }
             Json(json!({
@@ -463,7 +488,9 @@ async fn get_log(
     };
     match load_manifest(&dir) {
         Ok((_, m)) => {
-            if let Err(e) = nip98::authorize_governor(&state, signer, &suspend_pks(&m)) {
+            if let Err(e) =
+                nip98::authorize_agent_request(&state, signer, &m, "GET", &path_and_query(&uri))
+            {
                 return e.into_response();
             }
         }
@@ -529,7 +556,13 @@ async fn put_manifest(
     // writing a manifest that names them.
     match load_manifest(&dir) {
         Ok((_, current)) => {
-            if let Err(e) = nip98::authorize_governor(&state, signer, &suspend_pks(&current)) {
+            if let Err(e) = nip98::authorize_agent_request(
+                &state,
+                signer,
+                &current,
+                "PUT",
+                &path_and_query(&uri),
+            ) {
                 return e.into_response();
             }
         }
@@ -599,6 +632,11 @@ async fn ratify_agent(
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
+    if let Err(e) =
+        nip98::authorize_agent_request(&state, signer, &manifest, "POST", &path_and_query(&uri))
+    {
+        return e.into_response();
+    }
     let as_key = match normalize(&body.r#as) {
         Ok(k) => k,
         Err(e) => return e.into_response(),
@@ -618,7 +656,7 @@ async fn ratify_agent(
     // A host-held governor key signs ONLY for the identity that proved possession
     // of that same key: in nip98 mode the request signer must BE the
     // ratifier. (Open mode is local trust — same as holding the keystore.)
-    if state.auth == AuthMode::Nip98 && signer != Some(ratifier_pk) {
+    if signer.is_some() && signer != Some(ratifier_pk) {
         return err(
             StatusCode::FORBIDDEN,
             "ratification must be signed by the ratifying key itself (as == request signer)",

@@ -106,8 +106,7 @@ pub async fn run_stream(
         Err(e) => return e.into_response(),
     };
     let suspend_keys = crate::suspend_pks(&manifest);
-    // Only a governor may make the agent act.
-    if let Err(e) = nip98::authorize_governor(&state, signer, &suspend_keys) {
+    if let Err(e) = nip98::authorize_agent_request(&state, signer, &manifest, "POST", &pq) {
         return e.into_response();
     }
     // Ratification gate — verified signatures, both parties, current hash.

@@ -624,10 +624,35 @@ pub struct Governance {
     /// (SPEC §8). An identity may belong to a person or a separate manager
     /// agent; suspension authority must never rest with this agent's own key.
     pub suspend_keys: Vec<String>,
+    /// Additional per-agent managers with explicitly bounded authority.
+    /// Existing `suspend_keys` are always governors for backward
+    /// compatibility and remain eligible to ratify constitutional changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub managers: Vec<ManagerGrant>,
     /// Unified spend authority: token budgets and money budgets are one
     /// system of human-owned floors enforced by the host core.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub budgets: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ManagerRole {
+    /// Inspect the agent's non-secret environment and audit-visible state.
+    Viewer,
+    /// Viewer rights plus runs, activation, delivery, and other operations.
+    Operator,
+    /// Operator rights plus proposing configuration amendments.
+    Editor,
+    /// Full per-agent authority, including managers, credentials, and ratification.
+    Governor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagerGrant {
+    pub npub: String,
+    pub role: ManagerRole,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -769,19 +794,51 @@ impl Manifest {
             )));
         }
         let agent_pk = crate::identity::parse_npub(&self.identity.npub)?;
-        if self.governance.suspend_keys.is_empty() {
+        let has_governor = !self.governance.suspend_keys.is_empty()
+            || self
+                .governance
+                .managers
+                .iter()
+                .any(|manager| manager.role == ManagerRole::Governor);
+        if !has_governor {
             return Err(crate::Error::Manifest(
-                "governance.suspend_keys must name at least one independent governor identity: \
+                "governance must name at least one independent governor identity: \
                  suspension authority can never rest with the agent's own key"
                     .into(),
             ));
         }
-        // Suspend keys must be valid keys and must not include the agent itself.
+        // Manager identities must be valid, unique, and independent from the
+        // agent itself. Duplicate declarations would make effective authority
+        // ambiguous, so fail closed rather than silently choosing a role.
+        let mut manager_keys = std::collections::BTreeSet::new();
         for k in &self.governance.suspend_keys {
             let pk = crate::identity::parse_npub(k)?;
             if pk == agent_pk {
                 return Err(crate::Error::Manifest(
                     "agent's own key cannot be a suspend key".into(),
+                ));
+            }
+            if !manager_keys.insert(pk) {
+                return Err(crate::Error::Manifest(
+                    "duplicate governance manager identity".into(),
+                ));
+            }
+        }
+        if self.governance.managers.len() > 256 {
+            return Err(crate::Error::Manifest(
+                "governance may declare at most 256 managers".into(),
+            ));
+        }
+        for manager in &self.governance.managers {
+            let pk = crate::identity::parse_npub(&manager.npub)?;
+            if pk == agent_pk {
+                return Err(crate::Error::Manifest(
+                    "agent's own key cannot manage itself".into(),
+                ));
+            }
+            if !manager_keys.insert(pk) {
+                return Err(crate::Error::Manifest(
+                    "duplicate governance manager identity".into(),
                 ));
             }
         }
@@ -973,6 +1030,31 @@ mod tests {
         bad.metering = HarnessMetering::Strict;
         bad.estimated_tokens_per_run = Some(100);
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn scoped_manager_roles_require_an_independent_governor() {
+        let mut manifest = Manifest::from_yaml(&minimal_yaml()).unwrap();
+        let governor = identity::to_npub(&Keys::generate().public_key()).unwrap();
+        let viewer = identity::to_npub(&Keys::generate().public_key()).unwrap();
+        manifest.governance.suspend_keys.clear();
+        manifest.governance.managers = vec![ManagerGrant {
+            npub: viewer,
+            role: ManagerRole::Viewer,
+        }];
+        assert!(manifest.validate().is_err());
+        manifest.governance.managers.push(ManagerGrant {
+            npub: governor.clone(),
+            role: ManagerRole::Governor,
+        });
+        manifest.validate().unwrap();
+
+        manifest.governance.suspend_keys = vec![governor];
+        assert!(manifest.validate().is_err());
+
+        manifest.governance.suspend_keys.clear();
+        manifest.governance.managers[1].npub = manifest.identity.npub.clone();
+        assert!(manifest.validate().is_err());
     }
 
     #[test]

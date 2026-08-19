@@ -404,6 +404,7 @@ async function render() {
   c.replaceChildren();
   if (hostView === 'library') return renderLibrary(c);
   if (hostView === 'managers') return renderManagers(c);
+  if (hostView === 'audit') return renderControlAudit(c);
   if (hostView === 'found') return renderFound(c);
   if (hostView === 'import') return renderImport(c);
   if (!sel && !agents.length) return renderWelcome(c);
@@ -530,7 +531,11 @@ async function ratifyBanner(c) {
   box.append(el('h2', null, 'Review changes before this agent can run'),
     help(`${a.name || 'This agent'} is paused because its configuration has not been approved. Apiary will show you the effective setup and the exact file changes before signing.`));
   const d = await j(api('/manifest'));
-  const keys = (d.ok && d.manifest && d.manifest.governance && d.manifest.governance.suspend_keys) || [];
+  const governance = (d.ok && d.manifest && d.manifest.governance) || {};
+  const keys = [
+    ...(governance.suspend_keys || []),
+    ...(governance.managers || []).filter(manager => manager.role === 'governor').map(manager => manager.npub),
+  ];
   const holders = ownerHolders(keys);
   const row = el('div', 'row');
   const review = el('button', 'btn solid', 'Review changes');
@@ -558,7 +563,7 @@ async function ratifyBanner(c) {
     summary.append(technical); box.append(summary);
 
     if (!holders.length) {
-      st.textContent = 'Approval is unavailable here. Add a key listed under governance.suspend_keys, or use the external approval tools in Configuration.';
+      st.textContent = 'Approval is unavailable here. Add a locally held identity with the governor role, or use external approval tools in Configuration.';
       const open = el('button', 'btn', 'Open Configuration');
       open.onclick = () => openTab('manifest');
       box.append(open);
@@ -649,7 +654,9 @@ function quick(title, description, target) {
 
 async function renderOverview(c) {
   await proposalBanner(c);
-  const [d, spend, listener] = await Promise.all([j(api('/manifest')), j(api('/spend')), j(api('/listener'))]);
+  const [d, spend, listener, controlTokens] = await Promise.all([
+    j(api('/manifest')), j(api('/spend')), j(api('/listener')), j(api('/control-tokens')),
+  ]);
   if (!d.ok) { c.append(el('div', 'ev err', 'Could not load this agent: ' + d.error)); return; }
   const m = d.manifest || {};
   const roster = agents.find(a => a.npub === sel) || {};
@@ -721,39 +728,64 @@ async function renderOverview(c) {
   };
   c.append(character);
 
-  const governorKeys = ((m.governance || {}).suspend_keys || []);
+  const governanceConfig = m.governance || {};
+  const roleByKey = new Map();
+  for (const key of (governanceConfig.suspend_keys || [])) roleByKey.set(key, 'governor');
+  for (const manager of (governanceConfig.managers || [])) roleByKey.set(manager.npub, manager.role);
   const people = agentManagerCandidates(sel);
   const knownKeys = new Set(people.map(person => person.npub));
   const governance = section('Agent managers',
-    'These identities can independently approve configuration changes, stop this agent, and ask it to act. A manager may be a person or another Apiary agent. Host access is separate, and the agent cannot manage itself.');
-  const checks = [];
+    'Authority belongs to this agent, not the whole host. Viewers inspect, operators can run it, editors can propose amendments, and governors manage credentials and approve constitutional changes.');
+  const roleChoices = [
+    ['none', 'No access'], ['viewer', 'Viewer'], ['operator', 'Operator'],
+    ['editor', 'Editor'], ['governor', 'Governor'],
+  ];
+  const roleControls = [];
   for (const person of people) {
-    const checkbox = el('input'); checkbox.type = 'checkbox'; checkbox.style.width = 'auto';
-    checkbox.checked = governorKeys.includes(person.npub);
+    const select = el('select'); select.setAttribute('aria-label', `Role for ${person.name || person.npub}`);
+    for (const [value, label] of roleChoices) {
+      const option = el('option', null, label); option.value = value; select.append(option);
+    }
+    select.value = roleByKey.get(person.npub) || 'none';
     const label = el('label', 'row');
-    label.append(checkbox, el('span', null, person.name || person.npub.slice(0, 16)),
+    label.append(select, el('span', null, person.name || person.npub.slice(0, 16)),
       el('code', null, person.npub),
       el('span', 'meta', person.identityKind === 'agent' ? 'Apiary agent' :
         managers.some(manager => manager.npub === person.npub) ? 'host manager' : 'person'));
-    governance.append(label); checks.push([checkbox, person.npub]);
+    governance.append(label); roleControls.push([select, person.npub]);
   }
   const other = el('textarea', 'address-list'); other.rows = 3;
-  other.placeholder = 'npub1… (one per line)';
-  other.value = governorKeys.filter(key => !knownKeys.has(key)).join('\n');
+  other.placeholder = 'npub1… viewer|operator|editor|governor';
+  other.value = [...roleByKey.entries()]
+    .filter(([key]) => !knownKeys.has(key))
+    .map(([key, role]) => `${key} ${role}`)
+    .join('\n');
   const saveManagers = el('button', 'btn', 'Save agent managers');
   const managerStatus = el('span', 'meta', '');
   const managerRow = el('div', 'row'); managerRow.append(saveManagers, managerStatus);
-  governance.append(field('Other Nostr IDs', other, 'For people or agent identities that should govern this agent without receiving host-wide access.'),
+  governance.append(field('Other Nostr IDs', other, 'One per line as “npub role”. A missing role defaults to governor for compatibility.'),
     help('Changing this list is a constitutional amendment: Apiary pauses the agent until one of the newly listed managers approves it.'),
     managerRow);
   saveManagers.onclick = async () => {
-    const selected = checks.filter(([checkbox]) => checkbox.checked).map(([, npub]) => npub);
-    const additional = other.value.split(/[\n,]+/).map(value => value.trim()).filter(Boolean);
-    const npubs = [...new Set([...selected, ...additional])];
-    if (!npubs.length) { managerStatus.textContent = 'At least one agent manager is required.'; return; }
+    const selected = roleControls
+      .filter(([select]) => select.value !== 'none')
+      .map(([select, npub]) => ({npub, role: select.value}));
+    const additional = [];
+    for (const line of other.value.split('\n').map(value => value.trim()).filter(Boolean)) {
+      const parts = line.split(/\s+/); const npub = parts[0];
+      const role = roleChoices.some(([value]) => value === parts[1] && value !== 'none') ? parts[1] : 'governor';
+      additional.push({npub, role});
+    }
+    const roleManagers = [...selected, ...additional];
+    if (!roleManagers.some(manager => manager.role === 'governor')) {
+      managerStatus.textContent = 'At least one governor is required.'; return;
+    }
+    if (new Set(roleManagers.map(manager => manager.npub)).size !== roleManagers.length) {
+      managerStatus.textContent = 'Each identity may appear only once.'; return;
+    }
     saveManagers.disabled = true; managerStatus.textContent = 'Saving amendment…';
     const result = await j(api('/governors'), {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ npubs }),
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({managers: roleManagers}),
     });
     saveManagers.disabled = false;
     if (!result.ok) { managerStatus.textContent = 'Could not update managers: ' + result.error; return; }
@@ -850,25 +882,57 @@ async function renderOverview(c) {
   for (const [seconds, label] of [[3600, '1 hour'], [86400, '24 hours'], [604800, '7 days'], [2592000, '30 days'], [7776000, '90 days']]) {
     const option = el('option', null, label); option.value = String(seconds); if (seconds === 86400) option.selected = true; ttl.append(option);
   }
+  const tokenLabel = el('input'); tokenLabel.placeholder = 'e.g. Scout manager loop'; tokenLabel.maxLength = 80;
   const createToken = el('button', 'btn', 'Create MCP access token');
   const tokenStatus = el('span', 'meta', '');
   const tokenOutput = el('textarea', 'address-list'); tokenOutput.rows = 4; tokenOutput.readOnly = true;
   tokenOutput.placeholder = 'The token is shown here once created.';
   const tokenUrl = el('input'); tokenUrl.readOnly = true; tokenUrl.placeholder = 'MCP URL';
+  const tokenList = el('div');
+  const drawTokens = tokens => {
+    tokenList.replaceChildren();
+    if (!tokens.length) { tokenList.append(el('div', 'none', 'No recorded management tokens')); return; }
+    for (const token of tokens) {
+      const card = el('div', 'item');
+      const state = token.active ? 'active' : token.revoked_at ? 'revoked' : 'expired';
+      card.append(el('b', null, token.label || 'Unlabeled token'),
+        kv('state', state), kv('ID', token.id.slice(0, 16) + '…'),
+        kv('created', new Date(token.created_at * 1000).toLocaleString()),
+        kv('expires', new Date(token.expires_at * 1000).toLocaleString()));
+      if (token.active) {
+        const revoke = el('button', 'btn danger', 'Revoke');
+        revoke.onclick = async () => {
+          if (!confirm(`Revoke ${token.label || token.id.slice(0, 12)} now?`)) return;
+          revoke.disabled = true;
+          const result = await j(api('/control-tokens/' + encodeURIComponent(token.id)), {method: 'DELETE'});
+          if (!result.ok) { revoke.disabled = false; tokenStatus.textContent = 'Could not revoke: ' + result.error; return; }
+          tokenStatus.textContent = 'Token revoked immediately.';
+          const refreshed = await j(api('/control-tokens'));
+          drawTokens(refreshed.ok ? (refreshed.tokens || []) : []);
+        };
+        card.append(revoke);
+      }
+      tokenList.append(card);
+    }
+  };
+  drawTokens(controlTokens.ok ? (controlTokens.tokens || []) : []);
   createToken.onclick = async () => {
     createToken.disabled = true; tokenStatus.textContent = 'Signing token…';
     const result = await j(api('/control-token'), {
       method: 'POST', headers: {'content-type': 'application/json'},
-      body: JSON.stringify({expires_in_seconds: Number(ttl.value)}),
+      body: JSON.stringify({expires_in_seconds: Number(ttl.value), label: tokenLabel.value.trim()}),
     });
     createToken.disabled = false;
     if (!result.ok) { tokenStatus.textContent = 'Could not create token: ' + result.error; return; }
     tokenOutput.value = result.token; tokenUrl.value = result.mcp_url;
     tokenStatus.textContent = 'Created. Copy it now and store it only as this agent’s sealed MCP credential.';
+    const refreshed = await j(api('/control-tokens'));
+    drawTokens(refreshed.ok ? (refreshed.tokens || []) : []);
   };
   const tokenRow = el('div', 'row'); tokenRow.append(ttl, createToken, tokenStatus);
-  control.append(tokenRow, field('MCP URL', tokenUrl), field('Bearer credential', tokenOutput),
-    help('This token acts as the agent. Removing the agent from another agent’s manager list revokes that relationship immediately; the token itself expires at the selected time.'));
+  control.append(field('Label', tokenLabel), tokenRow, field('MCP URL', tokenUrl), field('Bearer credential', tokenOutput),
+    help('The bearer is shown only when created. It can be revoked below before expiry; removing this agent from a target’s manager list also removes that relationship immediately.'),
+    el('h4', null, 'Token history'), tokenList);
   c.append(control);
 
   const active = section('Always-on presence', declared.length
@@ -1474,7 +1538,8 @@ async function renderManifest(c) {
     ['memory.index', 'semantic index location (local)'],
     ['memory.log_relays[]', 'nostr relays the log publishes to (tier-enforced)'],
     ['presence.buzz', 'standing workspace membership: {relay, trigger?}. Constitutional — where the agent lives is ratified. While the agent is ACTIVE (Overview), the host supervises its mention listener.'],
-    ['governance.suspend_keys[]', 'human governor npubs — ratifiers; at least one required'],
+    ['governance.suspend_keys[]', 'legacy/full governor npubs — ratifiers; at least one governor is required'],
+    ['governance.managers[]', 'scoped viewer, operator, editor, or governor identities'],
     ['governance.budgets.tokens_per_day', 'hard daily token ceiling, enforced by atomic reservations'],
     ['lease', 'which host runs the agent: relay-event heartbeats, takeover policy (contested-human = a person resolves disputes), timings'],
   ];
@@ -1506,7 +1571,7 @@ async function renderManifest(c) {
   const extBody = el('div');
   extBody.append(help('For governors who keep their master nostr key outside this host: export the unsigned ratification event, sign it with your own tooling (nak, a NIP-07 extension, a signer app), and import the signed event. The keystore never sees the key.'));
   const exRow = el('div', 'row');
-  const exKey = el('input', 'grow'); exKey.placeholder = 'external governor key (npub or hex, must be a listed suspend key)';
+  const exKey = el('input', 'grow'); exKey.placeholder = 'external governor key (npub or hex, must have governor role)';
   const exGo = el('button', 'btn', 'EXPORT UNSIGNED EVENT');
   exRow.append(exKey, exGo);
   const exOut = el('pre'); exOut.style.display = 'none';
@@ -2621,6 +2686,11 @@ document.getElementById('managerstoggle').onclick = () => {
   document.querySelectorAll('nav button').forEach(x => x.classList.remove('sel'));
   render();
 };
+document.getElementById('audittoggle').onclick = () => {
+  hostView = 'audit';
+  document.querySelectorAll('nav button').forEach(x => x.classList.remove('sel'));
+  render();
+};
 document.getElementById('libtoggle').onclick = () => {
   hostView = 'library';
   document.querySelectorAll('nav button').forEach(x => x.classList.remove('sel'));
@@ -2636,6 +2706,55 @@ document.getElementById('importtoggle').onclick = () => {
   document.querySelectorAll('nav button').forEach(x => x.classList.remove('sel'));
   render();
 };
+
+// ------------------------------------------------------ people and access
+
+async function renderControlAudit(c) {
+  const head = el('div', 'page-head');
+  head.append(el('div', 'eyebrow', 'Host security'),
+    el('h2', 'page-title', 'Management audit'),
+    el('p', 'page-lede', 'Hash-chained MCP management calls. Request bodies and bearer credentials are never recorded.'));
+  c.append(head);
+  const [result, tokenHistory] = await Promise.all([
+    j('/api/control/audit?tail=250'), j('/api/control/tokens'),
+  ]);
+  if (!result.ok) { c.append(el('div', 'ev err', 'Audit unavailable: ' + result.error)); return; }
+  const audit = section('Recent control activity', 'Newest first. The actor is the authenticated Nostr identity or the trusted local desktop operator.');
+  const chain = result.chain || {};
+  audit.append(el('div', chain.valid ? 'state ready' : 'ev err', chain.valid
+    ? `Audit chain verified · ${chain.entries || 0} entries`
+    : `Audit chain failed verification · ${chain.error || 'unknown error'}`));
+  if (!(result.entries || []).length) audit.append(el('div', 'none', 'No MCP management calls recorded'));
+  for (const entry of (result.entries || [])) {
+    const summary = entry.summary || {};
+    const target = summary.agent || summary.path || '—';
+    const card = el('div', 'item');
+    card.append(el('b', null, entry.tool || 'unknown operation'),
+      kv('result', entry.status || 'unknown'),
+      kv('actor', entry.caller || 'unknown'),
+      kv('target', typeof target === 'string' ? target : JSON.stringify(target)),
+      kv('request', [summary.method, summary.path].filter(Boolean).join(' ') || 'convenience tool'),
+      kv('time', entry.at ? new Date(entry.at * 1000).toLocaleString() : '—'),
+      kv('chain hash', entry.hash ? entry.hash.slice(0, 20) + '…' : '—'));
+    audit.append(card);
+  }
+  c.append(audit);
+  if (tokenHistory.ok) {
+    const lifecycle = section('Management-token lifecycle', 'Active, expired, and revoked agent credentials. Token plaintext is never retained.');
+    if (!(tokenHistory.tokens || []).length) lifecycle.append(el('div', 'none', 'No management tokens recorded'));
+    for (const token of (tokenHistory.tokens || [])) {
+      const state = token.active ? 'active' : token.revoked_at ? 'revoked' : 'expired';
+      const card = el('div', 'item');
+      card.append(el('b', null, token.label || 'Unlabeled token'),
+        kv('state', state), kv('agent', token.agent), kv('ID', token.id.slice(0, 20) + '…'),
+        kv('created', new Date(token.created_at * 1000).toLocaleString()),
+        kv('expires', new Date(token.expires_at * 1000).toLocaleString()),
+        token.revoked_at ? kv('revoked', new Date(token.revoked_at * 1000).toLocaleString()) : el('span'));
+      lifecycle.append(card);
+    }
+    c.append(lifecycle);
+  }
+}
 
 // ------------------------------------------------------ people and access
 
@@ -2688,7 +2807,7 @@ function renderManagers(c) {
   const status = el('span', 'meta', '');
   const row = el('div', 'row'); row.append(go, status);
   add.append(field('Name', name), field('Nostr ID', npub),
-    help('Granting access does not automatically add this person to existing agents. Add their npub to an agent’s governance.suspend_keys when they should govern that agent too.'),
+    help('Granting host access does not automatically add this identity to existing agents. Assign its per-agent role from that agent’s overview.'),
     row);
   go.onclick = async () => {
     if (!name.value.trim()) { status.textContent = 'Enter a name.'; name.focus(); return; }

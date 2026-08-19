@@ -323,10 +323,12 @@ trusted processes on both machines form the operator boundary.
   credentials, and lock state. Add them by public `npub` or hex key. Apiary
   stores only the public identity in `~/.apiary/host-managers.json`; each person
   keeps their private key in their own signer.
-- **Agent managers** are the `governance.suspend_keys` on one agent. An entry
-  may identify a person or a separate Apiary agent. It can approve, stop, and
-  operate that agent without automatically receiving access to the rest of the
-  host. An agent can never name its own identity as a manager.
+- **Agent managers** are scoped to one agent and may identify a person or a
+  separate Apiary agent. `viewer` can inspect, `operator` can also run and
+  activate, `editor` can also propose inert amendments, and `governor` can
+  manage credentials, roles, and ratification. Existing
+  `governance.suspend_keys` remain governors; narrower roles live in
+  `governance.managers`. An agent can never name itself as a manager.
 
 New and existing agents can name multiple people. Each listed person has
 independent authority; this is an allowlist, not M-of-N approval. Changing an
@@ -356,8 +358,11 @@ use **Agent management access → Create MCP access token**, and store the
 result only as that agent's sealed MCP bearer credential. The token is an
 event signed by the agent, scoped to this Apiary installation's stable host
 identity (so a desktop port change does not invalidate it), and
-expires after 1–90 days. It identifies the caller but grants nothing by
-itself: add the manager agent's npub to each target agent separately.
+expires after 1–90 days. Every issued token has a non-secret registry record;
+the cockpit lists active, expired, and revoked credentials and can revoke an
+active token immediately. Tokens issued before this registry was introduced
+are invalidated. A token identifies the caller but grants nothing by itself:
+add the manager agent's npub and role to each target agent separately.
 
 Example HTTP MCP configuration:
 
@@ -415,8 +420,9 @@ the Run page selects only a manifest-granted harness name. CLI overrides may
 assert the exact command/arguments but cannot widen the ratified access.
 Profile isolation prevents accidental global configuration inheritance; the
 separate sandbox controls are enforced across the harness process tree by
-macOS Seatbelt. Requested restrictions fail closed on hosts without a
-supported backend. `read-only` blocks writes but does not hide readable files;
+macOS Seatbelt or Linux Bubblewrap. A Linux host refuses a requested sandbox
+before launch when `bwrap` is unavailable; other unsupported hosts likewise
+fail closed. `read-only` blocks writes but does not hide readable files;
 `no-network` blocks network access but does not restrict files. A full inherited
 profile with sandbox `none` is therefore a legitimate, visibly broad grant.
 For Goose, Apiary also pins `GOOSE_MODE` to `chat`, `approve`, or `auto` from

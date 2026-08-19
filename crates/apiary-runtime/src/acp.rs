@@ -101,7 +101,40 @@ fn sandboxed_command(
         process.args(["-p", profile, command]).args(args);
         Ok(process)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        let executable = std::env::var_os("PATH")
+            .and_then(|path| {
+                std::env::split_paths(&path)
+                    .map(|directory| directory.join("bwrap"))
+                    .find(|candidate| candidate.is_file())
+            })
+            .ok_or_else(|| {
+                crate::Error::Provider(
+                    "OS sandbox requested, but Bubblewrap (bwrap) is not installed".into(),
+                )
+            })?;
+        let mut process = Command::new(executable);
+        process.args(["--die-with-parent", "--new-session"]);
+        match sandbox {
+            SandboxMode::ReadOnly | SandboxMode::ReadOnlyNoNetwork => {
+                process.args(["--ro-bind", "/", "/"]);
+            }
+            SandboxMode::NoNetwork => {
+                process.args(["--bind", "/", "/"]);
+            }
+            SandboxMode::None => unreachable!("handled above"),
+        }
+        if matches!(
+            sandbox,
+            SandboxMode::NoNetwork | SandboxMode::ReadOnlyNoNetwork
+        ) {
+            process.arg("--unshare-net");
+        }
+        process.arg("--").arg(command).args(args);
+        Ok(process)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (command, args);
         Err(crate::Error::Provider(format!(

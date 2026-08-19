@@ -85,6 +85,7 @@ async fn main() {
             .secret_key()
             .to_secret_hex(),
         control_audit: std::sync::Mutex::new(()),
+        control_tokens: std::sync::Mutex::new(()),
         listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
         pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
         supervisor_notes: std::sync::Mutex::new(std::collections::HashMap::new()),

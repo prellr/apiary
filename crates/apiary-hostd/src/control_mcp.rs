@@ -208,7 +208,7 @@ fn describe() -> Value {
         "authentication": {
             "remote": "NIP-98 per request or Bearer apiary_<signed-control-token>",
             "desktop": "per-launch x-apiary-token or a signed control token",
-            "authorization": "agent operations require governance.suspend_keys membership; host operations require host-manager membership"
+            "authorization": "agent operations require the route's viewer/operator/editor/governor role; existing governance.suspend_keys are governors; host operations require host-manager membership"
         },
         "convenience_tools": ["apiary_list_agents", "apiary_get_agent_environment"],
         "request_tool": {
@@ -414,6 +414,7 @@ mod tests {
             token: None,
             internal_token: "control-mcp-test-internal".into(),
             control_audit: std::sync::Mutex::new(()),
+            control_tokens: std::sync::Mutex::new(()),
             listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
             pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             supervisor_notes: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -492,6 +493,20 @@ mod tests {
             value["result"]["structuredContent"]["body"]["agents"],
             json!([])
         );
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/control/audit?tail=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let audit: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(audit["chain"]["valid"], true);
+        assert_eq!(audit["chain"]["entries"], 1);
         let _ = std::fs::remove_dir_all(&state.home);
     }
 }

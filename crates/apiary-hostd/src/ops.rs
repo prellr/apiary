@@ -60,17 +60,89 @@ pub async fn control_audit_get(
     }
     let path = state.home.join("control-audit.jsonl");
     let lines = std::fs::read_to_string(path).unwrap_or_default();
-    let entries = lines
-        .lines()
+    let mut parsed = Vec::new();
+    let mut chain_error = None;
+    for (index, line) in lines.lines().enumerate() {
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(entry) => parsed.push(entry),
+            Err(error) => {
+                chain_error = Some(format!("entry {index} is invalid JSON: {error}"));
+                break;
+            }
+        }
+    }
+    let mut previous: Option<String> = None;
+    for (index, entry) in parsed.iter().enumerate() {
+        if chain_error.is_some() {
+            break;
+        }
+        let stored_previous = entry.get("prev").and_then(|value| value.as_str());
+        if stored_previous != previous.as_deref() {
+            chain_error = Some(format!("entry {index} has a broken previous-hash link"));
+            break;
+        }
+        let stored_hash = entry.get("hash").and_then(|value| value.as_str());
+        let mut unsigned = entry.clone();
+        if let Some(object) = unsigned.as_object_mut() {
+            object.remove("hash");
+        }
+        let computed = format!(
+            "{:x}",
+            sha2::Sha256::digest(unsigned.to_string().as_bytes())
+        );
+        if stored_hash != Some(computed.as_str()) {
+            chain_error = Some(format!("entry {index} has an invalid hash"));
+            break;
+        }
+        previous = Some(computed);
+    }
+    let total = parsed.len();
+    let entries = parsed
+        .into_iter()
         .rev()
         .take(query.tail.clamp(1, 1000))
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .collect::<Vec<_>>();
-    Json(json!({"ok": true, "entries": entries})).into_response()
+    Json(json!({
+        "ok": true,
+        "chain": {"valid": chain_error.is_none(), "entries": total, "error": chain_error},
+        "entries": entries,
+    }))
+    .into_response()
+}
+
+pub async fn control_tokens_all_get(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if let Err(error) = check_admin(&state, &headers, "GET", &uri, None) {
+        return error.into_response();
+    }
+    match nip98::list_all_control_tokens(&state) {
+        Ok(tokens) => {
+            let now = now_secs();
+            let tokens = tokens
+                .into_iter()
+                .map(|token| {
+                    json!({
+                        "id": token.id,
+                        "agent": token.agent,
+                        "label": token.label,
+                        "created_at": token.created_at,
+                        "expires_at": token.expires_at,
+                        "revoked_at": token.revoked_at,
+                        "active": token.revoked_at.is_none() && token.expires_at > now,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Json(json!({"ok": true, "tokens": tokens})).into_response()
+        }
+        Err(error) => err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
 }
 
 /// The common request gate: token/NIP-98 check, agent resolution, manifest
-/// load, governor authorization. Every per-agent endpoint goes through this.
+/// load, role authorization. Every per-agent endpoint goes through this.
 #[allow(clippy::type_complexity)]
 fn gate(
     state: &AppState,
@@ -96,7 +168,7 @@ fn gate(
     let signer = nip98::check(state, headers, method, &pq, body)?;
     let (ks, npub, dir) = agent_ctx(state, npub)?;
     let (raw, manifest) = load_manifest(&dir)?;
-    nip98::authorize_governor(state, signer, &suspend_pks(&manifest))?;
+    nip98::authorize_agent_request(state, signer, &manifest, method, &pq)?;
     Ok((ks, npub, dir, raw, manifest))
 }
 
@@ -362,12 +434,15 @@ pub async fn managers_remove(
 
 #[derive(serde::Deserialize)]
 pub struct GovernorsBody {
+    #[serde(default)]
     npubs: Vec<String>,
+    #[serde(default)]
+    managers: Vec<apiary_core::manifest::ManagerGrant>,
 }
 
-/// Replace an agent's governor allowlist. Authorization is checked against the
-/// current manifest before the amendment is written; the changed manifest is
-/// inert until one of the newly listed governors ratifies it.
+/// Replace an agent's manager roles. The legacy `npubs` shape remains accepted
+/// and treats every listed identity as a governor. Authorization is checked
+/// against the current manifest before the inert amendment is written.
 pub async fn governors_set(
     State(state): State<App>,
     AxPath(npub): AxPath<String>,
@@ -384,7 +459,29 @@ pub async fn governors_set(
         Ok(body) => body,
         Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
     };
-    if body.npubs.is_empty() {
+    if !body.npubs.is_empty() && !body.managers.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "send either legacy npubs or role-bearing managers, not both",
+        )
+        .into_response();
+    }
+    let requested = if body.managers.is_empty() {
+        body.npubs
+            .into_iter()
+            .map(|npub| apiary_core::manifest::ManagerGrant {
+                npub,
+                role: apiary_core::manifest::ManagerRole::Governor,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        body.managers
+    };
+    if requested.is_empty()
+        || !requested
+            .iter()
+            .any(|manager| manager.role == apiary_core::manifest::ManagerRole::Governor)
+    {
         return err(
             StatusCode::BAD_REQUEST,
             "at least one agent governor is required",
@@ -392,20 +489,38 @@ pub async fn governors_set(
         .into_response();
     }
     let mut seen = std::collections::HashSet::new();
-    let mut governors = Vec::new();
-    for raw in body.npubs {
-        let key = match apiary_core::identity::parse_npub(raw.trim()) {
+    let mut normalized = Vec::new();
+    for manager in requested {
+        let key = match apiary_core::identity::parse_npub(manager.npub.trim()) {
             Ok(key) => key,
             Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
         };
-        if seen.insert(key) {
-            match apiary_core::identity::to_npub(&key) {
-                Ok(npub) => governors.push(npub),
-                Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
-            }
+        if !seen.insert(key) {
+            return err(StatusCode::BAD_REQUEST, "duplicate agent manager identity")
+                .into_response();
         }
+        let npub = match apiary_core::identity::to_npub(&key) {
+            Ok(npub) => npub,
+            Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+        };
+        normalized.push(apiary_core::manifest::ManagerGrant {
+            npub,
+            role: manager.role,
+        });
     }
-    manifest.governance.suspend_keys = governors.clone();
+    manifest.governance.suspend_keys = normalized
+        .iter()
+        .filter(|manager| manager.role == apiary_core::manifest::ManagerRole::Governor)
+        .map(|manager| manager.npub.clone())
+        .collect();
+    manifest.governance.managers = normalized
+        .iter()
+        .filter(|manager| manager.role != apiary_core::manifest::ManagerRole::Governor)
+        .cloned()
+        .collect();
+    if let Err(error) = manifest.validate() {
+        return err(StatusCode::BAD_REQUEST, error).into_response();
+    }
     let yaml = match manifest.to_yaml() {
         Ok(yaml) => yaml,
         Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
@@ -416,7 +531,7 @@ pub async fn governors_set(
     Json(json!({
         "ok": true,
         "npub": npub,
-        "governors": governors,
+        "managers": normalized,
         "manifest_sha256": ceremony::manifest_hash(&yaml),
         "ratified": false,
         "note": "agent managers changed — the agent is paused until one of the newly listed governors ratifies",
@@ -1908,6 +2023,8 @@ pub struct ControlTokenBody {
     /// Short-lived by default; bounded to 90 days by the token verifier.
     #[serde(default = "default_control_token_ttl")]
     expires_in_seconds: u64,
+    #[serde(default)]
+    label: String,
 }
 
 fn default_control_token_ttl() -> u64 {
@@ -1933,6 +2050,7 @@ pub async fn control_token_issue(
     let body: ControlTokenBody = if raw_body.is_empty() {
         ControlTokenBody {
             expires_in_seconds: default_control_token_ttl(),
+            label: String::new(),
         }
     } else {
         match serde_json::from_slice(&raw_body) {
@@ -1940,29 +2058,103 @@ pub async fn control_token_issue(
             Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
         }
     };
+    let label = body.label.trim();
+    if label.len() > 80 || label.chars().any(char::is_control) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "control-token label must be at most 80 printable characters",
+        )
+        .into_response();
+    }
     let (custody, handle) = match crate::admit_agent(&state, &ks, &npub) {
         Ok(value) => value,
         Err(error) => return err(StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
     };
     let host_id = apiary_runtime::lease::host_id(&state.home);
-    match nip98::issue_control_token(
-        &custody,
-        &handle,
-        &host_id,
-        body.expires_in_seconds,
-    ) {
-        Ok((token, expires_at)) => Json(json!({
+    match nip98::issue_control_token(&custody, &handle, &host_id, body.expires_in_seconds) {
+        Ok((token, mut record)) => {
+            record.label = label.to_string();
+            if let Err(error) = nip98::register_control_token(&state, record.clone()) {
+                return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+            }
+            Json(json!({
+                "ok": true,
+                "agent": npub,
+                "id": record.id,
+                "label": record.label,
+                "token": token,
+                "expires_at": record.expires_at,
+                "mcp_url": format!("{}/mcp", state.origin.trim_end_matches('/')),
+                "local_mcp_url": "apiary://local/mcp",
+                "host_id": host_id,
+                "authorization": "Bearer <token>",
+                "note": "This bearer acts as the agent identity. Store it as a sealed credential and never log it."
+            }))
+            .into_response()
+        }
+        Err(error) => err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
+}
+
+pub async fn control_tokens_get(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, npub, _dir, _raw, _manifest) = match gate(&state, &headers, "GET", &uri, None, &npub)
+    {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    match nip98::list_control_tokens(&state, &npub) {
+        Ok(tokens) => {
+            let now = now_secs();
+            let tokens = tokens
+                .into_iter()
+                .map(|token| {
+                    json!({
+                        "id": token.id,
+                        "agent": token.agent,
+                        "label": token.label,
+                        "created_at": token.created_at,
+                        "expires_at": token.expires_at,
+                        "revoked_at": token.revoked_at,
+                        "active": token.revoked_at.is_none() && token.expires_at > now,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Json(json!({"ok": true, "tokens": tokens})).into_response()
+        }
+        Err(error) => err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
+}
+
+pub async fn control_token_revoke(
+    State(state): State<App>,
+    AxPath((npub, id)): AxPath<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, npub, _dir, _raw, _manifest) =
+        match gate(&state, &headers, "DELETE", &uri, None, &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return err(StatusCode::BAD_REQUEST, "invalid control-token ID").into_response();
+    }
+    match nip98::revoke_control_token(&state, &npub, &id) {
+        Ok(token) => Json(json!({
             "ok": true,
-            "agent": npub,
-            "token": token,
-            "expires_at": expires_at,
-            "mcp_url": format!("{}/mcp", state.origin.trim_end_matches('/')),
-            "local_mcp_url": "apiary://local/mcp",
-            "host_id": host_id,
-            "authorization": "Bearer <token>",
-            "note": "This bearer acts as the agent identity. Store it as a sealed credential and never log it."
+            "id": token.id,
+            "agent": token.agent,
+            "revoked_at": token.revoked_at,
         }))
         .into_response(),
+        Err(error) if error.contains("not found") => {
+            err(StatusCode::NOT_FOUND, error).into_response()
+        }
         Err(error) => err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     }
 }
