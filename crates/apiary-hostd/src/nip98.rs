@@ -560,6 +560,7 @@ mod tests {
             managers: std::sync::RwLock::new(crate::access::ManagerRegistry::in_memory(Vec::new())),
             supervisor_notes: std::sync::Mutex::new(std::collections::HashMap::new()),
             admitted: std::sync::Mutex::new(std::collections::HashMap::new()),
+            decisions: Default::default(),
         }
     }
 

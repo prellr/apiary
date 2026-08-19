@@ -105,7 +105,7 @@ pub fn bind_embedder(manifest: &apiary_core::manifest::Manifest) -> Option<Box<d
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct IndexRow {
     event_id: String,
     embedder: String,
@@ -222,6 +222,153 @@ impl SemanticIndex {
         });
         hits.truncate(k);
         hits.retain(|h| h.score > 0.0);
+        Ok(hits)
+    }
+
+    /// Refresh log/vault-derived rows and query one in-memory snapshot. The
+    /// older update → vault update → query sequence parsed the growing JSONL
+    /// index three times before every model call. Derived memory is an
+    /// off-chain read model; one snapshot and one persistence pass is enough.
+    pub fn refresh_and_query(
+        &self,
+        log: &EpisodicLog,
+        vaults: &[apiary_core::manifest::VaultRef],
+        embedder: &dyn Embedder,
+        text: &str,
+        k: usize,
+        exclude: &BTreeSet<String>,
+    ) -> Result<Vec<Hit>, crate::Error> {
+        let embedder_id = embedder.id();
+        let mut rows = self.rows()?;
+        let mut rewrite = false;
+        if rows.iter().any(|row| row.embedder != embedder_id) {
+            rows.clear();
+            rewrite = true;
+        }
+
+        let mut known = rows
+            .iter()
+            .map(|row| row.event_id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut appended = Vec::new();
+        for event in log.read_all()? {
+            let id = event.id.to_hex();
+            if known.contains(&id) {
+                continue;
+            }
+            let Ok(body) = EpisodicLog::parse_body(&event) else {
+                continue;
+            };
+            let row_text = entry_text(&body);
+            let row = IndexRow {
+                event_id: id.clone(),
+                embedder: embedder_id.clone(),
+                vector: embedder.embed(&row_text)?,
+                text: row_text,
+            };
+            known.insert(id);
+            appended.push(row.clone());
+            rows.push(row);
+        }
+
+        // Vault rows are replaceable projections. This deliberately includes
+        // the empty-vault case so removing a grant removes its recalled data.
+        let mut desired = Vec::new();
+        for vault in vaults {
+            let Ok(root) = crate::vault::open_root(&vault.path) else {
+                continue;
+            };
+            for note in crate::vault::walk(&root)? {
+                let Ok(content) = crate::vault::read_note(&root, &note.rel) else {
+                    continue;
+                };
+                let fingerprint = crate::vault::fingerprint(&content);
+                for (index, chunk) in crate::vault::chunks(&content, 1200).into_iter().enumerate() {
+                    desired.push((
+                        format!("vault:{}/{}#{index}:{fingerprint}", vault.name, note.rel),
+                        format!("[{} note {}] {}", vault.name, note.rel, chunk),
+                    ));
+                }
+            }
+        }
+        let desired_ids = desired
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<BTreeSet<_>>();
+        let before = rows.len();
+        rows.retain(|row| {
+            !row.event_id.starts_with("vault:") || desired_ids.contains(row.event_id.as_str())
+        });
+        if rows.len() != before {
+            rewrite = true;
+        }
+        known = rows
+            .iter()
+            .map(|row| row.event_id.clone())
+            .collect::<BTreeSet<_>>();
+        for (id, row_text) in desired {
+            if known.contains(&id) {
+                continue;
+            }
+            rows.push(IndexRow {
+                event_id: id.clone(),
+                embedder: embedder_id.clone(),
+                vector: embedder.embed(&row_text)?,
+                text: row_text,
+            });
+            known.insert(id);
+            rewrite = true;
+        }
+
+        if rewrite {
+            let mut output = String::new();
+            for row in &rows {
+                output.push_str(&serde_json::to_string(row)?);
+                output.push('\n');
+            }
+            std::fs::write(&self.path, output)?;
+        } else if !appended.is_empty() {
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&self.path)?;
+            for row in appended {
+                writeln!(file, "{}", serde_json::to_string(&row)?)?;
+            }
+        }
+        #[cfg(unix)]
+        if self.path.exists() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+        }
+
+        let query = embedder.embed(text)?;
+        let mut hits = rows
+            .into_iter()
+            .filter(|row| row.embedder == embedder_id && !exclude.contains(&row.event_id))
+            .map(|row| Hit {
+                event_id: row.event_id,
+                text: row.text,
+                score: row
+                    .vector
+                    .iter()
+                    .zip(&query)
+                    .map(|(left, right)| left * right)
+                    .sum(),
+            })
+            .filter(|hit| hit.score > 0.0)
+            .collect::<Vec<_>>();
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hits.truncate(k);
         Ok(hits)
     }
 }
@@ -354,6 +501,17 @@ mod tests {
             .query(&e, "tell me about bees and honey", 1, &BTreeSet::new())
             .unwrap();
         assert!(hits[0].text.contains("bees"), "{}", hits[0].text);
+        let combined = idx
+            .refresh_and_query(
+                &log,
+                &[],
+                &e,
+                "tell me about bees and honey",
+                1,
+                &BTreeSet::new(),
+            )
+            .unwrap();
+        assert!(combined[0].text.contains("bees"), "{}", combined[0].text);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -14,7 +14,7 @@ use axum::{
 use nostr::prelude::PublicKey;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use tower::ServiceExt;
 
 const MAX_FORWARD_RESPONSE: usize = 8 * 1024 * 1024;
@@ -144,21 +144,29 @@ async fn call_tool(
             let agent = apiary_core::identity::to_npub(&key)
                 .map_err(|error| (-32602, error.to_string()))?;
             let base = format!("/api/agents/{agent}");
+            let paths = [
+                ("manifest", format!("{base}/manifest")),
+                ("skills", format!("{base}/skills")),
+                ("harnesses", format!("{base}/harnesses")),
+                ("inference", format!("{base}/inference")),
+                ("spend", format!("{base}/spend")),
+                ("routines", format!("{base}/routines")),
+                ("lease", format!("{base}/lease")),
+                ("listener", format!("{base}/listener")),
+            ];
+            // These are independent read models. Execute them together so a
+            // remote manager pays one slowest-route latency, not eight RTTs.
+            let requests = paths.clone().map(|(_, path)| {
+                let state = state.clone();
+                async move { forward(&state, signer, Method::GET, &path, None).await }
+            });
+            let [manifest, skills, harnesses, inference, spend, routines, lease, listener] =
+                futures_join_8(requests).await;
             let mut environment = serde_json::Map::new();
-            for (name, suffix) in [
-                ("manifest", "/manifest"),
-                ("skills", "/skills"),
-                ("harnesses", "/harnesses"),
-                ("inference", "/inference"),
-                ("spend", "/spend"),
-                ("routines", "/routines"),
-                ("lease", "/lease"),
-                ("listener", "/listener"),
-            ] {
-                environment.insert(
-                    name.into(),
-                    forward(state, signer, Method::GET, &format!("{base}{suffix}"), None).await?,
-                );
+            for ((name, _), result) in paths.into_iter().zip([
+                manifest, skills, harnesses, inference, spend, routines, lease, listener,
+            ]) {
+                environment.insert(name.into(), result?);
             }
             json!({"agent": agent, "environment": environment})
         }
@@ -183,12 +191,26 @@ async fn call_tool(
         _ => return Err((-32601, format!("unknown tool: {name}"))),
     };
     let is_error = response_is_error(&output);
+    let text = if name == "apiary_get_agent_environment" {
+        "Apiary returned the governed environment snapshot in structuredContent.".to_string()
+    } else {
+        serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string())
+    };
     Ok(json!({
         "resultType": "complete",
-        "content": [{"type": "text", "text": serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string())}],
+        "content": [{"type": "text", "text": text}],
         "structuredContent": output,
         "isError": is_error
     }))
+}
+
+async fn futures_join_8<F, T>(futures: [F; 8]) -> [T; 8]
+where
+    F: std::future::Future<Output = T>,
+{
+    let [a, b, c, d, e, f, g, h] = futures;
+    let (a, b, c, d, e, f, g, h) = tokio::join!(a, b, c, d, e, f, g, h);
+    [a, b, c, d, e, f, g, h]
 }
 
 fn response_is_error(output: &Value) -> bool {
@@ -335,9 +357,7 @@ fn audit_call(
         return;
     };
     let path = state.home.join("control-audit.jsonl");
-    let previous = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| raw.lines().next_back().map(String::from))
+    let previous = last_nonempty_line(&path)
         .and_then(|line| serde_json::from_str::<Value>(&line).ok())
         .and_then(|entry| entry["hash"].as_str().map(String::from));
     let caller = signer
@@ -387,6 +407,31 @@ fn audit_call(
     }
 }
 
+fn last_nonempty_line(path: &std::path::Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut cursor = file.seek(SeekFrom::End(0)).ok()?;
+    let mut bytes = Vec::new();
+    const CHUNK: u64 = 4096;
+    while cursor > 0 {
+        let take = cursor.min(CHUNK);
+        cursor -= take;
+        file.seek(SeekFrom::Start(cursor)).ok()?;
+        let mut chunk = vec![0; take as usize];
+        file.read_exact(&mut chunk).ok()?;
+        chunk.extend(bytes);
+        bytes = chunk;
+        if bytes.iter().filter(|&&byte| byte == b'\n').count() > 1 {
+            break;
+        }
+    }
+    String::from_utf8(bytes)
+        .ok()?
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(String::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,6 +464,7 @@ mod tests {
             pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             supervisor_notes: std::sync::Mutex::new(std::collections::HashMap::new()),
             admitted: std::sync::Mutex::new(std::collections::HashMap::new()),
+            decisions: Default::default(),
         })
     }
 

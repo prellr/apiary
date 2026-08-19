@@ -15,7 +15,7 @@
 use nostr::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use crate::custody::{AgentHandle, Custody};
@@ -155,6 +155,9 @@ impl EpisodicLog {
         body: &EntryBody,
         extra_tags: Vec<Tag>,
     ) -> Result<Event, crate::Error> {
+        // The chain only needs the current tip. Reading the complete history
+        // here made every append O(history): a busy agent became slower for
+        // no governance benefit. Tail reading is bounded from the end.
         let prev = self.tail(1)?.pop();
         let content = serde_json::to_string(body)?;
         let mut builder = EventBuilder::new(Kind::Custom(LOG_ENTRY_KIND), content)
@@ -190,6 +193,17 @@ impl EpisodicLog {
         event
             .verify()
             .map_err(|e| crate::Error::Manifest(format!("foreign event: bad signature: {e}")))?;
+        let lock_path = self.path.with_extension("lock");
+        let mut lock_options = OpenOptions::new();
+        lock_options.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            lock_options.mode(0o600);
+        }
+        let lock = lock_options.open(lock_path)?;
+        fs2::FileExt::lock_exclusive(&lock)
+            .map_err(|e| crate::Error::Log(format!("log lock: {e}")))?;
         let mut opts = OpenOptions::new();
         opts.create(true).append(true);
         #[cfg(unix)]
@@ -198,8 +212,9 @@ impl EpisodicLog {
             opts.mode(0o600);
         }
         let mut file = opts.open(&self.path)?;
-        writeln!(file, "{}", event.as_json())?;
-        Ok(())
+        let result = writeln!(file, "{}", event.as_json()).map_err(crate::Error::from);
+        let _ = fs2::FileExt::unlock(&lock);
+        result
     }
 
     /// Read all entries in order.
@@ -221,11 +236,66 @@ impl EpisodicLog {
         Ok(events)
     }
 
+    /// Number of stored records without parsing or verifying them. Counts are
+    /// operational UI metadata; admission continues to use signed events.
+    pub fn entry_count(&self) -> Result<usize, crate::Error> {
+        if !self.path.exists() {
+            return Ok(0);
+        }
+        let reader = BufReader::new(fs::File::open(&self.path)?);
+        let mut count = 0;
+        for line in reader.lines() {
+            if !line?.trim().is_empty() {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    fn tail_lines(&self, n: usize) -> Result<Vec<String>, crate::Error> {
+        if n == 0 || !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let mut file = fs::File::open(&self.path)?;
+        let mut cursor = file.seek(SeekFrom::End(0))?;
+        let mut bytes = Vec::new();
+        const CHUNK: u64 = 8 * 1024;
+        while cursor > 0 {
+            let take = cursor.min(CHUNK);
+            cursor -= take;
+            file.seek(SeekFrom::Start(cursor))?;
+            let mut chunk = vec![0; take as usize];
+            file.read_exact(&mut chunk)?;
+            chunk.extend(bytes);
+            bytes = chunk;
+            // JSON events are one line. One extra newline is needed because
+            // the file normally ends in a newline itself.
+            if bytes.iter().filter(|&&byte| byte == b'\n').count() > n {
+                break;
+            }
+        }
+        let text = String::from_utf8(bytes)
+            .map_err(|e| crate::Error::Manifest(format!("log is not UTF-8: {e}")))?;
+        let mut lines = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(String::from)
+            .collect::<Vec<_>>();
+        if lines.len() > n {
+            lines.drain(..lines.len() - n);
+        }
+        Ok(lines)
+    }
+
     /// Last `n` entries, oldest first.
     pub fn tail(&self, n: usize) -> Result<Vec<Event>, crate::Error> {
-        let mut all = self.read_all()?;
-        let start = all.len().saturating_sub(n);
-        Ok(all.split_off(start))
+        self.tail_lines(n)?
+            .into_iter()
+            .map(|line| {
+                Event::from_json(&line)
+                    .map_err(|e| crate::Error::Manifest(format!("corrupt log line: {e}")))
+            })
+            .collect()
     }
 
     /// Verify every entry's signature and the prev-chain. Returns entry count.
@@ -297,6 +367,12 @@ mod tests {
         log.append(&custody, &h, Tier::Local, &body("run.task"))
             .unwrap();
         assert_eq!(log.verify().unwrap(), 3);
+        assert_eq!(log.entry_count().unwrap(), 3);
+        let tail = log.tail(2).unwrap();
+        assert_eq!(tail.len(), 2);
+        assert!(tail
+            .iter()
+            .all(|event| { EpisodicLog::parse_body(event).unwrap().action == "run.task" }));
         fs::remove_dir_all(&dir).ok();
     }
 

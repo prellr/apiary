@@ -7,6 +7,7 @@
 let sel = null, tab = 'overview', agents = [], owners = [], managers = [], hostStatus = {};
 let hostView = null; // null | 'library' | 'found' | 'import'
 let listenerPoll = null;
+let manifestRequest = null;
 
 // Desktop mode hands the per-launch token in the boot URL; every API call
 // echoes it back in a header. Without a token this is a no-op.
@@ -38,6 +39,17 @@ function el(tag, cls, text) {
   if (text !== undefined) n.textContent = text;
   return n;
 }
+function shortNostrId(value, leading = 12, trailing = 8) {
+  const text = String(value || '');
+  if (text.length <= leading + trailing + 1) return text;
+  return `${text.slice(0, leading)}…${text.slice(-trailing)}`;
+}
+function nostrId(value, tag = 'span', cls = null) {
+  const node = el(tag, cls, shortNostrId(value));
+  node.title = String(value || '');
+  node.setAttribute('aria-label', String(value || ''));
+  return node;
+}
 function help(text) { return el('div', 'help', text); }
 function kv(k, v) {
   const row = el('div', 'kv');
@@ -51,6 +63,10 @@ function section(title, helpText) {
   return s;
 }
 function api(path) { return `/api/agents/${encodeURIComponent(sel)}${path}`; }
+function currentManifest() {
+  if (!manifestRequest) manifestRequest = j(api('/manifest'));
+  return manifestRequest;
+}
 
 function ownerHolders(keys) {
   const byNpub = new Map();
@@ -362,7 +378,7 @@ async function loadRoster() {
     nm.append(el('span', 'badge ' + (a.ratified ? 'rat' : 'unrat'), a.ratified ? 'ratified' : 'unratified'));
     nm.append(el('span', 'badge ' + (a.active ? 'live' : 'unrat'), a.active ? 'active' : 'inactive'));
     if (running.has(a.npub)) nm.append(el('span', 'badge live', 'listening'));
-    card.append(nm, el('div', 'np', a.npub), el('div', 'np', a.log_entries + ' signed events'));
+    card.append(nm, nostrId(a.npub, 'div', 'np'), el('div', 'np', a.log_entries + ' signed events'));
     card.onclick = () => { hostView = null; sel = a.npub; render(); loadRoster(); };
     root.append(card);
   }
@@ -398,6 +414,7 @@ function entryLine(bold, rest, metaLines) {
 
 async function render() {
   if (listenerPoll) { clearInterval(listenerPoll); listenerPoll = null; }
+  manifestRequest = null;
   // Agent tabs only make sense when looking at an agent.
   document.querySelector('nav').style.display = (hostView || !sel) ? 'none' : 'flex';
   const c = document.getElementById('content');
@@ -489,7 +506,7 @@ function renderWelcome(c) {
   const purpose = el('textarea'); purpose.rows = 4; purpose.placeholder = 'What should this agent reliably help you do?';
   const owner = el('select'); owner.multiple = true; owner.size = Math.min(5, Math.max(2, approvalPeople().length));
   approvalPeople().forEach((identity, index) => {
-    const option = el('option', null, identity.name || identity.npub.slice(0, 16));
+    const option = el('option', null, identity.name || shortNostrId(identity.npub));
     option.value = identity.npub; option.selected = index === 0; owner.append(option);
   });
   const draft = el('input'); draft.type = 'checkbox'; draft.checked = !!hostStatus.anthropic_key_present; draft.disabled = !hostStatus.anthropic_key_present;
@@ -530,7 +547,7 @@ async function ratifyBanner(c) {
   const box = el('section', 'attention');
   box.append(el('h2', null, 'Review changes before this agent can run'),
     help(`${a.name || 'This agent'} is paused because its configuration has not been approved. Apiary will show you the effective setup and the exact file changes before signing.`));
-  const d = await j(api('/manifest'));
+  const d = await currentManifest();
   const governance = (d.ok && d.manifest && d.manifest.governance) || {};
   const keys = [
     ...(governance.suspend_keys || []),
@@ -570,7 +587,7 @@ async function ratifyBanner(c) {
       return;
     }
     const who = el('select');
-    for (const h of holders) { const o = el('option', null, h.name || h.npub.slice(0, 16)); o.value = h.npub; who.append(o); }
+    for (const h of holders) { const o = el('option', null, h.name || shortNostrId(h.npub)); o.value = h.npub; who.append(o); }
     const rat = el('button', 'btn solid', 'Approve configuration');
     const approveRow = el('div', 'row');
     approveRow.append(el('span', 'meta', 'Approve as'), who, rat); box.append(approveRow);
@@ -653,10 +670,11 @@ function quick(title, description, target) {
 }
 
 async function renderOverview(c) {
-  await proposalBanner(c);
+  const proposal = proposalBanner(c);
   const [d, spend, listener, controlTokens] = await Promise.all([
-    j(api('/manifest')), j(api('/spend')), j(api('/listener')), j(api('/control-tokens')),
+    currentManifest(), j(api('/spend')), j(api('/listener')), j(api('/control-tokens')),
   ]);
+  await proposal;
   if (!d.ok) { c.append(el('div', 'ev err', 'Could not load this agent: ' + d.error)); return; }
   const m = d.manifest || {};
   const roster = agents.find(a => a.npub === sel) || {};
@@ -748,8 +766,8 @@ async function renderOverview(c) {
     }
     select.value = roleByKey.get(person.npub) || 'none';
     const label = el('label', 'row');
-    label.append(select, el('span', null, person.name || person.npub.slice(0, 16)),
-      el('code', null, person.npub),
+    label.append(select, el('span', null, person.name || shortNostrId(person.npub)),
+      nostrId(person.npub, 'code'),
       el('span', 'meta', person.identityKind === 'agent' ? 'Apiary agent' :
         managers.some(manager => manager.npub === person.npub) ? 'host manager' : 'person'));
     governance.append(label); roleControls.push([select, person.npub]);
@@ -846,10 +864,14 @@ async function renderOverview(c) {
     const option = el('option', null, label); option.value = value; hMetering.append(option);
   }
   const hEstimate = el('input'); hEstimate.type = 'number'; hEstimate.min = '1'; hEstimate.max = '64000'; hEstimate.value = '8192';
+  const hDiscover = el('button', 'btn', 'Find installed harnesses');
   const harnessSave = el('button', 'btn', 'Add harness');
   const harnessStatus = el('span', 'meta', '');
+  const hDiscoverRow = el('div', 'row'); hDiscoverRow.append(hDiscover);
   const hRow = el('div', 'row'); hRow.append(harnessSave, harnessStatus);
-  harnessForm.append(field('Name', hName), field('Command', hCommand),
+  harnessForm.append(hDiscoverRow,
+    help('Discovery checks known local executables only. It does not launch them, copy credentials, add a grant, or approve an amendment.'),
+    field('Name', hName), field('Command', hCommand),
     field('Arguments', hArgs, 'One per line; arguments are exact and ratified.'),
     field('Working directory', hWorkdir, 'Optional. This selects cwd but does not confine the process.'),
     field('Native tool access', hAccess), field('Host profile', hProfile),
@@ -857,6 +879,24 @@ async function renderOverview(c) {
     field('Allowed tool titles', hTools), field('Inherited environment', hEnv),
     field('Token accounting', hMetering), field('Estimated tokens per run', hEstimate),
     help('Full host profile deliberately inherits the harness user’s global agents, skills, extensions, credentials, and environment. Isolated creates a clean per-agent HOME. Read-only blocks writes but not reads; no-network blocks outbound and inbound network access. Goose mode is pinned to chat, approve, or auto from the selected access. Other harnesses must honor ACP permission requests.'), hRow);
+  hDiscover.onclick = async () => {
+    hDiscover.disabled = true; harnessStatus.textContent = 'Checking this host…';
+    const result = await j(api('/harnesses/discover'));
+    hDiscover.disabled = false;
+    if (!result.ok) { harnessStatus.textContent = 'Could not discover harnesses: ' + result.error; return; }
+    const candidates = result.harnesses || [];
+    if (!candidates.length) { harnessStatus.textContent = 'No supported ACP harness was found on this host.'; return; }
+    const candidate = candidates.find(item => item.id === 'berd-goose') || candidates[0];
+    hName.value = candidate.id;
+    hCommand.value = candidate.command;
+    hArgs.value = (candidate.args || []).join('\n');
+    hAccess.value = 'inference-only';
+    hProfile.value = 'isolated';
+    hSandbox.value = 'none';
+    hMetering.value = 'estimated';
+    hEstimate.value = '8192';
+    harnessStatus.textContent = `${candidate.name} found. Review these defaults, then add and approve the amendment.`;
+  };
   harnessSave.onclick = async () => {
     const lines = value => value.split('\n').map(item => item.trim()).filter(Boolean);
     const harness = {
@@ -1011,7 +1051,10 @@ async function renderOverview(c) {
   const advanced = el('details', 'section technical');
   advanced.append(el('summary', null, 'Identity, portability, and host coordination'));
   const body = el('div');
-  body.append(kv('Public identity', sel), kv('Configuration hash', d.manifest_sha256));
+  const publicIdentity = kv('Public identity', shortNostrId(sel));
+  publicIdentity.querySelector('.v').title = sel;
+  publicIdentity.querySelector('.v').setAttribute('aria-label', sel);
+  body.append(publicIdentity, kv('Configuration hash', d.manifest_sha256));
   const rnIn = el('input'); rnIn.value = roster.name || '';
   const rnGo = el('button', 'btn', 'Rename'); const rnSt = el('span', 'meta', '');
   const rnRow = el('div', 'row'); rnRow.append(rnGo, rnSt);
@@ -1366,7 +1409,7 @@ async function renderInference(c) {
 // ------------------------------------------------------------ run
 
 async function renderRun(c) {
-  const manifestResult = await j(api('/manifest'));
+  const manifestResult = await currentManifest();
   const harnesses = manifestResult.ok ? ((manifestResult.manifest || {}).harnesses || []) : [];
   c.append(help('One governed task. The stream below is AG-UI presence (steps, tool calls, text); the signed log is truth — every model call lands as a signed checkpoint entry. Budget reservations are taken before the call and settled after.'));
   const box = el('div'); box.id = 'runbox';
@@ -1419,6 +1462,21 @@ async function runTask(ta, go, events, cls, dcls, harness) {
     const dec = new TextDecoder();
     let buf = '';
     let responseNode = null;
+    let responseText = null;
+    let pendingText = '';
+    let paint = null;
+    let lastScroll = 0;
+    const flushText = () => {
+      paint = null;
+      if (!pendingText || !responseText) return;
+      responseText.appendData(pendingText);
+      pendingText = '';
+      const now = performance.now();
+      if (now - lastScroll > 100) {
+        responseNode.scrollIntoView({ block: 'nearest' });
+        lastScroll = now;
+      }
+    };
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -1436,9 +1494,13 @@ async function runTask(ta, go, events, cls, dcls, harness) {
           case 'TOOL_CALL_ARGS': ev(events, 'meta', 'args ' + e.delta); break;
           case 'TOOL_CALL_END': ev(events, e.ok ? 'tool' : 'err', `⚒ ${e.toolCallId} ${e.ok ? 'ok' : 'FAILED'} — ${e.detail}`); break;
           case 'TEXT_MESSAGE_CONTENT':
-            if (!responseNode) responseNode = ev(events, 'text', '');
-            responseNode.textContent += e.delta;
-            responseNode.scrollIntoView({ block: 'nearest' });
+            if (!responseNode) {
+              responseNode = ev(events, 'text', '');
+              responseText = document.createTextNode('');
+              responseNode.append(responseText);
+            }
+            pendingText += e.delta;
+            if (!paint) paint = requestAnimationFrame(flushText);
             break;
           case 'CUSTOM':
             if (e.name === 'apiary.checkpoint') {
@@ -1451,6 +1513,8 @@ async function runTask(ta, go, events, cls, dcls, harness) {
         }
       }
     }
+    if (paint) cancelAnimationFrame(paint);
+    flushText();
   } catch (err) { ev(events, 'err', String(err)); }
   go.disabled = false;
 }
@@ -1514,7 +1578,7 @@ async function renderLog(c) {
 // ------------------------------------------------------------ manifest
 
 async function renderManifest(c) {
-  const d = await j(api('/manifest'));
+  const d = await currentManifest();
   if (!d.ok) { c.append(el('div', 'ev err', 'Could not load configuration: ' + d.error)); return; }
   const head = el('div', 'page-head');
   head.append(el('div', 'eyebrow', d.ratified ? 'Approved configuration' : 'Draft configuration'),
@@ -2172,7 +2236,7 @@ async function renderLibrary(c) {
     const d = await j(`/api/agents/${encodeURIComponent(a.npub)}/manifest`);
     if (!d.ok) continue;
     for (const g of (d.manifest.connectors || [])) {
-      (grantsByKind[g.type] = grantsByKind[g.type] || []).push(a.name || a.npub.slice(0, 12));
+      (grantsByKind[g.type] = grantsByKind[g.type] || []).push(a.name || shortNostrId(a.npub));
     }
   }
 
@@ -2216,8 +2280,8 @@ async function renderLibrary(c) {
       const gRow = el('div', 'row');
       gRow.append(el('span', 'meta', holders.length ? 'granted to: ' + holders.join(', ') : 'granted to: nobody yet'));
       const sel = el('select');
-      const eligible = agents.filter(a => !holders.includes(a.name || a.npub.slice(0, 12)));
-      for (const a of eligible) { const o = el('option', null, a.name || a.npub.slice(0, 12)); o.value = a.npub; sel.append(o); }
+      const eligible = agents.filter(a => !holders.includes(a.name || shortNostrId(a.npub)));
+      for (const a of eligible) { const o = el('option', null, a.name || shortNostrId(a.npub)); o.value = a.npub; sel.append(o); }
       const gBtn = el('button', 'btn', 'GRANT TO ▸');
       const gSt = el('span', 'meta', '');
       if (eligible.length) gRow.append(sel, gBtn, gSt);
@@ -2232,7 +2296,7 @@ async function renderLibrary(c) {
         const r = await j(`/api/agents/${encodeURIComponent(npub)}/connectors`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: e.name }) });
         gBtn.disabled = false;
         if (r.ok) {
-          const who = (agents.find(a => a.npub === npub) || {}).name || npub.slice(0, 12);
+          const who = (agents.find(a => a.npub === npub) || {}).name || shortNostrId(npub);
           window.__libFlash = `granted ${e.name} to ${who} — ratify on ${who}’s Configuration before it takes effect`;
           loadRoster(); render();
         } else if (r.oauth_url || (r.error && /oauth/i.test(r.error))) {
@@ -2781,7 +2845,7 @@ function renderManagers(c) {
   for (const manager of managers) {
     const row = el('div', 'lib');
     row.append(el('b', null, manager.name || 'Manager'),
-      el('code', null, manager.npub),
+      nostrId(manager.npub, 'code'),
       el('span', 'meta', manager.source === 'startup' ? 'started with --admin' : 'stored on this host'),
       el('span', 'spacer'));
     if (manager.removable) {
@@ -2830,7 +2894,7 @@ function renderManagers(c) {
       'These encrypted keys can already approve agents on this host. Grant host access only if that human identity should also administer Apiary itself.');
     for (const owner of localOnly) {
       const row = el('div', 'lib');
-      row.append(el('b', null, owner.name), el('code', null, owner.npub), el('span', 'spacer'));
+      row.append(el('b', null, owner.name), nostrId(owner.npub, 'code'), el('span', 'spacer'));
       const grant = el('button', 'btn', 'Grant host access');
       grant.onclick = async () => {
         grant.disabled = true;
@@ -2878,7 +2942,7 @@ function renderFound(c) {
   const fSuspend = el('select', 'grow'); fSuspend.multiple = true;
   fSuspend.size = Math.min(6, Math.max(2, people.length));
   people.forEach((identity, index) => {
-    const option = el('option', null, identity.name || identity.npub.slice(0, 16));
+    const option = el('option', null, identity.name || shortNostrId(identity.npub));
     option.value = identity.npub; option.selected = index === 0; fSuspend.append(option);
   });
   if (!people.length) {
@@ -2957,7 +3021,7 @@ function renderImport(c) {
     });
     go.disabled = false;
     st.textContent = r.ok
-      ? `Imported ${r.name || r.npub.slice(0, 12)} with ${r.log_entries} signed history entries. It is inactive on this host.`
+      ? `Imported ${r.name || shortNostrId(r.npub)} with ${r.log_entries} signed history entries. It is inactive on this host.`
       : 'Could not import: ' + r.error;
     if (r.ok) {
       bundle.value = ''; file.value = ''; hostView = null; sel = r.npub; tab = 'overview';

@@ -151,6 +151,19 @@ pub fn is_ratified(
     agent: &PublicKey,
     suspend_keys: &[PublicKey],
 ) -> Result<bool, crate::Error> {
+    let events = log.read_all()?;
+    is_ratified_events(&events, manifest_yaml, agent, suspend_keys)
+}
+
+/// Evaluate ratification from an already-loaded snapshot. Host admission can
+/// parse the signed history once, derive several off-chain views from it, and
+/// avoid turning each view into a separate full-log scan.
+pub fn is_ratified_events(
+    events: &[Event],
+    manifest_yaml: &str,
+    agent: &PublicKey,
+    suspend_keys: &[PublicKey],
+) -> Result<bool, crate::Error> {
     let want = manifest_hash(manifest_yaml);
     let agent_npub = crate::identity::to_npub(agent)?;
     let hash_matches = |body: &EntryBody| {
@@ -162,13 +175,13 @@ pub fn is_ratified(
     };
     let mut agent_signed = false;
     let mut human_ratified = false;
-    for event in log.read_all()? {
+    for event in events {
         // Cryptographic checks first: signature and kind. Unverifiable
         // entries are ignored, never trusted.
         if event.kind != Kind::Custom(crate::log::LOG_ENTRY_KIND) || event.verify().is_err() {
             continue;
         }
-        let Ok(body) = EpisodicLog::parse_body(&event) else {
+        let Ok(body) = EpisodicLog::parse_body(event) else {
             continue;
         };
         match body.action.as_str() {

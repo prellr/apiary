@@ -11,7 +11,7 @@
 //! What this deliberately is not: a workflow engine. One routine = one
 //! governed run = the runner's bounded loop.
 
-use crate::{admit_agent, ceremony, suspend_pks, App};
+use crate::{admit_agent, agent_decision, ceremony, App};
 use apiary_core::keystore::Keystore;
 use apiary_core::log::{EntryBody, EpisodicLog, Tier};
 use apiary_core::manifest::{Delivery, Manifest, Routine};
@@ -162,12 +162,7 @@ fn gate(
             }
         }
     }
-    let suspend = suspend_pks(manifest);
-    let Ok(agent_pk) = apiary_core::identity::parse_npub(npub) else {
-        return Some("bad npub".into());
-    };
-    let log = EpisodicLog::open(dir);
-    if !ceremony::is_ratified(&log, raw, &agent_pk, &suspend).unwrap_or(false) {
+    if !agent_decision(state, dir, npub, raw, manifest).ratified {
         return Some("not ratified".into());
     }
     None

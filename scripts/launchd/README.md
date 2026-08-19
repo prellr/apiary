@@ -33,3 +33,9 @@ routes use the host's existing `claude auth login` session. Apiary disables
 Claude Code's own tools and dispatches only the connectors granted to the
 agent. A relaunch retrieves the keystore passphrase from macOS Keychain when
 automatic unlock has been enabled in the cockpit.
+
+Build the executable referenced by the launch agent with
+`scripts/build-desktop.sh`. The stable signature prevents macOS Keychain from
+treating every rebuilt executable as an unrelated application. The first
+signed launch may ask once; choose **Always Allow** to retain that signed
+application requirement across later builds.

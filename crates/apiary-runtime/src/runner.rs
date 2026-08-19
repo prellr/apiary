@@ -506,7 +506,6 @@ pub(crate) fn build_working_set(
     if let Some(embedder) = crate::index::bind_embedder(manifest) {
         let idx = crate::index::SemanticIndex::open(agent_dir);
         let retrieved: Result<(), crate::Error> = (|| {
-            idx.update(log, embedder.as_ref())?;
             // Granted vault connectors feed recall too — a grant IS the
             // "this is my knowledge" act; memory.vaults stays for vaults
             // that are memory-only (no tools). Deduped by name.
@@ -537,8 +536,7 @@ pub(crate) fn build_working_set(
                     }
                 }
             }
-            idx.update_vaults(&vaults, embedder.as_ref())?;
-            for hit in idx.query(embedder.as_ref(), task, 4, &tail_ids)? {
+            for hit in idx.refresh_and_query(log, &vaults, embedder.as_ref(), task, 4, &tail_ids)? {
                 relevant_lines.push(format!("- {}", hit.text));
             }
             Ok(())

@@ -11,6 +11,7 @@
 pub mod access;
 pub mod agui;
 pub mod control_mcp;
+pub mod decision_gate;
 pub mod events;
 pub mod nip98;
 pub mod ops;
@@ -84,6 +85,10 @@ pub struct AppState {
     /// posture as holding the passphrase, which derives exactly these;
     /// cleared on lock. Keyed by npub.
     pub admitted: std::sync::Mutex<std::collections::HashMap<String, nostr::prelude::Keys>>,
+    /// Off-chain projection of signed governance decisions. It never grants
+    /// authority of its own: configuration changes select a new cache key
+    /// and signed history is re-evaluated before the answer can become true.
+    pub decisions: decision_gate::DecisionGate,
 }
 
 impl AppState {
@@ -196,6 +201,10 @@ pub fn build_router(state: App) -> Router {
         .route(
             "/api/agents/{npub}/harnesses",
             get(ops::harnesses_get).post(ops::harness_upsert),
+        )
+        .route(
+            "/api/agents/{npub}/harnesses/discover",
+            get(ops::harnesses_discover),
         )
         .route(
             "/api/agents/{npub}/harnesses/{name}",
@@ -366,17 +375,16 @@ pub fn suspend_pks(manifest: &Manifest) -> Vec<PublicKey> {
     keys
 }
 
-fn ratified(dir: &std::path::Path, npub: &str, raw: &str, manifest: &Manifest) -> bool {
-    let Ok(agent_pk) = apiary_core::identity::parse_npub(npub) else {
-        return false;
-    };
-    ceremony::is_ratified(
-        &EpisodicLog::open(dir),
-        raw,
-        &agent_pk,
-        &suspend_pks(manifest),
-    )
-    .unwrap_or(false)
+pub fn agent_decision(
+    state: &AppState,
+    dir: &std::path::Path,
+    npub: &str,
+    raw: &str,
+    manifest: &Manifest,
+) -> decision_gate::AgentDecision {
+    state
+        .decisions
+        .evaluate(dir, npub, raw, &suspend_pks(manifest))
 }
 
 fn path_and_query(uri: &axum::http::Uri) -> String {
@@ -410,15 +418,12 @@ async fn list_agents(
         {
             continue;
         }
-        let entries = EpisodicLog::open(&dir)
-            .read_all()
-            .map(|v| v.len())
-            .unwrap_or(0);
+        let decision = agent_decision(&state, &dir, &npub, &raw, &m);
         agents.push(json!({
             "npub": npub,
             "name": name,
-            "ratified": ratified(&dir, &npub, &raw, &m),
-            "log_entries": entries,
+            "ratified": decision.ratified,
+            "log_entries": decision.log_entries,
             "active": ops::is_active(&dir),
             "declared_channels": m.presence.channels.keys().cloned().collect::<Vec<_>>(),
         }));
@@ -447,14 +452,15 @@ async fn get_manifest(
             {
                 return e.into_response();
             }
+            let decision = agent_decision(&state, &dir, &npub, &raw, &m);
             Json(json!({
                 "ok": true,
                 "npub": npub,
                 "yaml": raw,
                 "approved_yaml": std::fs::read_to_string(dir.join("manifest.approved.yaml")).ok(),
                 "manifest": serde_json::to_value(&m).unwrap_or_default(),
-                "ratified": ratified(&dir, &npub, &raw, &m),
-                "manifest_sha256": ceremony::manifest_hash(&raw),
+                "ratified": decision.ratified,
+                "manifest_sha256": decision.manifest_sha256,
             }))
             .into_response()
         }
@@ -690,6 +696,7 @@ async fn ratify_agent(
             let snapshot_warning = snapshot_approved_manifest(&dir, &raw)
                 .err()
                 .map(|e| e.to_string());
+            state.decisions.invalidate(&npub);
             Json(json!({
                 "ok": true,
                 "npub": npub,
@@ -926,19 +933,22 @@ pub fn admit_agent(
     let pass = state
         .passphrase_clone()
         .ok_or("keystore is locked — unlock with the passphrase first")?;
-    let cached = state
-        .admitted
-        .lock()
-        .ok()
-        .and_then(|m| m.get(npub).cloned());
-    let keys = match cached {
-        Some(k) => k,
-        None => {
-            let k = ks.load(npub, &pass).map_err(|e| e.to_string())?;
-            if let Ok(mut m) = state.admitted.lock() {
-                m.insert(npub.to_string(), k.clone());
-            }
-            k
+    // Hold the small admission lock across the deliberately expensive load.
+    // Without this, Buzz, Telegram, the lease keeper, and a concurrent task
+    // can all miss the cache together and perform the same NIP-49 KDF. Key
+    // admission is rare; serializing it is substantially cheaper and avoids
+    // a CPU spike while channels appear stuck in "Starting".
+    let keys = {
+        let mut admitted = state
+            .admitted
+            .lock()
+            .map_err(|_| "agent admission cache is unavailable".to_string())?;
+        if let Some(keys) = admitted.get(npub) {
+            keys.clone()
+        } else {
+            let keys = ks.load(npub, &pass).map_err(|e| e.to_string())?;
+            admitted.insert(npub.to_string(), keys.clone());
+            keys
         }
     };
     let mut custody = Custody::new();

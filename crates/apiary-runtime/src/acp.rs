@@ -62,7 +62,15 @@ fn goose_mode(command: &str, mode: &PermissionMode) -> Option<&'static str> {
     let name = std::path::Path::new(command)
         .file_name()
         .and_then(|name| name.to_str())?;
-    if name != "goose" && !name.starts_with("goose-") {
+    // Goose's upstream CLI is normally named `goose`; Berd bundles the same
+    // ACP server as `goosed`. Both expose native execution modes that must be
+    // pinned from the ratified Apiary access policy rather than inherited
+    // from the host environment.
+    if name != "goose"
+        && name != "goosed"
+        && !name.starts_with("goose-")
+        && !name.starts_with("goosed-")
+    {
         return None;
     }
     Some(match mode {
@@ -418,6 +426,13 @@ mod tests {
             Some("auto")
         );
         assert_eq!(goose_mode("claude", &PermissionMode::Allow), None);
+        assert_eq!(
+            goose_mode(
+                "/Applications/Berd.app/Contents/MacOS/goosed",
+                &PermissionMode::Deny
+            ),
+            Some("chat")
+        );
     }
 
     #[cfg(target_os = "macos")]

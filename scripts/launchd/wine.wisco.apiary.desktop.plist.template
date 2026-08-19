@@ -3,7 +3,7 @@
 <plist version="1.0"><dict>
   <key>Label</key><string>wine.wisco.apiary.desktop</string>
   <key>ProgramArguments</key><array>
-    <string>/Users/Storage/Apiary/target/release/apiary-desktop</string>
+    <string>/Users/Storage/Apiary/target/release/Apiary</string>
   </array>
   <key>EnvironmentVariables</key><dict>
     <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>

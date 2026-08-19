@@ -245,6 +245,7 @@ fn run_local(home: PathBuf, bootstrap: DesktopBootstrap) {
         pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
         supervisor_notes: std::sync::Mutex::new(std::collections::HashMap::new()),
         admitted: std::sync::Mutex::new(std::collections::HashMap::new()),
+        decisions: Default::default(),
         // Desktop runs open-mode behind its per-launch token; the token
         // IS the request boundary there. Stored manager npubs become the
         // NIP-98 allowlist when this home later runs headless.

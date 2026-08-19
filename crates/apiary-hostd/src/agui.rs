@@ -6,8 +6,7 @@
 //! non-streaming today); signed checkpoints stay in the log — this stream
 //! is presence, the log is truth.
 
-use crate::{admit_agent, agent_ctx, err, load_manifest, nip98, App};
-use apiary_core::{ceremony, log::EpisodicLog};
+use crate::{admit_agent, agent_ctx, agent_decision, err, load_manifest, nip98, App};
 use apiary_runtime::routing::TaskContext;
 use apiary_runtime::runner::{run_task_observed, RunEvent};
 use axum::{
@@ -105,24 +104,17 @@ pub async fn run_stream(
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
-    let suspend_keys = crate::suspend_pks(&manifest);
     if let Err(e) = nip98::authorize_agent_request(&state, signer, &manifest, "POST", &pq) {
         return e.into_response();
     }
-    // Ratification gate — verified signatures, both parties, current hash.
-    let agent_pk = match apiary_core::identity::parse_npub(&npub) {
-        Ok(pk) => pk,
-        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
-    };
-    match ceremony::is_ratified(&EpisodicLog::open(&dir), &raw, &agent_pk, &suspend_keys) {
-        Ok(true) => {}
-        _ => {
-            return err(
-                StatusCode::CONFLICT,
-                "manifest is not ratified — amendments need re-ratification before the agent runs",
-            )
-            .into_response()
-        }
+    // One host gate projects the signed ceremony into an operational answer.
+    // A configuration change cannot reuse the preceding decision.
+    if !agent_decision(&state, &dir, &npub, &raw, &manifest).ratified {
+        return err(
+            StatusCode::CONFLICT,
+            "manifest is not ratified — amendments need re-ratification before the agent runs",
+        )
+        .into_response();
     }
     let (custody, handle) = match admit_agent(&state, &ks, &npub) {
         Ok(v) => v,

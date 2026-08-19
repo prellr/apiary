@@ -90,6 +90,7 @@ async fn main() {
         pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
         supervisor_notes: std::sync::Mutex::new(std::collections::HashMap::new()),
         admitted: std::sync::Mutex::new(std::collections::HashMap::new()),
+        decisions: Default::default(),
         managers: std::sync::RwLock::new(managers),
     });
     apiary_hostd::write_control_discovery(&state).unwrap_or_else(|error| {

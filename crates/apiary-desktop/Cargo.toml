@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "apiary-desktop"
+name = "Apiary"
 path = "src/main.rs"
 
 [build-dependencies]

@@ -767,6 +767,138 @@ pub async fn harnesses_get(
     Json(json!({"ok": true, "harnesses": manifest.harnesses})).into_response()
 }
 
+#[derive(serde::Serialize)]
+struct DiscoveredHarness {
+    id: &'static str,
+    name: &'static str,
+    description: &'static str,
+    command: String,
+    args: Vec<&'static str>,
+    source: &'static str,
+}
+
+fn executable(path: &std::path::Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    true
+}
+
+fn discover_acp_harnesses_from(
+    berd_paths: &[std::path::PathBuf],
+    search_path: Option<&std::ffi::OsStr>,
+) -> Vec<DiscoveredHarness> {
+    let mut found = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+
+    for path in berd_paths {
+        if executable(path) && seen.insert(path.clone()) {
+            found.push(DiscoveredHarness {
+                id: "berd-goose",
+                name: "Berd's Goose harness",
+                description: "Berd's bundled Goose ACP loop; Apiary still governs its profile, tools, sandbox, and accounting.",
+                command: path.to_string_lossy().into_owned(),
+                args: vec!["acp"],
+                source: "Berd application",
+            });
+        }
+    }
+
+    if let Some(path) = search_path {
+        for directory in std::env::split_paths(&path) {
+            for (binary, id, name) in [
+                ("goose", "goose", "Goose harness"),
+                ("goosed", "goose-daemon", "Goose harness"),
+            ] {
+                let candidate = directory.join(binary);
+                if executable(&candidate) && seen.insert(candidate.clone()) {
+                    found.push(DiscoveredHarness {
+                        id,
+                        name,
+                        description: "Installed Goose ACP loop; Apiary still governs its profile, tools, sandbox, and accounting.",
+                        command: candidate.to_string_lossy().into_owned(),
+                        args: vec!["acp"],
+                        source: "PATH",
+                    });
+                }
+            }
+        }
+    }
+    found
+}
+
+fn discover_acp_harnesses() -> Vec<DiscoveredHarness> {
+    let mut berd_paths = vec![std::path::PathBuf::from(
+        "/Applications/Berd.app/Contents/MacOS/goosed",
+    )];
+    if let Some(home) = std::env::var_os("HOME") {
+        berd_paths.push(
+            std::path::PathBuf::from(home).join("Applications/Berd.app/Contents/MacOS/goosed"),
+        );
+    }
+    let search_path = std::env::var_os("PATH");
+    discover_acp_harnesses_from(&berd_paths, search_path.as_deref())
+}
+
+#[cfg(test)]
+mod harness_discovery_tests {
+    use super::discover_acp_harnesses_from;
+
+    #[cfg(unix)]
+    #[test]
+    fn berd_and_path_goose_are_prefilled_as_stdio_acp_without_launching() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("apiary-harness-discovery-{}", std::process::id()));
+        let berd = root.join("Berd.app/Contents/MacOS/goosed");
+        let path_bin = root.join("bin");
+        std::fs::create_dir_all(berd.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&path_bin).unwrap();
+        std::fs::write(&berd, b"test").unwrap();
+        std::fs::write(path_bin.join("goose"), b"test").unwrap();
+        std::fs::set_permissions(&berd, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            path_bin.join("goose"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let found =
+            discover_acp_harnesses_from(std::slice::from_ref(&berd), Some(path_bin.as_os_str()));
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].id, "berd-goose");
+        assert_eq!(found[0].command, berd.to_string_lossy());
+        assert_eq!(found[0].args, vec!["acp"]);
+        assert_eq!(found[1].id, "goose");
+        assert_eq!(found[1].args, vec!["acp"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// Discover known ACP harness executables without launching them. Discovery
+/// is agent-scoped so the same viewer/editor/governor policy as the harness
+/// page applies; it never imports the foreign harness's profile or secrets.
+pub async fn harnesses_discover(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if let Err(error) = gate(&state, &headers, "GET", &uri, None, &npub) {
+        return error.into_response();
+    }
+    Json(json!({"ok": true, "harnesses": discover_acp_harnesses()})).into_response()
+}
+
 #[derive(serde::Deserialize)]
 pub struct HarnessBody {
     harness: apiary_core::manifest::HarnessGrant,
@@ -1390,6 +1522,56 @@ fn probe_inference_slot(slot: &apiary_core::manifest::InferenceSlot) -> serde_js
     }
 }
 
+fn inference_probe_key(slot: &apiary_core::manifest::InferenceSlot) -> String {
+    if slot.provider == "claude-code" {
+        // All Claude Code routes share one local account and executable.
+        return "claude-code-account".into();
+    }
+    serde_json::to_string(&json!({
+        "provider": slot.provider,
+        "role": inference_role(&slot.name),
+        "model": slot.model,
+        "requires": slot.requires,
+    }))
+    .unwrap_or_else(|_| format!("{}:{}", slot.provider, slot.name))
+}
+
+fn probe_inference_slots(slots: &[apiary_core::manifest::InferenceSlot]) -> Vec<serde_json::Value> {
+    let mut representatives = std::collections::BTreeMap::new();
+    for slot in slots {
+        representatives
+            .entry(inference_probe_key(slot))
+            .or_insert_with(|| slot.clone());
+    }
+    let statuses = std::thread::scope(|scope| {
+        let handles = representatives
+            .into_iter()
+            .map(|(key, slot)| scope.spawn(move || (key, probe_inference_slot(&slot))))
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok())
+            .collect::<std::collections::HashMap<_, _>>()
+    });
+    slots
+        .iter()
+        .map(|slot| {
+            json!({
+                "name": slot.name,
+                "role": inference_role(&slot.name),
+                "provider": slot.provider,
+                "model": slot.model,
+                "requires": slot.requires,
+                "credential_source": credential_source(slot),
+                "status": statuses.get(&inference_probe_key(slot)).cloned().unwrap_or_else(|| json!({
+                    "state": "unavailable",
+                    "detail": "provider health check did not complete"
+                })),
+            })
+        })
+        .collect()
+}
+
 pub async fn inference_status(
     State(state): State<App>,
     AxPath(npub): AxPath<String>,
@@ -1400,30 +1582,20 @@ pub async fn inference_status(
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
-    let agent_pk = apiary_core::identity::parse_npub(&npub).ok();
-    let ratified = agent_pk.is_some_and(|pk| {
-        ceremony::is_ratified(&EpisodicLog::open(&dir), &raw, &pk, &suspend_pks(&manifest))
-            .unwrap_or(false)
-    });
+    let ratified = crate::agent_decision(&state, &dir, &npub, &raw, &manifest).ratified;
     let slots = manifest.inference.clone();
     let default = manifest.routing.default.clone();
     let rules = manifest.routing.rules.clone();
     let floors = manifest.routing.floors.clone();
+    let configuration = ceremony::manifest_hash(&raw);
+    let state_for_probe = state.clone();
+    let npub_for_probe = npub.clone();
     let probed = tokio::task::spawn_blocking(move || {
-        slots
-            .iter()
-            .map(|slot| {
-                json!({
-                    "name": slot.name,
-                    "role": inference_role(&slot.name),
-                    "provider": slot.provider,
-                    "model": slot.model,
-                    "requires": slot.requires,
-                    "credential_source": credential_source(slot),
-                    "status": probe_inference_slot(slot),
-                })
+        state_for_probe
+            .decisions
+            .inference_probes(&npub_for_probe, &configuration, || {
+                probe_inference_slots(&slots)
             })
-            .collect::<Vec<_>>()
     })
     .await
     .unwrap_or_default();
@@ -1984,6 +2156,8 @@ pub async fn ratify_import(
         Err(e) => return e.into_response(),
     };
     let listed = suspend_pks(&manifest);
+    let state_for_decision = state.clone();
+    let npub_for_decision = npub.clone();
     let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, Resp> {
         let (custody, handle) = admit(&ks, &npub, &pass)?;
         let log = EpisodicLog::open(&dir);
@@ -1998,6 +2172,7 @@ pub async fn ratify_import(
         let snapshot_warning = write_private(&dir.join("manifest.approved.yaml"), &raw)
             .err()
             .map(|e| e.to_string());
+        state_for_decision.decisions.invalidate(&npub_for_decision);
         Ok(json!({
             "ok": true,
             "npub": npub,
@@ -3835,40 +4010,58 @@ pub async fn lease_status(
         Ok(pk) => pk.to_hex(),
         Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
     };
-    let relays2 = relays.clone();
-    let view =
-        tokio::task::spawn_blocking(move || apiary_runtime::lease::fetch(&relays2, &agent_hex))
-            .await
-            .unwrap_or(None);
-    match view {
-        Some(l) => {
-            let expired = l.expired(now_secs());
-            Json(json!({
+    let configuration =
+        serde_json::to_string(&json!({"relays": relays, "host": host})).unwrap_or_default();
+    let key = format!("lease:{npub}");
+    let state_for_view = state.clone();
+    let npub_for_view = npub.clone();
+    let host_for_view = host.clone();
+    let view = tokio::task::spawn_blocking(move || {
+        state_for_view.decisions.observation(
+            &key,
+            &configuration,
+            std::time::Duration::from_secs(10),
+            || match apiary_runtime::lease::fetch(&relays, &agent_hex) {
+                Some(lease) => {
+                    let expired = lease.expired(now_secs());
+                    json!({
+                        "ok": true,
+                        "npub": npub_for_view,
+                        "mechanism": "relay-event",
+                        "coordinated": true,
+                        "host_id": host_for_view,
+                        "lease": {
+                            "holder": lease.host,
+                            "ours": lease.host == host_for_view,
+                            "seq": lease.seq,
+                            "expires_at": lease.expires_at,
+                            "expired": expired,
+                        },
+                    })
+                }
+                None => json!({
+                    "ok": true,
+                    "npub": npub_for_view,
+                    "mechanism": "relay-event",
+                    "coordinated": true,
+                    "host_id": host_for_view,
+                    "lease": null,
+                }),
+            },
+        )
+    })
+    .await
+    .unwrap_or_else(|_| {
+        json!({
                 "ok": true,
                 "npub": npub,
                 "mechanism": "relay-event",
                 "coordinated": true,
                 "host_id": host,
-                "lease": {
-                    "holder": l.host,
-                    "ours": l.host == host,
-                    "seq": l.seq,
-                    "expires_at": l.expires_at,
-                    "expired": expired,
-                },
-            }))
-            .into_response()
-        }
-        None => Json(json!({
-            "ok": true,
-            "npub": npub,
-            "mechanism": "relay-event",
-            "coordinated": true,
-            "host_id": host,
-            "lease": null,
-        }))
-        .into_response(),
-    }
+                "lease": null,
+        })
+    });
+    Json(view).into_response()
 }
 
 /// The human decision "contested-human" defers to: supersede a live foreign
@@ -4250,7 +4443,7 @@ pub fn available_kinds(state: &AppState) -> Vec<String> {
 /// and flip `done` so the supervisor can reap, note, and back off.
 #[allow(clippy::too_many_arguments)]
 fn spawn_channel(
-    state: &AppState,
+    state: &App,
     npub: &str,
     kind: &str,
     dir: std::path::PathBuf,
@@ -4262,10 +4455,10 @@ fn spawn_channel(
         .channel(kind)
         .cloned()
         .ok_or_else(|| format!("manifest declares no presence.{kind}"))?;
-    let pass = state
-        .passphrase_clone()
-        .ok_or("keystore is locked — unlock first")?;
-    let home = state.home.clone();
+    if state.passphrase_clone().is_none() {
+        return Err("keystore is locked — unlock first".into());
+    }
+    let state = state.clone();
     let npub = npub.to_string();
     let kind = kind.to_string();
     let stop = Arc::new(AtomicBool::new(false));
@@ -4297,13 +4490,13 @@ fn spawn_channel(
             push_line(lines, msg);
             done.store(true, Ordering::Relaxed);
         };
-        let ks = match Keystore::open(&home) {
+        let ks = match Keystore::open(&state.home) {
             Ok(k) => k,
             Err(e) => return fail(&lines, &done, format!("keystore: {e}")),
         };
-        let (custody, agent_handle) = match admit(&ks, &npub, &pass) {
+        let (custody, agent_handle) = match crate::admit_agent(&state, &ks, &npub) {
             Ok(v) => v,
-            Err((_, j)) => return fail(&lines, &done, format!("channel died: {}", j.0)),
+            Err(error) => return fail(&lines, &done, format!("channel died: {error}")),
         };
         let name = std::fs::read_to_string(dir.join("name"))
             .unwrap_or_default()
@@ -4410,7 +4603,7 @@ fn spawn_channel(
 }
 
 fn spawn_keeper(
-    state: &AppState,
+    state: &App,
     npub: &str,
     manifest: &apiary_core::manifest::Manifest,
 ) -> Result<Option<KeeperHandle>, String> {
@@ -4418,10 +4611,10 @@ fn spawn_keeper(
     if relays.is_empty() {
         return Ok(None); // uncoordinated, loudly noted by the caller
     }
-    let pass = state
-        .passphrase_clone()
-        .ok_or("keystore is locked — unlock first")?;
-    let home = state.home.clone();
+    if state.passphrase_clone().is_none() {
+        return Err("keystore is locked — unlock first".into());
+    }
+    let state = state.clone();
     let npub = npub.to_string();
     let heartbeat = manifest.lease.heartbeat_secs;
     let expiry = manifest.lease.expiry_secs;
@@ -4439,11 +4632,11 @@ fn spawn_keeper(
         let sink_lines = lines.clone();
         let mut sink = move |l: String| push_line(&sink_lines, l);
         let run = (|| -> Result<(), apiary_runtime::Error> {
-            let ks = Keystore::open(&home)?;
-            let (custody, agent_handle) = admit(&ks, &npub, &pass)
-                .map_err(|(_, j)| apiary_runtime::Error::Provider(j.0.to_string()))?;
+            let ks = Keystore::open(&state.home)?;
+            let (custody, agent_handle) =
+                crate::admit_agent(&state, &ks, &npub).map_err(apiary_runtime::Error::Provider)?;
             let agent_hex = agent_handle.pubkey().to_hex();
-            let host = apiary_runtime::lease::host_id(&home);
+            let host = apiary_runtime::lease::host_id(&state.home);
             apiary_runtime::lease::run_keeper(
                 &custody,
                 &agent_handle,
@@ -4539,12 +4732,7 @@ fn reconcile(state: &App, backoff: &mut std::collections::HashMap<String, u64>) 
         let needs_start = presence.keeper.is_none()
             || declared.iter().any(|k| !presence.channels.contains_key(k));
         if needs_start {
-            let suspend = suspend_pks(&manifest);
-            let Ok(agent_pk) = apiary_core::identity::parse_npub(&npub) else {
-                continue;
-            };
-            let log = EpisodicLog::open(&dir);
-            if !ceremony::is_ratified(&log, &raw, &agent_pk, &suspend).unwrap_or(false) {
+            if !crate::agent_decision(state, &dir, &npub, &raw, &manifest).ratified {
                 state
                     .supervisor_notes
                     .lock()
