@@ -763,7 +763,7 @@ async function renderOverview(c) {
   c.append(governance);
 
   const harnessSection = section('Harnesses and native tools',
-    'A harness is a complete external agent loop such as Goose or Claude Code. Each grant independently controls its native tools, profile inheritance, and accounting. Profile isolation does not sandbox the filesystem or network.');
+    'A harness is a complete external agent loop such as Goose or Claude Code. Each grant independently controls native tools, profile inheritance, OS restrictions, and accounting.');
   const harnessList = el('div');
   for (const harness of (m.harnesses || [])) {
     const card = el('div', 'item');
@@ -771,6 +771,7 @@ async function renderOverview(c) {
       kv('adapter', `${harness.kind || 'acp'} · ${harness.command}`),
       kv('native tools', harness.access || 'inference-only'),
       kv('host profile', harness.profile || 'isolated'),
+      kv('OS sandbox', harness.sandbox || 'none'),
       kv('accounting', harness.metering || 'strict'),
       harness.allowed_tools && harness.allowed_tools.length ? kv('allowed tools', harness.allowed_tools.join(', ')) : el('span'));
     const remove = el('button', 'btn danger', 'Remove');
@@ -797,6 +798,15 @@ async function renderOverview(c) {
   for (const [value, label] of [['isolated', 'Isolated profile · clean HOME'], ['curated', 'Curated profile · selected environment'], ['inherit', 'Full host profile · global agents, skills and credentials']]) {
     const option = el('option', null, label); option.value = value; hProfile.append(option);
   }
+  const hSandbox = el('select');
+  for (const [value, label] of [
+    ['read-only', 'Read only · deny filesystem writes'],
+    ['read-only-no-network', 'Read only + offline · deny writes and network'],
+    ['no-network', 'Offline · deny network access'],
+    ['none', 'Unrestricted OS access · no process sandbox'],
+  ]) {
+    const option = el('option', null, label); option.value = value; hSandbox.append(option);
+  }
   const hTools = el('textarea', 'address-list'); hTools.rows = 3; hTools.placeholder = 'ACP permission title, one per line (curated tools only)';
   const hEnv = el('textarea', 'address-list'); hEnv.rows = 2; hEnv.placeholder = 'Environment variable names, one per line (curated profile only)';
   const hMetering = el('select');
@@ -811,14 +821,15 @@ async function renderOverview(c) {
     field('Arguments', hArgs, 'One per line; arguments are exact and ratified.'),
     field('Working directory', hWorkdir, 'Optional. This selects cwd but does not confine the process.'),
     field('Native tool access', hAccess), field('Host profile', hProfile),
+    field('OS sandbox', hSandbox, 'macOS enforcement applies to the complete harness process tree. A requested sandbox fails closed on unsupported hosts.'),
     field('Allowed tool titles', hTools), field('Inherited environment', hEnv),
     field('Token accounting', hMetering), field('Estimated tokens per run', hEstimate),
-    help('Full host profile deliberately inherits the harness user’s global agents, skills, extensions, credentials, and environment. Isolated creates a clean per-agent HOME. Goose mode is pinned to chat, approve, or auto from the selected access. Other harnesses must honor ACP permission requests; filesystem/network confinement still requires a sandbox.'), hRow);
+    help('Full host profile deliberately inherits the harness user’s global agents, skills, extensions, credentials, and environment. Isolated creates a clean per-agent HOME. Read-only blocks writes but not reads; no-network blocks outbound and inbound network access. Goose mode is pinned to chat, approve, or auto from the selected access. Other harnesses must honor ACP permission requests.'), hRow);
   harnessSave.onclick = async () => {
     const lines = value => value.split('\n').map(item => item.trim()).filter(Boolean);
     const harness = {
       name: hName.value.trim(), kind: 'acp', command: hCommand.value.trim(), args: lines(hArgs.value),
-      access: hAccess.value, profile: hProfile.value, allowed_tools: lines(hTools.value),
+      access: hAccess.value, profile: hProfile.value, sandbox: hSandbox.value, allowed_tools: lines(hTools.value),
       inherit_env: lines(hEnv.value), metering: hMetering.value,
     };
     if (hWorkdir.value.trim()) harness.workdir = hWorkdir.value.trim();

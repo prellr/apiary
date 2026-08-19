@@ -4,7 +4,7 @@
 use apiary_core::custody::Custody;
 use apiary_core::log::EpisodicLog;
 use apiary_core::manifest::{
-    HarnessAccess, HarnessGrant, HarnessMetering, HarnessProfile, Manifest,
+    HarnessAccess, HarnessGrant, HarnessMetering, HarnessProfile, HarnessSandbox, Manifest,
 };
 use nostr::prelude::*;
 
@@ -38,6 +38,7 @@ fn grant(command: &str, access: HarnessAccess) -> HarnessGrant {
         args: Vec::new(),
         access,
         profile: HarnessProfile::Isolated,
+        sandbox: HarnessSandbox::None,
         allowed_tools: Vec::new(),
         inherit_env: Vec::new(),
         metering: HarnessMetering::Unmetered,
@@ -50,7 +51,11 @@ fn grant(command: &str, access: HarnessAccess) -> HarnessGrant {
 fn acp_deny_mode_blocks_tool_and_logs_harness() {
     let (mut manifest, dir, custody, handle) = setup("deny");
     let mock = env!("CARGO_BIN_EXE_mock-acp-agent");
-    let grant = grant(mock, HarnessAccess::InferenceOnly);
+    let mut grant = grant(mock, HarnessAccess::InferenceOnly);
+    #[cfg(target_os = "macos")]
+    {
+        grant.sandbox = HarnessSandbox::ReadOnly;
+    }
     manifest.harnesses.push(grant.clone());
     let out = apiary_runtime::runner::run_acp_task(
         &manifest,
@@ -85,6 +90,8 @@ fn acp_deny_mode_blocks_tool_and_logs_harness() {
     let body = EpisodicLog::parse_body(entries.last().unwrap()).unwrap();
     assert_eq!(body.action, "run.task");
     assert!(body.harness.as_deref().unwrap_or("").starts_with("acp:"));
+    #[cfg(target_os = "macos")]
+    assert_eq!(body.detail.as_ref().unwrap()["sandbox"], "read-only");
     assert_eq!(log.verify().unwrap(), 1);
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -9,7 +9,7 @@
 use apiary_core::custody::{AgentHandle, Custody};
 use apiary_core::log::{Cost, EntryBody, EpisodicLog, Tier};
 use apiary_core::manifest::{
-    HarnessAccess, HarnessGrant, HarnessMetering, HarnessProfile, Manifest,
+    HarnessAccess, HarnessGrant, HarnessMetering, HarnessProfile, HarnessSandbox, Manifest,
 };
 use serde_json::json;
 use std::path::Path;
@@ -780,6 +780,12 @@ pub fn run_acp_task(
         HarnessProfile::Curated => crate::acp::ProfileMode::Curated(grant.inherit_env.clone()),
         HarnessProfile::Inherit => crate::acp::ProfileMode::Inherit,
     };
+    let sandbox = match grant.sandbox {
+        HarnessSandbox::None => crate::acp::SandboxMode::None,
+        HarnessSandbox::ReadOnly => crate::acp::SandboxMode::ReadOnly,
+        HarnessSandbox::NoNetwork => crate::acp::SandboxMode::NoNetwork,
+        HarnessSandbox::ReadOnlyNoNetwork => crate::acp::SandboxMode::ReadOnlyNoNetwork,
+    };
     let workdir = match grant.workdir.as_deref() {
         None | Some("") => agent_dir.to_path_buf(),
         Some(path) => {
@@ -809,6 +815,7 @@ pub fn run_acp_task(
         task,
         mode,
         profile,
+        sandbox,
         &grant.name,
         std::time::Duration::from_secs(300),
     );
@@ -833,6 +840,12 @@ pub fn run_acp_task(
         HarnessMetering::Estimated => "estimated",
         HarnessMetering::Strict => "strict",
     };
+    let sandbox = match grant.sandbox {
+        HarnessSandbox::None => "none",
+        HarnessSandbox::ReadOnly => "read-only",
+        HarnessSandbox::NoNetwork => "no-network",
+        HarnessSandbox::ReadOnlyNoNetwork => "read-only-no-network",
+    };
 
     let event = log.append(
         custody,
@@ -851,6 +864,7 @@ pub fn run_acp_task(
                 "permission_decisions": result.permissions,
                 "access": access,
                 "profile": profile,
+                "sandbox": sandbox,
                 "metering": metering,
                 "estimated_tokens": grant.estimated_tokens_per_run,
                 "tools": grant.allowed_tools,

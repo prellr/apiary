@@ -40,6 +40,14 @@ pub enum ProfileMode {
     Inherit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxMode {
+    None,
+    ReadOnly,
+    NoNetwork,
+    ReadOnlyNoNetwork,
+}
+
 pub struct AcpOutcome {
     /// Accumulated agent text (message chunks joined).
     pub text: String,
@@ -64,6 +72,44 @@ fn goose_mode(command: &str, mode: &PermissionMode) -> Option<&'static str> {
     })
 }
 
+#[cfg(target_os = "macos")]
+fn sandbox_profile(mode: SandboxMode) -> Option<&'static str> {
+    match mode {
+        SandboxMode::None => None,
+        SandboxMode::ReadOnly => Some("(version 1)(allow default)(deny file-write*)"),
+        SandboxMode::NoNetwork => Some("(version 1)(allow default)(deny network*)"),
+        SandboxMode::ReadOnlyNoNetwork => {
+            Some("(version 1)(allow default)(deny file-write*)(deny network*)")
+        }
+    }
+}
+
+fn sandboxed_command(
+    command: &str,
+    args: &[String],
+    sandbox: SandboxMode,
+) -> Result<Command, crate::Error> {
+    if sandbox == SandboxMode::None {
+        let mut process = Command::new(command);
+        process.args(args);
+        return Ok(process);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let profile = sandbox_profile(sandbox).expect("non-none sandbox has a profile");
+        let mut process = Command::new("/usr/bin/sandbox-exec");
+        process.args(["-p", profile, command]).args(args);
+        Ok(process)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (command, args);
+        Err(crate::Error::Provider(format!(
+            "OS sandbox {sandbox:?} was requested, but this host has no supported sandbox backend"
+        )))
+    }
+}
+
 /// Run one prompt through an ACP agent subprocess.
 #[allow(clippy::too_many_arguments)]
 pub fn run_acp_prompt(
@@ -74,6 +120,7 @@ pub fn run_acp_prompt(
     task: &str,
     mode: PermissionMode,
     profile: ProfileMode,
+    sandbox: SandboxMode,
     profile_name: &str,
     turn_timeout: Duration,
 ) -> Result<AcpOutcome, crate::Error> {
@@ -82,8 +129,8 @@ pub fn run_acp_prompt(
     // inheritance is a separate ratified choice. This is profile isolation,
     // not a filesystem/network sandbox; the manifest and UI say so plainly.
     const ENV_ALLOWLIST: &[&str] = &["PATH", "HOME", "USER", "SHELL", "LANG", "TMPDIR", "TERM"];
-    let mut cmd = Command::new(command);
-    cmd.args(args).current_dir(workdir);
+    let mut cmd = sandboxed_command(command, args, sandbox)?;
+    cmd.current_dir(workdir);
     if profile != ProfileMode::Inherit {
         cmd.env_clear();
         for key in ENV_ALLOWLIST {
@@ -338,5 +385,51 @@ mod tests {
             Some("auto")
         );
         assert_eq!(goose_mode("claude", &PermissionMode::Allow), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_read_only_sandbox_denies_child_writes() {
+        use super::{sandboxed_command, SandboxMode};
+        use std::process::Stdio;
+
+        let path =
+            std::env::temp_dir().join(format!("apiary-sandbox-write-probe-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut command = sandboxed_command(
+            "/usr/bin/touch",
+            &[path.to_string_lossy().into_owned()],
+            SandboxMode::ReadOnly,
+        )
+        .unwrap();
+        let status = command
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success());
+        assert!(!path.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_no_network_sandbox_denies_loopback_connections() {
+        use super::{sandboxed_command, SandboxMode};
+        use std::process::Stdio;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port().to_string();
+        let mut command = sandboxed_command(
+            "/usr/bin/nc",
+            &["-z".into(), "127.0.0.1".into(), port],
+            SandboxMode::NoNetwork,
+        )
+        .unwrap();
+        let status = command
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success());
     }
 }

@@ -386,6 +386,8 @@ commands an operator can inject at run time. Each grant independently chooses:
 - `profile`: `isolated` per-agent HOME, `curated` environment inheritance, or
   the complete host `inherit` profile (including its global agents, skills,
   extensions, credentials, and environment)
+- `sandbox`: `read-only`, `no-network`, both as
+  `read-only-no-network`, or explicitly unrestricted `none`
 - `metering`: `strict` refusal while ACP usage is unknown, a fixed
   `estimated` charge, or intentionally `unmetered` operation outside the
   daily token limit
@@ -401,6 +403,7 @@ harnesses:
     args: [acp]
     access: curated
     profile: isolated
+    sandbox: read-only
     allowed_tools: [read_file, write_file, shell]
     metering: estimated
     estimated_tokens_per_run: 8192
@@ -410,13 +413,16 @@ harnesses:
 The cockpit exposes these choices under **Harnesses and native tools**, and
 the Run page selects only a manifest-granted harness name. CLI overrides may
 assert the exact command/arguments but cannot widen the ratified access.
-Profile isolation prevents accidental global configuration inheritance; it is
-not a filesystem or network sandbox. A full inherited profile is therefore a
-legitimate, visibly broad grant rather than a misleadingly “safe” preset.
+Profile isolation prevents accidental global configuration inheritance; the
+separate sandbox controls are enforced across the harness process tree by
+macOS Seatbelt. Requested restrictions fail closed on hosts without a
+supported backend. `read-only` blocks writes but does not hide readable files;
+`no-network` blocks network access but does not restrict files. A full inherited
+profile with sandbox `none` is therefore a legitimate, visibly broad grant.
 For Goose, Apiary also pins `GOOSE_MODE` to `chat`, `approve`, or `auto` from
 the ratified access level. Other harnesses must faithfully emit ACP permission
-requests for title-level curation to be enforceable; the signed log records
-what Apiary approved and what the harness reported, not an imaginary sandbox.
+requests for title-level curation to be enforceable. The signed log records the
+selected sandbox along with permission decisions and reported tool calls.
 
 ## Layout
 

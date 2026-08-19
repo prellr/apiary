@@ -89,6 +89,9 @@ pub struct HarnessGrant {
     /// isolated | curated | inherit
     #[serde(default)]
     pub profile: HarnessProfile,
+    /// none | read-only | no-network | read-only-no-network
+    #[serde(default)]
+    pub sandbox: HarnessSandbox,
     /// ACP permission-request titles permitted by a curated harness.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_tools: Vec<String>,
@@ -151,6 +154,23 @@ pub enum HarnessProfile {
     Curated,
     /// Inherit the host user's complete environment and global profile.
     Inherit,
+}
+
+/// Optional OS-enforced restrictions applied to the entire harness process
+/// tree. Support is platform-dependent and requested modes fail closed when
+/// the host has no enforcement backend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessSandbox {
+    /// No OS sandbox. Profile and ACP permission policy still apply.
+    #[default]
+    None,
+    /// Deny filesystem writes. Reads and network remain available.
+    ReadOnly,
+    /// Deny network access. Filesystem access remains available.
+    NoNetwork,
+    /// Deny both filesystem writes and network access.
+    ReadOnlyNoNetwork,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -933,6 +953,7 @@ mod tests {
             args: vec!["acp".into()],
             access: HarnessAccess::Curated,
             profile: HarnessProfile::Isolated,
+            sandbox: HarnessSandbox::ReadOnly,
             allowed_tools: vec!["shell".into(), "write_file".into()],
             inherit_env: Vec::new(),
             metering: HarnessMetering::Estimated,
@@ -943,6 +964,7 @@ mod tests {
         let round_trip = Manifest::from_yaml(&manifest.to_yaml().unwrap()).unwrap();
         assert_eq!(round_trip.harnesses[0].name, "goose-workspace");
         assert_eq!(round_trip.harnesses[0].access, HarnessAccess::Curated);
+        assert_eq!(round_trip.harnesses[0].sandbox, HarnessSandbox::ReadOnly);
 
         let mut bad = round_trip.harnesses[0].clone();
         bad.allowed_tools.clear();
