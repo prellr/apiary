@@ -456,6 +456,154 @@ pub async fn constitution_set(
     .into_response()
 }
 
+/// Return the SKILL.md interchange form plus requirement status. Skill bodies
+/// are safe to return to governors; credentials remain in separate sealed
+/// connector fields and never appear here.
+pub async fn skills_get(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, _npub, _dir, _raw, manifest) = match gate(&state, &headers, "GET", &uri, None, &npub)
+    {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    let skills = manifest
+        .skills
+        .iter()
+        .map(|skill| {
+            let missing: Vec<&String> = skill
+                .requires_connectors
+                .iter()
+                .filter(|required| {
+                    !manifest
+                        .connectors
+                        .iter()
+                        .any(|connector| connector.kind.as_str() == required.as_str())
+                })
+                .collect();
+            json!({
+                "name": skill.name,
+                "description": skill.description,
+                "markdown": skill.to_markdown().unwrap_or_default(),
+                "requires_connectors": skill.requires_connectors,
+                "available": missing.is_empty(),
+                "missing_connectors": missing,
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(json!({"ok": true, "skills": skills})).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct SkillBody {
+    markdown: String,
+    #[serde(default)]
+    requires_connectors: Vec<String>,
+    #[serde(default)]
+    original_name: Option<String>,
+}
+
+/// Import or update one SKILL.md. The parsed body is embedded in the
+/// manifest, so approval covers the exact instructions and exports remain
+/// self-contained. Connector requirements are checks, never grants.
+pub async fn skill_upsert(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    let body: SkillBody = match serde_json::from_slice(&raw_body) {
+        Ok(body) => body,
+        Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let skill =
+        match apiary_core::manifest::Skill::from_markdown(&body.markdown, body.requires_connectors)
+        {
+            Ok(skill) => skill,
+            Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+        };
+    let original = body.original_name.as_deref().unwrap_or(&skill.name);
+    if original != skill.name
+        && manifest
+            .skills
+            .iter()
+            .any(|existing| existing.name == skill.name)
+    {
+        return err(
+            StatusCode::CONFLICT,
+            format!("a skill named '{}' already exists", skill.name),
+        )
+        .into_response();
+    }
+    manifest.skills.retain(|existing| existing.name != original);
+    manifest.skills.push(skill.clone());
+    manifest
+        .skills
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    if let Err(error) = manifest.validate() {
+        return err(StatusCode::BAD_REQUEST, error).into_response();
+    }
+    let yaml = match manifest.to_yaml() {
+        Ok(yaml) => yaml,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    if let Err(error) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "skill": skill.name,
+        "manifest_sha256": ceremony::manifest_hash(&yaml),
+        "ratified": false,
+        "note": "skill saved — review its instructions and approve the amendment before the agent runs",
+    }))
+    .into_response()
+}
+
+pub async fn skill_delete(
+    State(state): State<App>,
+    AxPath((npub, name)): AxPath<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "DELETE", &uri, None, &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    let before = manifest.skills.len();
+    manifest.skills.retain(|skill| skill.name != name);
+    if manifest.skills.len() == before {
+        return err(StatusCode::NOT_FOUND, format!("no skill named '{name}'")).into_response();
+    }
+    let yaml = match manifest.to_yaml() {
+        Ok(yaml) => yaml,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    if let Err(error) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "removed": name,
+        "manifest_sha256": ceremony::manifest_hash(&yaml),
+        "ratified": false,
+        "note": "skill removed — review and approve the amendment before the agent runs",
+    }))
+    .into_response()
+}
+
 // ---------------------------------------------------------------- owners
 
 #[derive(serde::Deserialize)]

@@ -5,10 +5,10 @@ identity (nostr), not sessions welded to a platform.
 
 An agent is five things, none of which is the model: **identity** (a nostr
 keypair), **constitution** (ratified purpose, role, voice, principles, and
-boundaries), **skillset** (manifest-declared connectors), **memory** (signed log
-and semantic index), and **permissions** (human-owned floors + encrypted
-credential grants). The model is rented, swappable cognition: *inference in,
-connections out*.
+boundaries), **skillset** (ratified SKILL.md workflows), **memory** (signed log
+and semantic index), and **permissions** (manifest-declared connectors,
+human-owned floors, and encrypted credential grants). The model is rented,
+swappable cognition: *inference in, connections out*.
 
 Read the full design: [docs/SPEC.md](docs/SPEC.md).
 
@@ -21,7 +21,7 @@ model runs). What exists today:
 **The substrate** (`apiary-core`)
 
 - Manifest schema v1 — the agent's constitution: identity, operating
-  character, inference pool, routing, connectors, memory, presence,
+  character, skills, inference pool, routing, connectors, memory, presence,
   governance, lease
 - Identity: nostr keypair (BIP-340); custody with NIP-44 seal/open,
   per-agent isolation, JIT decrypt, zeroizing buffers
@@ -47,6 +47,10 @@ model runs). What exists today:
 - Durable role and personality: purpose, role, voice, principles, and
   boundaries are manifest fields injected into every run. Editing them is a
   constitutional amendment that pauses the agent until manager approval
+- Portable skills: standard `SKILL.md` frontmatter + Markdown instructions
+  import into the ratified manifest. The host selects at most three relevant
+  skills per task; unmet connector requirements make a skill visibly
+  unavailable and never grant the missing capability
 - Provenance framing: memory, tool results, and workspace messages are
   DATA in the working set; instructions come only from the constitution
   and the operator's task (proven live: a channel mention asking an agent
@@ -226,6 +230,8 @@ explanations:
   **host connector library** (sidebar, host-scoped, shows which agents hold
   each entry), with curated setup templates for built-in Web, Files, Git,
   and GitHub, plus advanced MCP servers and OAuth-granted remotes
+- **Skills** — import, edit, and remove standard `SKILL.md` workflows;
+  requirement status is shown separately from connector grants
 - **Credentials** — NIP-44 seal/open against the agent's key
 - **Header** — host status chips, keystore lock/unlock (memory for the
   session, with optional macOS Keychain automatic unlock), npub⇄hex key tool

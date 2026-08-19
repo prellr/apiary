@@ -21,6 +21,11 @@ pub struct Manifest {
     /// a connector, but can never grant one.
     #[serde(default, skip_serializing_if = "Constitution::is_empty")]
     pub constitution: Constitution,
+    /// Ratified procedural knowledge. `SKILL.md` is the interchange format;
+    /// the parsed content lives here so the manifest remains the single,
+    /// portable source of truth.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<Skill>,
     /// Inference is a POOL, not a scalar — each entry is a full connection
     /// ("inference in" is itself a credentialed connection, SPEC §1/§7).
     #[serde(default)]
@@ -113,6 +118,138 @@ impl Constitution {
             ));
         }
         sections.join("\n")
+    }
+}
+
+/// One portable skill. Requirements describe capabilities the instructions
+/// expect, but never grant them; connectors remain separate amendments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Skill {
+    pub name: String,
+    pub description: String,
+    pub instructions: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires_connectors: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillFrontmatter {
+    name: String,
+    description: String,
+}
+
+impl Skill {
+    pub const MAX_COUNT: usize = 32;
+    pub const MAX_DESCRIPTION_BYTES: usize = 2_048;
+    pub const MAX_INSTRUCTIONS_BYTES: usize = 32_768;
+
+    /// Parse the interoperable SKILL.md shape: YAML frontmatter containing
+    /// only name + description, followed by Markdown instructions.
+    pub fn from_markdown(
+        markdown: &str,
+        requires_connectors: Vec<String>,
+    ) -> Result<Self, crate::Error> {
+        let normalized = markdown.replace("\r\n", "\n");
+        let rest = normalized.strip_prefix("---\n").ok_or_else(|| {
+            crate::Error::Manifest("SKILL.md must start with YAML frontmatter ('---')".into())
+        })?;
+        let (frontmatter, instructions) = rest.split_once("\n---\n").ok_or_else(|| {
+            crate::Error::Manifest("SKILL.md frontmatter needs a closing '---' line".into())
+        })?;
+        let header: SkillFrontmatter = serde_yaml::from_str(frontmatter)?;
+        let mut skill = Self {
+            name: header.name.trim().to_string(),
+            description: header.description.trim().to_string(),
+            instructions: instructions.trim().to_string(),
+            requires_connectors: requires_connectors
+                .into_iter()
+                .map(|kind| kind.trim().to_string())
+                .filter(|kind| !kind.is_empty())
+                .collect(),
+        };
+        skill.requires_connectors.sort();
+        skill.requires_connectors.dedup();
+        skill.validate()?;
+        Ok(skill)
+    }
+
+    pub fn to_markdown(&self) -> Result<String, crate::Error> {
+        let frontmatter = serde_yaml::to_string(&SkillFrontmatter {
+            name: self.name.clone(),
+            description: self.description.clone(),
+        })?;
+        Ok(format!(
+            "---\n{}\n---\n\n{}\n",
+            frontmatter.trim_end(),
+            self.instructions.trim()
+        ))
+    }
+
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        let valid_name = !self.name.is_empty()
+            && self.name.len() <= 64
+            && !self.name.starts_with('-')
+            && !self.name.ends_with('-')
+            && self
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if !valid_name {
+            return Err(crate::Error::Manifest(format!(
+                "skill name '{}' must be 1-64 lowercase letters, digits, or hyphens",
+                self.name
+            )));
+        }
+        if self.description.trim().is_empty()
+            || self.description.len() > Self::MAX_DESCRIPTION_BYTES
+        {
+            return Err(crate::Error::Manifest(format!(
+                "skill '{}': description must be 1-{} bytes",
+                self.name,
+                Self::MAX_DESCRIPTION_BYTES
+            )));
+        }
+        if self.instructions.trim().is_empty()
+            || self.instructions.len() > Self::MAX_INSTRUCTIONS_BYTES
+        {
+            return Err(crate::Error::Manifest(format!(
+                "skill '{}': instructions must be 1-{} bytes",
+                self.name,
+                Self::MAX_INSTRUCTIONS_BYTES
+            )));
+        }
+        if self
+            .requires_connectors
+            .iter()
+            .any(|kind| kind.trim().is_empty())
+        {
+            return Err(crate::Error::Manifest(format!(
+                "skill '{}': connector requirements cannot be empty",
+                self.name
+            )));
+        }
+        let unique = self
+            .requires_connectors
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        if unique.len() != self.requires_connectors.len() {
+            return Err(crate::Error::Manifest(format!(
+                "skill '{}': connector requirements must be unique",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn requirements_met(&self, manifest: &Manifest) -> bool {
+        self.requires_connectors.iter().all(|required| {
+            manifest
+                .connectors
+                .iter()
+                .any(|connector| connector.kind == *required)
+        })
     }
 }
 
@@ -443,6 +580,23 @@ impl Manifest {
                 ));
             }
         }
+        if self.skills.len() > Skill::MAX_COUNT {
+            return Err(crate::Error::Manifest(format!(
+                "manifest declares {} skills; at most {} are allowed",
+                self.skills.len(),
+                Skill::MAX_COUNT
+            )));
+        }
+        let mut skill_names = std::collections::BTreeSet::new();
+        for skill in &self.skills {
+            skill.validate()?;
+            if !skill_names.insert(skill.name.as_str()) {
+                return Err(crate::Error::Manifest(format!(
+                    "duplicate skill name '{}'",
+                    skill.name
+                )));
+            }
+        }
         // Routing targets must exist in the inference pool.
         let slot_names: Vec<&str> = self.inference.iter().map(|s| s.name.as_str()).collect();
         for rule in self.routing.floors.iter().chain(self.routing.rules.iter()) {
@@ -589,5 +743,38 @@ mod tests {
         assert!(prompt.contains("Voice: Warm and direct"));
         assert!(prompt.contains("Operating principles:\n- Verify account details"));
         assert!(prompt.contains("Behavioral boundaries:\n- Do not issue refunds"));
+    }
+
+    #[test]
+    fn skill_markdown_round_trips_and_normalizes_requirements() {
+        let markdown = "---\r\nname: web-research\r\ndescription: Research current topics with sources.\r\n---\r\n\r\n# Workflow\r\n\r\nSearch, read, and cite.\r\n";
+        let skill = Skill::from_markdown(
+            markdown,
+            vec![
+                " web-fetch ".into(),
+                "web-search".into(),
+                "web-search".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(skill.name, "web-research");
+        assert_eq!(skill.requires_connectors, ["web-fetch", "web-search"]);
+        let round_trip = Skill::from_markdown(
+            &skill.to_markdown().unwrap(),
+            skill.requires_connectors.clone(),
+        )
+        .unwrap();
+        assert_eq!(round_trip.name, skill.name);
+        assert_eq!(round_trip.description, skill.description);
+        assert_eq!(round_trip.instructions, skill.instructions);
+    }
+
+    #[test]
+    fn skill_markdown_rejects_extra_frontmatter_and_bad_names() {
+        let extra =
+            "---\nname: research\ndescription: Research things.\nauthor: stranger\n---\nDo it.";
+        assert!(Skill::from_markdown(extra, vec![]).is_err());
+        let bad_name = "---\nname: Research Skill\ndescription: Research things.\n---\nDo it.";
+        assert!(Skill::from_markdown(bad_name, vec![]).is_err());
     }
 }

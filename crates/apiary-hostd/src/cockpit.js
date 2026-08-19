@@ -280,6 +280,7 @@ async function render() {
   if (tab === 'manifest') return renderManifest(c);
   if (tab === 'buzz') return renderBuzz(c);
   if (tab === 'connectors') return renderConnectors(c);
+  if (tab === 'skills') return renderSkills(c);
   if (tab === 'routines') return renderRoutines(c);
   if (tab === 'creds') return renderCreds(c);
 }
@@ -543,7 +544,7 @@ async function renderOverview(c) {
   const shortcuts = el('div', 'quick-grid');
   shortcuts.append(quick('Start a task', 'Give this agent a one-time job.', 'run'),
     quick('Manage capabilities', 'Choose what it can read or change.', 'connectors'),
-    quick('Manage inference', 'Models, memory, speech, and routing.', 'inference'));
+    quick('Manage skills', 'Add approved workflows and expertise.', 'skills'));
   c.append(shortcuts);
 
   const constitution = m.constitution || {};
@@ -685,6 +686,7 @@ async function renderOverview(c) {
     kv('Default route', (m.routing || {}).default || 'Not set'),
     kv('Memory & voice', supportingModels.length ? supportingModels.map(x => `${inferenceRoleLabel[inferenceRoleForName(x.name)]}: ${x.provider}${x.model ? ' / ' + x.model : ''}`).join(', ') : 'None configured'),
     kv('Capabilities', connectors.length ? connectors.map(x => x.name || x.type).join(', ') : 'None granted'),
+    kv('Skills', (m.skills || []).length ? (m.skills || []).map(x => x.name).join(', ') : 'None installed'),
     kv('Automations', routines.length ? `${routines.length} configured` : 'None'),
     kv('Memory', `${(m.memory || {}).log || 'local'} log · ${(m.memory || {}).index || 'no index'}`));
   if (spend.ok && spend.budget_tokens_per_day) {
@@ -1211,6 +1213,7 @@ async function renderManifest(c) {
   const rows = [
     ['identity.npub', 'the agent’s public key — immutable; the host refuses an amendment that changes it'],
     ['constitution', 'the agent’s durable purpose, role, voice, operating principles, and behavioral boundaries. These are authoritative instructions, but never grant capabilities or override enforced limits.'],
+    ['skills[]', 'approved procedural knowledge imported from SKILL.md. Each entry stores name, trigger description, instructions, and optional connector requirements. Requirements never grant connectors.'],
     ['inference[]', 'agent-owned inference connections. Task-model names are routing targets; reserved names embed, transcribe, and speak provide semantic memory and voice equipment. Manage ordinary changes from Inference. Per-slot credentials are NIP-44-sealed.'],
     ['routing.default', 'slot used when no rule matches'],
     ['routing.rules[]', 'conditional slot choices, e.g. {when: task.class == "reasoning", to: workhorse}'],
@@ -1404,6 +1407,106 @@ async function renderBuzz(c) {
   };
   pollListener();
   listenerPoll = setInterval(pollListener, 3000);
+}
+
+// --------------------------------------------------------------- skills
+
+async function renderSkills(c) {
+  const d = await j(api('/skills'));
+  if (!d.ok) { c.append(el('div', 'ev err', 'Could not load skills: ' + d.error)); return; }
+  const skills = d.skills || [];
+  const head = el('div', 'page-head');
+  head.append(el('div', 'eyebrow', 'Approved know-how'),
+    el('h2', 'page-title', 'Skills'),
+    el('p', 'page-lede', 'Skills are reusable workflows and domain expertise. Apiary imports the standard SKILL.md shape, selects relevant skills for each task, and loads only those instructions.'));
+  c.append(head);
+
+  const installed = section('Installed skills', skills.length
+    ? 'A skill is available only when every connector it requires is separately granted. Skills never add permissions or credentials.'
+    : 'No skills are installed. Add a concise SKILL.md below.');
+  const list = el('div', 'catalog-list');
+  installed.append(list);
+  c.append(installed);
+
+  const editor = el('details', 'section'); editor.open = skills.length === 0;
+  editor.append(el('summary', null, skills.length ? 'Add or edit a skill' : 'Add a skill'));
+  const editorBody = el('div');
+  const markdown = el('textarea'); markdown.rows = 18; markdown.spellcheck = false;
+  markdown.placeholder = `---
+name: web-research
+description: Research current topics with public web sources. Use for briefs, comparisons, and fact checking.
+---
+
+# Workflow
+
+Search broadly, prefer primary sources, distinguish facts from inference, and cite important claims.`;
+  const requirements = el('input');
+  requirements.placeholder = 'web-search, web-fetch';
+  let originalName = null;
+  const save = el('button', 'btn solid', 'Save skill for review');
+  const clear = el('button', 'btn', 'New skill');
+  const status = el('span', 'meta', '');
+  const row = el('div', 'row'); row.append(save, clear, status);
+  editorBody.append(
+    field('SKILL.md', markdown, 'Frontmatter accepts only name and description. Keep the Markdown body concise and procedural.'),
+    field('Required connectors', requirements, 'Optional connector kinds, comma-separated. This checks availability; it does not grant anything.'),
+    help('Saving embeds the exact instructions in the portable manifest and pauses the agent until a manager approves the amendment.'),
+    row);
+  editor.append(editorBody); c.append(editor);
+
+  const resetEditor = () => {
+    originalName = null; markdown.value = ''; requirements.value = '';
+    save.textContent = 'Save skill for review'; status.textContent = '';
+  };
+  clear.onclick = () => { resetEditor(); editor.open = true; markdown.focus(); };
+  save.onclick = async () => {
+    if (!markdown.value.trim()) { status.textContent = 'Paste or write a SKILL.md first.'; markdown.focus(); return; }
+    const required = requirements.value.split(/[\n,]+/).map(value => value.trim()).filter(Boolean);
+    save.disabled = true; status.textContent = 'Validating and saving amendment…';
+    const result = await j(api('/skills'), {
+      method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify({
+        markdown: markdown.value, requires_connectors: required, original_name: originalName,
+      }),
+    });
+    save.disabled = false;
+    if (!result.ok) { status.textContent = 'Could not save: ' + result.error; return; }
+    status.textContent = 'Saved. Review and approve the amendment before the agent can run.';
+    await loadRoster(); render();
+  };
+
+  for (const skill of skills) {
+    const item = el('div', 'catalog-item');
+    item.append(el('h4', null, skill.name), el('p', null, skill.description));
+    const meta = el('div', 'catalog-meta');
+    meta.append(el('span', skill.available ? 'state ready' : 'state unavailable', skill.available ? 'Available' : 'Missing capabilities'));
+    if ((skill.requires_connectors || []).length) {
+      meta.append(el('span', null, 'Requires: ' + skill.requires_connectors.join(', ')));
+    } else {
+      meta.append(el('span', null, 'No connector requirements'));
+    }
+    item.append(meta);
+    if ((skill.missing_connectors || []).length) {
+      item.append(help('Grant separately before use: ' + skill.missing_connectors.join(', ')));
+    }
+    const actions = el('div', 'row');
+    const edit = el('button', 'btn', 'Edit');
+    const remove = el('button', 'btn danger', 'Remove');
+    const itemStatus = el('span', 'meta', '');
+    actions.append(edit, remove, itemStatus); item.append(actions); list.append(item);
+    edit.onclick = () => {
+      originalName = skill.name; markdown.value = skill.markdown;
+      requirements.value = (skill.requires_connectors || []).join(', ');
+      save.textContent = 'Save skill changes for review'; status.textContent = '';
+      editor.open = true; editor.scrollIntoView({behavior:'smooth', block:'start'}); markdown.focus();
+    };
+    remove.onclick = async () => {
+      if (!confirm(`Remove the ${skill.name} skill? The agent will pause until this amendment is approved.`)) return;
+      remove.disabled = true; itemStatus.textContent = 'Removing…';
+      const result = await j(api('/skills/' + encodeURIComponent(skill.name)), {method:'DELETE'});
+      if (!result.ok) { remove.disabled = false; itemStatus.textContent = 'Could not remove: ' + result.error; return; }
+      await loadRoster(); render();
+    };
+  }
 }
 
 // ------------------------------------------------------------ connectors

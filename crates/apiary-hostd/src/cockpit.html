@@ -52,7 +52,7 @@
   .rat { color:var(--ok); border-color:#4c6840; } .unrat { color:var(--bad); border-color:#78483e; }
   .live { color:var(--blue); border-color:#465d75; }
   #panel { flex:1; display:flex; flex-direction:column; min-width:0; }
-  nav { display:flex; gap:1px; border-bottom:1px solid var(--line-soft); padding:0 14px; background:rgba(18,16,13,.46); }
+  nav { display:flex; gap:1px; overflow-x:auto; border-bottom:1px solid var(--line-soft); padding:0 14px; background:rgba(18,16,13,.46); }
   nav button { background:none; border:none; color:var(--dim); padding:12px 11px 10px; cursor:pointer; border-bottom:2px solid transparent; white-space:nowrap; font-size:13px; }
   nav button:hover { color:var(--text); }
   nav button.sel { color:var(--amber); border-bottom-color:var(--amber); }
@@ -250,6 +250,7 @@
       <button data-tab="manifest">Configuration</button>
       <button data-tab="buzz">Workspace</button>
       <button data-tab="connectors">Capabilities</button>
+      <button data-tab="skills">Skills</button>
       <button data-tab="routines">Automations</button>
       <button data-tab="creds">Developer</button>
     </nav>

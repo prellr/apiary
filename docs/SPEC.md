@@ -5,16 +5,17 @@
 ## 1. Thesis
 Build a host for **portable agents**: durable principals with self-owned identity, not sessions welded to a platform.
 
-An agent here is four things, none of which is the model:
+An agent here is five things, none of which is the model:
 
 | Attribute | What it is | Substrate |
 | --- | --- | --- |
 | **Identity** | Who it is — self-owned, provable, portable | nostr keypair (secp256k1) |
-| **Skillset** | What it _can_ do — tools, connectors | Manifest-declared connectors |
+| **Constitution** | Why it exists and how it behaves | Ratified purpose, role, voice, principles, boundaries |
+| **Skillset** | What it knows how to do | Ratified SKILL.md workflows in the manifest |
 | **Memory** | What it knows across runs and hosts | Signed log + semantic index + working set |
-| **Permissions** | What it _may_ do — entitlements, budgets | Floors + encrypted credential grants |
+| **Permissions** | What it _may_ do — capabilities, entitlements, budgets | Connectors + floors + encrypted credential grants |
 
-Skillset and permissions are two views of one mechanism: a skill is a connection out; a permission is which credentials that identity can decrypt and which actions require co-sign.
+Skillset and permissions are deliberately separate. A skill is approved procedural knowledge; it may declare required connector kinds but never grants them. Permissions decide which connectors and credentials the identity actually holds and which actions require co-sign. A skill with unmet requirements remains installed but unavailable.
 
 **Core principle — "inference in, connections out":** the model is rented, swappable cognition. Everything durable (identity, memory, config, credentials) lives outside it. Inference is itself just a connection wired to the cognition port — connections all the way around.
 
@@ -86,6 +87,11 @@ constitution:                  # authoritative operating character, human-ratifi
   voice: Clear, curious, candid, and concise
   principles: [Distinguish facts from inference, Cite sources]
   boundaries: [Never publish without approval]
+skills:                        # SKILL.md content normalized into the manifest
+  - name: web-research
+    description: Research current topics with public web sources
+    instructions: Search broadly, prefer primary sources, and cite claims.
+    requires_connectors: [web-search, web-fetch] # checks only; grants nothing
 inference:                      # a POOL, not a scalar — each entry is a full connection
   - name: workhorse            # hard reasoning, tool orchestration
     provider: anthropic

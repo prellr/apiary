@@ -142,6 +142,14 @@ pub fn build_router(state: App) -> Router {
             "/api/agents/{npub}/constitution",
             post(ops::constitution_set),
         )
+        .route(
+            "/api/agents/{npub}/skills",
+            get(ops::skills_get).post(ops::skill_upsert),
+        )
+        .route(
+            "/api/agents/{npub}/skills/{name}",
+            axum::routing::delete(ops::skill_delete),
+        )
         .route("/api/agents/{npub}/ratify/export", post(ops::ratify_export))
         .route("/api/agents/{npub}/ratify/import", post(ops::ratify_import))
         .route("/api/agents/{npub}/log", get(get_log))
