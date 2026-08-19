@@ -12,6 +12,13 @@ let listenerPoll = null;
 // echoes it back in a header. Without a token this is a no-op.
 const TOKEN = new URLSearchParams(location.search).get('token');
 const REMOTE = new URLSearchParams(location.search).get('remote');
+let DESKTOP = null;
+try {
+  const encoded = new URLSearchParams(location.hash.slice(1)).get('desktop');
+  if (encoded) DESKTOP = JSON.parse(encoded);
+} catch {
+  DESKTOP = null;
+}
 function hdrs(extra) {
   const h = Object.assign({}, extra);
   if (TOKEN) h['x-apiary-token'] = TOKEN;
@@ -105,6 +112,126 @@ function accessSelect(mode = 'read-only') {
   select.setAttribute('aria-label', 'Connector access');
   return select;
 }
+
+function desktopAction(action, params) {
+  const target = new URL(`apiary-desktop://${action}`);
+  for (const [key, value] of Object.entries(params || {})) {
+    if (value !== undefined && value !== null && String(value).trim() !== '') {
+      target.searchParams.set(key, String(value).trim());
+    }
+  }
+  location.assign(target.href);
+}
+
+function renderBackendSwitcher() {
+  if (!DESKTOP) return;
+  const root = document.getElementById('desktop-backend');
+  root.hidden = false;
+  root.className = 'backend-control';
+  root.replaceChildren();
+
+  const profiles = Array.isArray(DESKTOP.remotes) ? DESKTOP.remotes : [];
+  const activeId = DESKTOP.mode === 'remote' ? DESKTOP.active_remote : 'local';
+  const active = profiles.find(profile => profile.id === activeId);
+  const heading = el('div', 'backend-heading');
+  const current = el('span', 'backend-current');
+  current.textContent = DESKTOP.mode === 'remote' && active
+    ? `${active.name}\n${active.ssh_target}`
+    : 'This Mac\nlocal agents and settings';
+  current.style.whiteSpace = 'pre-line';
+  heading.append(el('strong', null, 'Backend'), current);
+  root.append(heading);
+
+  if (DESKTOP.environment_override) {
+    root.append(el('div', 'backend-managed', 'This connection is controlled by the APIARY_REMOTE_SSH environment setting. Remove the setting to switch backends here.'));
+    return;
+  }
+
+  const select = el('select');
+  select.setAttribute('aria-label', 'Apiary backend');
+  const local = el('option', null, 'This Mac (local)');
+  local.value = 'local';
+  select.append(local);
+  for (const profile of profiles) {
+    const option = el('option', null, `${profile.name} (${profile.ssh_target})`);
+    option.value = profile.id;
+    select.append(option);
+  }
+  select.value = activeId || 'local';
+  const switchButton = el('button', 'btn solid', 'Switch');
+  switchButton.type = 'button';
+  switchButton.disabled = select.value === activeId;
+  select.onchange = () => { switchButton.disabled = select.value === activeId; };
+  switchButton.onclick = () => {
+    message.textContent = 'Confirm the backend change in the Apiary dialog.';
+    desktopAction('switch', { profile: select.value });
+  };
+  const primary = el('div', 'backend-actions');
+  primary.append(select, switchButton);
+  root.append(primary);
+
+  const secondary = el('div', 'backend-secondary');
+  const reconnect = el('button', 'btn', 'Reconnect');
+  reconnect.type = 'button';
+  reconnect.onclick = () => {
+    message.textContent = 'Confirm the restart in the Apiary dialog.';
+    desktopAction('reconnect');
+  };
+  const remove = el('button', 'btn danger', 'Remove saved server');
+  remove.type = 'button';
+  remove.disabled = select.value === 'local';
+  select.addEventListener('change', () => { remove.disabled = select.value === 'local'; });
+  remove.onclick = () => {
+    message.textContent = 'Confirm removal in the Apiary dialog.';
+    desktopAction('remove', { profile: select.value });
+  };
+  secondary.append(reconnect, remove);
+  root.append(secondary);
+
+  const message = el('div', 'backend-message');
+  message.setAttribute('role', 'status');
+  message.setAttribute('aria-live', 'polite');
+  root.append(message);
+
+  const add = document.createElement('details');
+  add.className = 'backend-add';
+  add.append(el('summary', null, 'Add a server'));
+  const form = el('form', 'backend-form');
+  const input = (label, name, placeholder, options) => {
+    const control = el('input');
+    control.name = name;
+    control.placeholder = placeholder;
+    for (const [key, value] of Object.entries(options || {})) {
+      if (value === true) control.setAttribute(key, '');
+      else control.setAttribute(key, value);
+    }
+    return field(label, control);
+  };
+  const name = input('Name', 'name', 'Home server', { required: true, maxlength: '80' });
+  name.classList.add('wide');
+  const target = input('SSH destination', 'ssh_target', 'user@server', { required: true, maxlength: '255', pattern: '[^\\s]+' });
+  target.classList.add('wide');
+  const remotePort = input('Apiary port', 'remote_port', '7777', { type: 'number', min: '1', max: '65535', value: '7777' });
+  const localPort = input('Local tunnel port', 'local_port', '7777', { type: 'number', min: '1', max: '65535', value: '7777' });
+  const sshPort = input('SSH port (optional)', 'ssh_port', '22', { type: 'number', min: '1', max: '65535' });
+  const identity = input('SSH key path (optional)', 'identity_file', '/Users/you/.ssh/apiary', { maxlength: '1024' });
+  identity.classList.add('wide');
+  const connect = el('button', 'btn solid', 'Save and connect');
+  connect.type = 'submit';
+  connect.classList.add('wide');
+  form.append(name, target, remotePort, localPort, sshPort, identity, connect);
+  form.onsubmit = event => {
+    event.preventDefault();
+    if (!form.reportValidity()) return;
+    const data = Object.fromEntries(new FormData(form).entries());
+    message.textContent = 'Confirm the new server in the Apiary dialog.';
+    desktopAction('add', data);
+  };
+  add.append(form);
+  root.append(add);
+}
+
+renderBackendSwitcher();
 
 // ------------------------------------------------------------ host status
 

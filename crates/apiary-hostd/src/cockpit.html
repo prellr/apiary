@@ -29,8 +29,24 @@
   .host-menu { position:relative; }
   .host-menu > summary { list-style:none; color:var(--dim); border:1px solid var(--line); border-radius:7px; padding:6px 10px; cursor:pointer; font-size:12px; }
   .host-menu > summary::-webkit-details-marker { display:none; }
-  .host-popover { position:absolute; right:0; top:38px; z-index:5; width:280px; padding:12px; border:1px solid var(--line); border-radius:10px; background:var(--panel-2); box-shadow:0 18px 45px var(--shadow); display:grid; gap:8px; }
+  .host-popover { position:absolute; right:0; top:38px; z-index:5; width:min(440px,calc(100vw - 24px)); max-height:calc(100dvh - 76px); overflow:auto; padding:12px; border:1px solid var(--line); border-radius:10px; background:var(--panel-2); box-shadow:0 18px 45px var(--shadow); display:grid; gap:8px; }
   .host-popover .chip { text-align:left; width:100%; }
+  .backend-control { border-top:1px solid var(--line); margin-top:3px; padding-top:11px; display:grid; gap:9px; }
+  .backend-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
+  .backend-heading strong { font-size:13px; }
+  .backend-current { color:var(--dim); font-size:11px; text-align:right; overflow-wrap:anywhere; }
+  .backend-actions { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:7px; }
+  .backend-actions select { width:100%; }
+  .backend-secondary { display:flex; align-items:center; gap:7px; flex-wrap:wrap; }
+  .backend-secondary .btn { padding:6px 9px; font-size:11px; }
+  .backend-message { min-height:18px; color:var(--dim); font-size:11px; }
+  .backend-add { border-top:1px solid var(--line-soft); padding-top:8px; }
+  .backend-add > summary { color:var(--amber); font-size:11px; }
+  .backend-form { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:9px; margin-top:10px; }
+  .backend-form .wide { grid-column:1 / -1; }
+  .backend-form input { width:100%; }
+  .backend-form .btn { justify-self:start; }
+  .backend-managed { color:var(--dim); font-size:11px; border-top:1px solid var(--line-soft); padding-top:8px; }
   #unlockbar,#keybar { display:none; padding:12px 18px; border-bottom:1px solid var(--line); background:var(--panel); align-items:center; gap:10px; flex-wrap:wrap; }
   #unlockbar input { width:min(320px,100%); }
   #keybar input { width:min(460px,100%); }
@@ -193,6 +209,8 @@
     .connection-form { grid-template-columns:1fr; }
     .connection-form .wide,.connection-actions { grid-column:1; }
     .route-line { grid-template-columns:1fr; }
+    .backend-form { grid-template-columns:1fr; }
+    .backend-form .wide { grid-column:1; }
   }
 </style>
 </head>
@@ -211,6 +229,7 @@
         <span class="chip" id="c-home" title="state directory">State directory</span>
         <span class="chip" id="c-auth" title="host authentication mode">Authentication</span>
         <button class="chip" id="c-keytool" title="npub ⇄ hex converter">Key converter</button>
+        <div id="desktop-backend" hidden></div>
       </div>
     </details>
   </div>

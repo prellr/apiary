@@ -158,6 +158,18 @@ CLI can do) is operable from the GUI with inline explanations:
 cargo run -p apiary-desktop
 ```
 
+The desktop can switch between its embedded host and saved headless servers.
+Open **Host status**, choose a backend, and select **Switch**. The same menu can
+reconnect, remove a saved server, or add an SSH connection. Apiary confirms the
+change in a native dialog, restarts, and keeps the headless daemon bound to the
+server's loopback interface.
+
+Backend profiles are stored with `0600` permissions in
+`~/.apiary/desktop-config.json`. Existing single-server configurations are
+adopted as the first saved profile automatically. `APIARY_REMOTE_SSH` and its
+related environment settings remain the highest-priority override; while an
+override is present, the in-app switcher is read-only.
+
 Or the CLI:
 
 ```bash
