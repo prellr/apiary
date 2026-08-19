@@ -17,7 +17,112 @@ use nostr::prelude::*;
 use sha2::{Digest, Sha256};
 
 const NIP98_KIND: u16 = 27235;
+const CONTROL_TOKEN_KIND: u16 = 27236;
 const FRESHNESS_SECS: u64 = 60;
+const MAX_CONTROL_TOKEN_SECS: u64 = 90 * 24 * 60 * 60;
+
+fn constant_time_eq(presented: &str, expected: &str) -> bool {
+    presented.len() == expected.len()
+        && presented
+            .bytes()
+            .zip(expected.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+}
+
+/// Authenticate the MCP control endpoint. In addition to ordinary NIP-98,
+/// it accepts a time-bounded token signed by an Apiary agent's own Nostr key.
+/// The bearer proves only identity; every called REST operation still checks
+/// that identity against the target agent or host-manager allowlist.
+pub fn check_control(
+    state: &AppState,
+    headers: &HeaderMap,
+    method: &str,
+    path_and_query: &str,
+    body: Option<&[u8]>,
+) -> Result<Option<PublicKey>, (StatusCode, Json<serde_json::Value>)> {
+    let bearer = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer apiary_"));
+    if let Some(encoded) = bearer {
+        return verify_control_token(state, encoded).map(Some);
+    }
+    check(state, headers, method, path_and_query, body)
+}
+
+pub fn issue_control_token(
+    custody: &apiary_core::custody::Custody,
+    handle: &apiary_core::custody::AgentHandle,
+    host_id: &str,
+    expires_in_secs: u64,
+) -> Result<(String, u64), apiary_core::Error> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let ttl = expires_in_secs.clamp(60, MAX_CONTROL_TOKEN_SECS);
+    let expires_at = now.saturating_add(ttl);
+    let audience = format!("apiary-host:{host_id}");
+    let event = custody.sign(
+        handle,
+        EventBuilder::new(Kind::Custom(CONTROL_TOKEN_KIND), "apiary-control")
+            .tag(Tag::custom("aud", vec![audience]))
+            .tag(Tag::custom("exp", vec![expires_at.to_string()])),
+    )?;
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(event.as_json());
+    Ok((format!("apiary_{encoded}"), expires_at))
+}
+
+fn verify_control_token(
+    state: &AppState,
+    encoded: &str,
+) -> Result<PublicKey, (StatusCode, Json<serde_json::Value>)> {
+    let fail = |message: &str| {
+        crate::err(
+            StatusCode::UNAUTHORIZED,
+            format!("apiary control token: {message}"),
+        )
+    };
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| fail("bad base64"))?;
+    let event = Event::from_json(String::from_utf8_lossy(&bytes).as_ref())
+        .map_err(|_| fail("bad event JSON"))?;
+    if event.kind != Kind::Custom(CONTROL_TOKEN_KIND) || event.content != "apiary-control" {
+        return Err(fail("wrong kind or purpose"));
+    }
+    event.verify().map_err(|_| fail("bad signature"))?;
+    let tag = |name: &str| {
+        event.tags.iter().find_map(|tag| {
+            let values = tag.as_slice();
+            (values.first().map(String::as_str) == Some(name)).then(|| values.get(1).cloned())?
+        })
+    };
+    let audience = format!(
+        "apiary-host:{}",
+        apiary_runtime::lease::host_id(&state.home)
+    );
+    if tag("aud").as_deref() != Some(audience.as_str()) {
+        return Err(fail("audience does not match this Apiary host"));
+    }
+    let expires_at = tag("exp")
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| fail("missing or invalid expiry"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if expires_at <= now {
+        return Err(fail("expired"));
+    }
+    if event.created_at.as_secs() > now.saturating_add(FRESHNESS_SECS)
+        || expires_at.saturating_sub(event.created_at.as_secs()) > MAX_CONTROL_TOKEN_SECS
+    {
+        return Err(fail("lifetime is invalid"));
+    }
+    Ok(event.pubkey)
+}
 
 /// Authenticate a request. `path_and_query` is the exact request target
 /// (e.g. "/api/agents/npub1…/log?tail=50"); `body` is the raw body for
@@ -29,6 +134,22 @@ pub fn check(
     path_and_query: &str,
     body: Option<&[u8]>,
 ) -> Result<Option<PublicKey>, (StatusCode, Json<serde_json::Value>)> {
+    // Only the in-process MCP adapter knows this random capability. It may
+    // forward the already-authenticated signer into the ordinary REST gates;
+    // untrusted callers cannot manufacture this header pair.
+    let internal = headers
+        .get("x-apiary-internal-token")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| constant_time_eq(value, &state.internal_token));
+    if internal {
+        return headers
+            .get("x-apiary-internal-signer")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .map(apiary_core::identity::parse_npub)
+            .transpose()
+            .map_err(|error| crate::err(StatusCode::UNAUTHORIZED, error));
+    }
     // Desktop token gate: when the host carries a per-launch token, every
     // request must present it (header or, for the boot navigation and SSE,
     // query param). This binds the embedded daemon to its own webview —
@@ -44,12 +165,7 @@ pub fn check(
         });
         let presented = from_header.or(from_query).unwrap_or_default();
         // Constant-time-ish compare; the token is 32 random bytes of hex.
-        let ok = presented.len() == expected.len()
-            && presented
-                .bytes()
-                .zip(expected.bytes())
-                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                == 0;
+        let ok = constant_time_eq(&presented, expected);
         if !ok {
             return Err(crate::err(
                 StatusCode::UNAUTHORIZED,
@@ -188,6 +304,8 @@ mod tests {
             auth,
             origin: "http://127.0.0.1:7777".into(),
             token: None,
+            internal_token: "test-internal-token".into(),
+            control_audit: std::sync::Mutex::new(()),
             listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
             pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
             managers: std::sync::RwLock::new(crate::access::ManagerRegistry::in_memory(Vec::new())),
@@ -305,6 +423,47 @@ mod tests {
         // Missing payload tag → rejected.
         let h2 = headers_with(signed_header(&keys, url, "POST", None, 0));
         assert!(check(&s, &h2, "POST", "/api/agents/npub1x/run", Some(body)).is_err());
+    }
+
+    #[test]
+    fn signed_control_token_authenticates_as_the_agent() {
+        let s = state(AuthMode::Nip98);
+        let keys = Keys::generate();
+        let expected = keys.public_key();
+        let mut custody = apiary_core::custody::Custody::new();
+        let handle = custody.admit(keys);
+        let host_id = apiary_runtime::lease::host_id(&s.home);
+        let (token, _) = issue_control_token(&custody, &handle, &host_id, 3600).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        assert_eq!(
+            check_control(&s, &headers, "POST", "/mcp", Some(br#"{}"#)).unwrap(),
+            Some(expected)
+        );
+
+        let mut wrong_host = state(AuthMode::Nip98);
+        wrong_host.home =
+            std::env::temp_dir().join(format!("apiary-wrong-control-host-{}", std::process::id()));
+        assert!(check_control(&wrong_host, &headers, "POST", "/mcp", None).is_err());
+    }
+
+    #[test]
+    fn internal_identity_forwarding_requires_process_secret() {
+        let s = state(AuthMode::Nip98);
+        let signer = Keys::generate().public_key();
+        let signer_npub = apiary_core::identity::to_npub(&signer).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-apiary-internal-token", "wrong".parse().unwrap());
+        headers.insert("x-apiary-internal-signer", signer_npub.parse().unwrap());
+        assert!(check(&s, &headers, "GET", "/api/agents", None).is_err());
+        headers.insert(
+            "x-apiary-internal-token",
+            "test-internal-token".parse().unwrap(),
+        );
+        assert_eq!(
+            check(&s, &headers, "GET", "/api/agents", None).unwrap(),
+            Some(signer)
+        );
     }
 
     #[test]

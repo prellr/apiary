@@ -10,6 +10,7 @@
 
 pub mod access;
 pub mod agui;
+pub mod control_mcp;
 pub mod events;
 pub mod nip98;
 pub mod ops;
@@ -63,6 +64,12 @@ pub struct AppState {
     /// present it — the desktop webview gets it in its boot URL, so other
     /// local processes cannot drive the embedded daemon.
     pub token: Option<String>,
+    /// Process-private capability used only when the MCP control adapter
+    /// dispatches into the existing REST router. This preserves one set of
+    /// authorization gates without trusting caller-supplied identity headers.
+    pub internal_token: String,
+    /// Serializes the hash-chained MCP control audit file.
+    pub control_audit: std::sync::Mutex<()>,
     /// Managed Buzz mention listeners, one per agent.
     pub listeners: std::sync::Mutex<std::collections::HashMap<String, ops::AgentPresence>>,
     /// In-flight OAuth grants, keyed by the `state` parameter.
@@ -81,6 +88,25 @@ impl AppState {
     pub fn passphrase_clone(&self) -> Option<String> {
         self.passphrase.read().ok().and_then(|g| g.clone())
     }
+}
+
+/// Publish the current control-plane address for local agents. The file is
+/// only discovery metadata—never a bearer token—and lets portable manifests
+/// use `apiary://local/mcp` across desktop port changes and headless hosts.
+pub fn write_control_discovery(state: &AppState) -> Result<(), std::io::Error> {
+    std::fs::create_dir_all(&state.home)?;
+    let path = state.home.join("control.json");
+    let body = serde_json::to_vec_pretty(&json!({
+        "url": format!("{}/mcp", state.origin.trim_end_matches('/')),
+        "host_id": apiary_runtime::lease::host_id(&state.home),
+    }))?;
+    std::fs::write(&path, body)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -117,6 +143,8 @@ pub fn build_router(state: App) -> Router {
         .route("/api/connectors/discover", post(ops::connectors_discover))
         .route("/api/host/pick-folder", post(ops::pick_folder))
         .route("/api/events", get(events::events))
+        .route("/api/control/audit", get(ops::control_audit_get))
+        .route("/mcp", post(control_mcp::handle))
         .route(
             "/api/agents/{npub}/connectors/{name}/discover",
             post(ops::agent_connector_discover),
@@ -139,6 +167,10 @@ pub fn build_router(state: App) -> Router {
         )
         .route("/api/agents/{npub}/ratify", post(ratify_agent))
         .route(
+            "/api/agents/{npub}/control-token",
+            post(ops::control_token_issue),
+        )
+        .route(
             "/api/agents/{npub}/constitution",
             post(ops::constitution_set),
         )
@@ -149,6 +181,14 @@ pub fn build_router(state: App) -> Router {
         .route(
             "/api/agents/{npub}/skills/{name}",
             axum::routing::delete(ops::skill_delete),
+        )
+        .route(
+            "/api/agents/{npub}/harnesses",
+            get(ops::harnesses_get).post(ops::harness_upsert),
+        )
+        .route(
+            "/api/agents/{npub}/harnesses/{name}",
+            axum::routing::delete(ops::harness_delete),
         )
         .route("/api/agents/{npub}/ratify/export", post(ops::ratify_export))
         .route("/api/agents/{npub}/ratify/import", post(ops::ratify_import))
@@ -526,7 +566,7 @@ async fn put_manifest(
 
 #[derive(serde::Deserialize)]
 struct RatifyBody {
-    /// Ratifying human's key (npub or hex) — keystore-held, listed in suspend_keys.
+    /// Ratifying governor's key (npub or hex) — keystore-held, listed in suspend_keys.
     r#as: String,
 }
 
@@ -575,7 +615,7 @@ async fn ratify_agent(
         }
         Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
     };
-    // A host-held human key signs ONLY for the person who proved possession
+    // A host-held governor key signs ONLY for the identity that proved possession
     // of that same key: in nip98 mode the request signer must BE the
     // ratifier. (Open mode is local trust — same as holding the keystore.)
     if state.auth == AuthMode::Nip98 && signer != Some(ratifier_pk) {
@@ -673,7 +713,7 @@ async fn found_agent(
     if body.suspend_keys.is_empty() {
         return err(
             StatusCode::BAD_REQUEST,
-            "at least one human suspend key is required",
+            "at least one independent governor identity is required",
         )
         .into_response();
     }

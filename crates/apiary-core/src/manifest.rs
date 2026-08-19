@@ -36,6 +36,11 @@ pub struct Manifest {
     /// connector = absent capability (default-deny by construction).
     #[serde(default)]
     pub connectors: Vec<Connector>,
+    /// Foreign execution loops are capabilities too. Each entry names one
+    /// complete harness and the profile, tools, and accounting policy this
+    /// agent's governors approved. Absent entry = harness unavailable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub harnesses: Vec<HarnessGrant>,
     pub memory: Memory,
     #[serde(default)]
     pub presence: Presence,
@@ -64,6 +69,185 @@ pub struct Identity {
     /// compatible with whatever rotation NIP the ecosystem lands on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub successor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessGrant {
+    /// Stable selection name used by API and CLI runs.
+    pub name: String,
+    /// Adapter protocol. ACP is implemented today; additional adapters can
+    /// be added without conflating a harness with an inference provider.
+    #[serde(default = "default_harness_kind")]
+    pub kind: String,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// inference-only | curated | full
+    #[serde(default)]
+    pub access: HarnessAccess,
+    /// isolated | curated | inherit
+    #[serde(default)]
+    pub profile: HarnessProfile,
+    /// ACP permission-request titles permitted by a curated harness.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_tools: Vec<String>,
+    /// Additional host environment variable names inherited by a curated
+    /// profile. Full `inherit` deliberately receives the complete profile.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inherit_env: Vec<String>,
+    /// unmetered | estimated | strict
+    #[serde(default)]
+    pub metering: HarnessMetering,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_tokens_per_run: Option<u64>,
+    /// Optional ratified working directory. This selects a cwd; it is not an
+    /// OS sandbox, and the cockpit states that distinction explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+}
+
+fn default_harness_kind() -> String {
+    "acp".into()
+}
+
+fn validate_slug(label: &str, value: &str, max: usize) -> Result<(), crate::Error> {
+    let valid = !value.is_empty()
+        && value.len() <= max
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    if valid {
+        Ok(())
+    } else {
+        Err(crate::Error::Manifest(format!(
+            "{label} '{value}' must be 1-{max} lowercase letters, digits, or hyphens"
+        )))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessAccess {
+    /// Deny ACP permission requests; known harness-native modes are also
+    /// pinned to chat/inference-only where an adapter supports that.
+    #[default]
+    InferenceOnly,
+    /// Only permission requests matching `allowed_tools` may be approved.
+    Curated,
+    /// Approve the complete native tool surface exposed by the harness.
+    Full,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessProfile {
+    /// Fresh per-agent HOME and scrubbed environment.
+    #[default]
+    Isolated,
+    /// Fresh per-agent HOME plus explicitly named environment variables.
+    Curated,
+    /// Inherit the host user's complete environment and global profile.
+    Inherit,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessMetering {
+    /// Run even though ACP reports no usage; daily token limits do not bound
+    /// this harness. The signed log calls that out on every run.
+    Unmetered,
+    /// Charge a ratified per-run estimate against the daily ledger.
+    Estimated,
+    /// Refuse when the harness cannot report authoritative usage.
+    #[default]
+    Strict,
+}
+
+impl HarnessGrant {
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        validate_slug("harness name", &self.name, 64)?;
+        if self.kind != "acp" {
+            return Err(crate::Error::Manifest(format!(
+                "harness '{}' kind '{}' is unsupported (available: acp)",
+                self.name, self.kind
+            )));
+        }
+        if self.command.trim().is_empty() || self.command.chars().count() > 1024 {
+            return Err(crate::Error::Manifest(format!(
+                "harness '{}' command must be 1–1024 characters",
+                self.name
+            )));
+        }
+        if self.args.len() > 64 || self.args.iter().any(|arg| arg.len() > 4096) {
+            return Err(crate::Error::Manifest(format!(
+                "harness '{}' has too many or oversized arguments",
+                self.name
+            )));
+        }
+        if self.access == HarnessAccess::Curated && self.allowed_tools.is_empty() {
+            return Err(crate::Error::Manifest(format!(
+                "curated harness '{}' requires allowed_tools",
+                self.name
+            )));
+        }
+        if self.allowed_tools.len() > 256
+            || self
+                .allowed_tools
+                .iter()
+                .any(|tool| tool.trim().is_empty() || tool.len() > 512)
+        {
+            return Err(crate::Error::Manifest(format!(
+                "harness '{}' has an invalid tool allowlist",
+                self.name
+            )));
+        }
+        if self.inherit_env.len() > 128
+            || self.inherit_env.iter().any(|name| {
+                name.is_empty()
+                    || name.len() > 128
+                    || !name
+                        .as_bytes()
+                        .first()
+                        .is_some_and(|byte| *byte == b'_' || byte.is_ascii_alphabetic())
+                    || !name
+                        .bytes()
+                        .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+            })
+        {
+            return Err(crate::Error::Manifest(format!(
+                "harness '{}' has an invalid environment-variable allowlist",
+                self.name
+            )));
+        }
+        if self.workdir.as_ref().is_some_and(|workdir| {
+            workdir.trim().is_empty() || workdir.len() > 4096 || workdir.contains('\0')
+        }) {
+            return Err(crate::Error::Manifest(format!(
+                "harness '{}' has an invalid working directory",
+                self.name
+            )));
+        }
+        match (self.metering, self.estimated_tokens_per_run) {
+            (HarnessMetering::Estimated, Some(1..=64_000)) => {}
+            (HarnessMetering::Estimated, _) => {
+                return Err(crate::Error::Manifest(format!(
+                    "estimated harness '{}' needs estimated_tokens_per_run between 1 and 64000",
+                    self.name
+                )))
+            }
+            (_, Some(_)) => {
+                return Err(crate::Error::Manifest(format!(
+                    "harness '{}' may set estimated_tokens_per_run only with estimated metering",
+                    self.name
+                )))
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 /// Human-owned operating character. These fields are injected as
@@ -416,8 +600,9 @@ impl PresenceChannel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Governance {
-    /// Human keys that can halt the agent (SPEC §8). Suspension authority
-    /// must never rest with the agent's own key.
+    /// Independent Nostr identities that can halt and govern the agent
+    /// (SPEC §8). An identity may belong to a person or a separate manager
+    /// agent; suspension authority must never rest with this agent's own key.
     pub suspend_keys: Vec<String>,
     /// Unified spend authority: token budgets and money budgets are one
     /// system of human-owned floors enforced by the host core.
@@ -566,7 +751,7 @@ impl Manifest {
         let agent_pk = crate::identity::parse_npub(&self.identity.npub)?;
         if self.governance.suspend_keys.is_empty() {
             return Err(crate::Error::Manifest(
-                "governance.suspend_keys must name at least one human key: \
+                "governance.suspend_keys must name at least one independent governor identity: \
                  suspension authority can never rest with the agent's own key"
                     .into(),
             ));
@@ -594,6 +779,16 @@ impl Manifest {
                 return Err(crate::Error::Manifest(format!(
                     "duplicate skill name '{}'",
                     skill.name
+                )));
+            }
+        }
+        let mut harness_names = std::collections::BTreeSet::new();
+        for harness in &self.harnesses {
+            harness.validate()?;
+            if !harness_names.insert(harness.name.as_str()) {
+                return Err(crate::Error::Manifest(format!(
+                    "duplicate harness name '{}'",
+                    harness.name
                 )));
             }
         }
@@ -726,6 +921,36 @@ mod tests {
         let manifest = Manifest::from_yaml(&minimal_yaml()).unwrap();
         assert!(manifest.constitution.is_empty());
         assert!(!manifest.to_yaml().unwrap().contains("constitution:"));
+    }
+
+    #[test]
+    fn harness_grants_are_portable_and_fail_closed() {
+        let mut manifest = Manifest::from_yaml(&minimal_yaml()).unwrap();
+        manifest.harnesses.push(HarnessGrant {
+            name: "goose-workspace".into(),
+            kind: "acp".into(),
+            command: "goose".into(),
+            args: vec!["acp".into()],
+            access: HarnessAccess::Curated,
+            profile: HarnessProfile::Isolated,
+            allowed_tools: vec!["shell".into(), "write_file".into()],
+            inherit_env: Vec::new(),
+            metering: HarnessMetering::Estimated,
+            estimated_tokens_per_run: Some(8192),
+            workdir: Some("/workspace".into()),
+        });
+        manifest.validate().unwrap();
+        let round_trip = Manifest::from_yaml(&manifest.to_yaml().unwrap()).unwrap();
+        assert_eq!(round_trip.harnesses[0].name, "goose-workspace");
+        assert_eq!(round_trip.harnesses[0].access, HarnessAccess::Curated);
+
+        let mut bad = round_trip.harnesses[0].clone();
+        bad.allowed_tools.clear();
+        assert!(bad.validate().is_err());
+        bad.access = HarnessAccess::Full;
+        bad.metering = HarnessMetering::Strict;
+        bad.estimated_tokens_per_run = Some(100);
+        assert!(bad.validate().is_err());
     }
 
     #[test]

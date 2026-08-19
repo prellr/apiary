@@ -19,12 +19,25 @@ use std::time::Duration;
 
 /// Host policy for the harness's permission requests. Default deny: a
 /// hijacked or overeager loop is bounded by construction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionMode {
-    /// Reject every request (read-only observation of the harness).
+    /// Reject every ACP permission request. Harnesses that perform native
+    /// actions without requesting permission need their own mode or sandbox.
     Deny,
     /// Approve every request (the human explicitly opted in for this run).
     Allow,
+    /// Approve only matching ACP tool titles; reject every other request.
+    AllowList(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileMode {
+    /// Scrubbed environment and a fresh per-agent HOME.
+    Isolated,
+    /// Isolated profile plus explicitly named environment variables.
+    Curated(Vec<String>),
+    /// The harness receives the host user's complete environment and HOME.
+    Inherit,
 }
 
 pub struct AcpOutcome {
@@ -37,26 +50,71 @@ pub struct AcpOutcome {
     pub permissions: Vec<(String, String)>,
 }
 
+fn goose_mode(command: &str, mode: &PermissionMode) -> Option<&'static str> {
+    let name = std::path::Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())?;
+    if name != "goose" && !name.starts_with("goose-") {
+        return None;
+    }
+    Some(match mode {
+        PermissionMode::Deny => "chat",
+        PermissionMode::AllowList(_) => "approve",
+        PermissionMode::Allow => "auto",
+    })
+}
+
 /// Run one prompt through an ACP agent subprocess.
+#[allow(clippy::too_many_arguments)]
 pub fn run_acp_prompt(
     command: &str,
     args: &[String],
     workdir: &std::path::Path,
+    profile_root: &std::path::Path,
     task: &str,
     mode: PermissionMode,
+    profile: ProfileMode,
+    profile_name: &str,
     turn_timeout: Duration,
 ) -> Result<AcpOutcome, crate::Error> {
-    // The harness gets a MINIMAL environment, not ours: no APIARY_PASSPHRASE,
-    // no provider credentials, no session markers. Capability flows through
-    // permission-gated tools, never through inherited env. (Filesystem and
-    // network isolation still require an OS sandbox — documented limit.)
+    // Isolated and curated profiles get a per-agent HOME, so global agents,
+    // skills, extensions, and credentials do not leak in accidentally. Full
+    // inheritance is a separate ratified choice. This is profile isolation,
+    // not a filesystem/network sandbox; the manifest and UI say so plainly.
     const ENV_ALLOWLIST: &[&str] = &["PATH", "HOME", "USER", "SHELL", "LANG", "TMPDIR", "TERM"];
     let mut cmd = Command::new(command);
-    cmd.args(args).current_dir(workdir).env_clear();
-    for key in ENV_ALLOWLIST {
-        if let Ok(v) = std::env::var(key) {
-            cmd.env(key, v);
+    cmd.args(args).current_dir(workdir);
+    if profile != ProfileMode::Inherit {
+        cmd.env_clear();
+        for key in ENV_ALLOWLIST {
+            if *key != "HOME" {
+                if let Ok(value) = std::env::var(key) {
+                    cmd.env(key, value);
+                }
+            }
         }
+        if let ProfileMode::Curated(names) = &profile {
+            for name in names {
+                if let Ok(value) = std::env::var(name) {
+                    cmd.env(name, value);
+                }
+            }
+        }
+        let profile_home = profile_root
+            .join(".apiary-harnesses")
+            .join(profile_name)
+            .join("home");
+        std::fs::create_dir_all(&profile_home)?;
+        cmd.env("HOME", &profile_home)
+            .env("XDG_CONFIG_HOME", profile_home.join(".config"))
+            .env("XDG_DATA_HOME", profile_home.join(".local/share"))
+            .env("XDG_CACHE_HOME", profile_home.join(".cache"));
+    }
+    // Goose has an explicit native execution mode in addition to ACP
+    // permission requests. Pin it from the ratified access policy so an
+    // inherited global GOOSE_MODE cannot silently widen this agent.
+    if let Some(goose_mode) = goose_mode(command, &mode) {
+        cmd.env("GOOSE_MODE", goose_mode);
     }
     let mut child = cmd
         .stdin(Stdio::piped())
@@ -151,9 +209,17 @@ fn drive(
                     // back to an allow option — a malformed option list gets
                     // a JSON-RPC error, which the harness must treat as
                     // not-granted.
-                    let acceptable = |kind: &str| match mode {
-                        PermissionMode::Allow => kind.starts_with("allow"),
-                        PermissionMode::Deny => {
+                    let tool_allowed = match &mode {
+                        PermissionMode::Allow => true,
+                        PermissionMode::AllowList(allowed) => {
+                            allowed.iter().any(|item| item == &title)
+                        }
+                        PermissionMode::Deny => false,
+                    };
+                    let acceptable = |kind: &str| {
+                        if tool_allowed {
+                            kind.starts_with("allow")
+                        } else {
                             kind.starts_with("reject") || kind.starts_with("deny")
                         }
                     };
@@ -250,5 +316,27 @@ fn drive(
                 return Ok(out);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{goose_mode, PermissionMode};
+
+    #[test]
+    fn goose_native_mode_is_pinned_from_ratified_access() {
+        assert_eq!(goose_mode("goose", &PermissionMode::Deny), Some("chat"));
+        assert_eq!(
+            goose_mode(
+                "/usr/local/bin/goose-acp",
+                &PermissionMode::AllowList(vec!["shell".into()])
+            ),
+            Some("approve")
+        );
+        assert_eq!(
+            goose_mode("/opt/bin/goose", &PermissionMode::Allow),
+            Some("auto")
+        );
+        assert_eq!(goose_mode("claude", &PermissionMode::Allow), None);
     }
 }

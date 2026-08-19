@@ -8,7 +8,9 @@
 
 use apiary_core::custody::{AgentHandle, Custody};
 use apiary_core::log::{Cost, EntryBody, EpisodicLog, Tier};
-use apiary_core::manifest::Manifest;
+use apiary_core::manifest::{
+    HarnessAccess, HarnessGrant, HarnessMetering, HarnessProfile, Manifest,
+};
 use serde_json::json;
 use std::path::Path;
 
@@ -711,33 +713,32 @@ pub struct AcpRunOutcome {
 /// governance shell as the native loop: budget floor first, permission
 /// requests decided by host policy, the whole session signed into the log
 /// with harness attribution. The loop is rented; the shell is ours.
-#[allow(clippy::too_many_arguments)]
 pub fn run_acp_task(
     manifest: &Manifest,
     agent_dir: &Path,
     custody: &Custody,
     agent: &AgentHandle,
     task: &str,
-    command: &str,
-    args: &[String],
-    allow_permissions: bool,
+    grant: &HarnessGrant,
 ) -> Result<AcpRunOutcome, crate::Error> {
+    grant.validate()?;
+    if !manifest.harnesses.iter().any(|approved| approved == grant) {
+        return Err(crate::Error::Provider(format!(
+            "harness '{}' is not present exactly as supplied in the ratified manifest",
+            grant.name
+        )));
+    }
     let log = EpisodicLog::open(agent_dir);
     let ledger = SpendLedger::open(agent_dir);
-    let harness = format!("acp:{command}");
-
-    // Budget floor still gates entry. ACP runtimes don't report token usage
-    // on the wire, so spend inside the session is unmetered — recorded as
-    // such rather than pretended away. (Metering lands with provider-side
-    // accounting in the daemon.)
+    let harness = format!("acp:{}:{}", grant.name, grant.command);
     let cap = tokens_per_day(&manifest.governance.budgets)?;
-    match ledger.reserve(cap) {
-        // ACP usage is unmetered on the wire; the reservation only proves
-        // the budget is not exhausted, then frees immediately.
-        Ok(r) => {
-            ledger.settle(r, 0, 0)?;
-        }
-        Err(e) => {
+    let estimated_reservation = match grant.metering {
+        HarnessMetering::Unmetered => None,
+        HarnessMetering::Strict => {
+            let error = crate::Error::Budget(format!(
+                "harness '{}' does not report authoritative token usage; choose estimated or unmetered accounting in the ratified agent policy",
+                grant.name
+            ));
             log.append(
                 custody,
                 agent,
@@ -746,28 +747,92 @@ pub fn run_acp_task(
                     action: "run.task".into(),
                     model: None,
                     cost: None,
-                    harness: Some(harness),
+                    harness: Some(harness.clone()),
                     outcome: "budget-refused".into(),
-                    detail: Some(json!({ "task": task })),
+                    detail: Some(json!({ "task": task, "metering": "strict" })),
                 },
             )?;
-            return Err(e);
+            return Err(error);
         }
-    }
-
-    let mode = if allow_permissions {
-        crate::acp::PermissionMode::Allow
-    } else {
-        crate::acp::PermissionMode::Deny
+        HarnessMetering::Estimated => {
+            let estimate = grant.estimated_tokens_per_run.unwrap_or(0);
+            let reservation = ledger.reserve_up_to(cap, Some(estimate))?;
+            if reservation.amount < estimate {
+                ledger.settle(reservation, 0, 0)?;
+                return Err(crate::Error::Budget(format!(
+                    "harness '{}' needs its ratified {estimate}-token estimate, but only {} tokens remain",
+                    grant.name, reservation.amount
+                )));
+            }
+            Some(reservation)
+        }
     };
+
+    let mode = match grant.access {
+        HarnessAccess::InferenceOnly => crate::acp::PermissionMode::Deny,
+        HarnessAccess::Curated => {
+            crate::acp::PermissionMode::AllowList(grant.allowed_tools.clone())
+        }
+        HarnessAccess::Full => crate::acp::PermissionMode::Allow,
+    };
+    let profile = match grant.profile {
+        HarnessProfile::Isolated => crate::acp::ProfileMode::Isolated,
+        HarnessProfile::Curated => crate::acp::ProfileMode::Curated(grant.inherit_env.clone()),
+        HarnessProfile::Inherit => crate::acp::ProfileMode::Inherit,
+    };
+    let workdir = match grant.workdir.as_deref() {
+        None | Some("") => agent_dir.to_path_buf(),
+        Some(path) => {
+            let path = std::path::PathBuf::from(path);
+            if path.is_absolute() {
+                path
+            } else {
+                agent_dir.join(path)
+            }
+        }
+    };
+    if !workdir.is_dir() {
+        if let Some(reservation) = estimated_reservation {
+            let _ = ledger.settle(reservation, 0, 0);
+        }
+        return Err(crate::Error::Provider(format!(
+            "harness '{}' working directory does not exist: {}",
+            grant.name,
+            workdir.display()
+        )));
+    }
     let result = crate::acp::run_acp_prompt(
-        command,
-        args,
+        &grant.command,
+        &grant.args,
+        &workdir,
         agent_dir,
         task,
         mode,
+        profile,
+        &grant.name,
         std::time::Duration::from_secs(300),
-    )?;
+    );
+    if let Some(reservation) = estimated_reservation {
+        let estimate = grant.estimated_tokens_per_run.unwrap_or(0);
+        ledger.settle(reservation, estimate, 0)?;
+    }
+    let result = result?;
+
+    let access = match grant.access {
+        HarnessAccess::InferenceOnly => "inference-only",
+        HarnessAccess::Curated => "curated",
+        HarnessAccess::Full => "full",
+    };
+    let profile = match grant.profile {
+        HarnessProfile::Isolated => "isolated",
+        HarnessProfile::Curated => "curated",
+        HarnessProfile::Inherit => "inherit",
+    };
+    let metering = match grant.metering {
+        HarnessMetering::Unmetered => "unmetered",
+        HarnessMetering::Estimated => "estimated",
+        HarnessMetering::Strict => "strict",
+    };
 
     let event = log.append(
         custody,
@@ -784,8 +849,11 @@ pub fn run_acp_task(
                 "response_chars": result.text.len(),
                 "tool_calls": result.tool_calls,
                 "permission_decisions": result.permissions,
-                "permission_mode": if allow_permissions { "allow" } else { "deny" },
-                "tokens_unmetered": true,
+                "access": access,
+                "profile": profile,
+                "metering": metering,
+                "estimated_tokens": grant.estimated_tokens_per_run,
+                "tools": grant.allowed_tools,
             })),
         },
     )?;

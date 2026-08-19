@@ -80,7 +80,7 @@ pub fn bind_connectors_in(
     }
     for entry in &manifest.connectors {
         match entry.kind.as_str() {
-            "mcp" => out.extend(bind_mcp(entry, custody, agent)?),
+            "mcp" => out.extend(bind_mcp(entry, custody, agent, agent_dir)?),
             "obsidian" => out.extend(bind_vault(entry, true)?),
             "markdown-vault" => out.extend(bind_vault(entry, false)?),
             "web-search" => {
@@ -282,6 +282,7 @@ fn bind_mcp(
     entry: &apiary_core::manifest::Connector,
     custody: &Custody,
     agent: &AgentHandle,
+    agent_dir: Option<&std::path::Path>,
 ) -> Result<Vec<Box<dyn Connector>>, crate::Error> {
     use std::sync::{Arc, Mutex};
     let cap_str = |k: &str| entry.caps.get(k).and_then(|v| v.as_str()).map(String::from);
@@ -333,8 +334,9 @@ fn bind_mcp(
             None,
         ),
         "http" => {
-            let url = cap_str("url")
+            let raw_url = cap_str("url")
                 .ok_or_else(|| crate::Error::Provider("mcp http requires caps.url".into()))?;
+            let url = resolve_mcp_url(&raw_url, agent_dir)?;
             let (bearer, refresh) = match credential_plain.as_deref() {
                 None => (None, None),
                 Some(raw) => match serde_json::from_str::<Value>(raw) {
@@ -390,6 +392,38 @@ fn bind_mcp(
         }));
     }
     Ok(out)
+}
+
+fn resolve_mcp_url(
+    configured: &str,
+    agent_dir: Option<&std::path::Path>,
+) -> Result<String, crate::Error> {
+    if configured != "apiary://local/mcp" {
+        return Ok(configured.to_string());
+    }
+    let agent_dir = agent_dir.ok_or_else(|| {
+        crate::Error::Provider(
+            "apiary://local/mcp requires an agent directory (run through an Apiary host)".into(),
+        )
+    })?;
+    let home = agent_dir
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or_else(|| crate::Error::Provider("could not resolve the Apiary home".into()))?;
+    let path = home.join("control.json");
+    let raw = std::fs::read_to_string(&path).map_err(|error| {
+        crate::Error::Provider(format!(
+            "{} is unavailable; start Apiary or use an explicit MCP URL: {error}",
+            path.display()
+        ))
+    })?;
+    let value: Value = serde_json::from_str(&raw)?;
+    value
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+        .map(String::from)
+        .ok_or_else(|| crate::Error::Provider(format!("{} has no valid url", path.display())))
 }
 
 fn mcp_tool_allowed(
@@ -2254,6 +2288,28 @@ mod connector_security_tests {
         assert!(public_ip(IpAddr::V6(
             "2606:4700:4700::1111".parse().unwrap()
         )));
+    }
+
+    #[test]
+    fn local_apiary_mcp_url_follows_host_discovery() {
+        let home =
+            std::env::temp_dir().join(format!("apiary-mcp-discovery-{}", std::process::id()));
+        let agent_dir = home.join("agents/npub1test");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            home.join("control.json"),
+            r#"{"url":"http://127.0.0.1:43210/mcp","host_id":"test"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_mcp_url("apiary://local/mcp", Some(&agent_dir)).unwrap(),
+            "http://127.0.0.1:43210/mcp"
+        );
+        assert_eq!(
+            resolve_mcp_url("https://example.com/mcp", Some(&agent_dir)).unwrap(),
+            "https://example.com/mcp"
+        );
+        std::fs::remove_dir_all(home).ok();
     }
 
     #[test]

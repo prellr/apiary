@@ -64,6 +64,15 @@ function approvalPeople() {
   return [...byNpub.values()].sort((a, b) => (a.name || a.npub).localeCompare(b.name || b.npub));
 }
 
+function agentManagerCandidates(target) {
+  const byNpub = new Map();
+  for (const identity of approvalPeople()) byNpub.set(identity.npub, {...identity, identityKind: 'person'});
+  for (const agent of agents) {
+    if (agent.npub !== target) byNpub.set(agent.npub, {...agent, identityKind: 'agent'});
+  }
+  return [...byNpub.values()].sort((a, b) => (a.name || a.npub).localeCompare(b.name || b.npub));
+}
+
 function field(labelText, control, hint) {
   const label = el('label', 'field');
   label.append(el('span', null, labelText), control);
@@ -713,10 +722,10 @@ async function renderOverview(c) {
   c.append(character);
 
   const governorKeys = ((m.governance || {}).suspend_keys || []);
-  const people = approvalPeople();
+  const people = agentManagerCandidates(sel);
   const knownKeys = new Set(people.map(person => person.npub));
   const governance = section('Agent managers',
-    'These people can independently approve configuration changes, stop this agent, and ask it to act. Host access is separate; selecting someone here does not let them administer other agents.');
+    'These identities can independently approve configuration changes, stop this agent, and ask it to act. A manager may be a person or another Apiary agent. Host access is separate, and the agent cannot manage itself.');
   const checks = [];
   for (const person of people) {
     const checkbox = el('input'); checkbox.type = 'checkbox'; checkbox.style.width = 'auto';
@@ -724,7 +733,8 @@ async function renderOverview(c) {
     const label = el('label', 'row');
     label.append(checkbox, el('span', null, person.name || person.npub.slice(0, 16)),
       el('code', null, person.npub),
-      managers.some(manager => manager.npub === person.npub) ? el('span', 'meta', 'host manager') : el('span'));
+      el('span', 'meta', person.identityKind === 'agent' ? 'Apiary agent' :
+        managers.some(manager => manager.npub === person.npub) ? 'host manager' : 'person'));
     governance.append(label); checks.push([checkbox, person.npub]);
   }
   const other = el('textarea', 'address-list'); other.rows = 3;
@@ -733,7 +743,7 @@ async function renderOverview(c) {
   const saveManagers = el('button', 'btn', 'Save agent managers');
   const managerStatus = el('span', 'meta', '');
   const managerRow = el('div', 'row'); managerRow.append(saveManagers, managerStatus);
-  governance.append(field('Other Nostr IDs', other, 'For people who should govern this agent without receiving host-wide access.'),
+  governance.append(field('Other Nostr IDs', other, 'For people or agent identities that should govern this agent without receiving host-wide access.'),
     help('Changing this list is a constitutional amendment: Apiary pauses the agent until one of the newly listed managers approves it.'),
     managerRow);
   saveManagers.onclick = async () => {
@@ -751,6 +761,104 @@ async function renderOverview(c) {
     await loadRoster(); render();
   };
   c.append(governance);
+
+  const harnessSection = section('Harnesses and native tools',
+    'A harness is a complete external agent loop such as Goose or Claude Code. Each grant independently controls its native tools, profile inheritance, and accounting. Profile isolation does not sandbox the filesystem or network.');
+  const harnessList = el('div');
+  for (const harness of (m.harnesses || [])) {
+    const card = el('div', 'item');
+    card.append(el('b', null, harness.name),
+      kv('adapter', `${harness.kind || 'acp'} · ${harness.command}`),
+      kv('native tools', harness.access || 'inference-only'),
+      kv('host profile', harness.profile || 'isolated'),
+      kv('accounting', harness.metering || 'strict'),
+      harness.allowed_tools && harness.allowed_tools.length ? kv('allowed tools', harness.allowed_tools.join(', ')) : el('span'));
+    const remove = el('button', 'btn danger', 'Remove');
+    remove.onclick = async () => {
+      if (!confirm(`Remove harness ${harness.name} from this agent?`)) return;
+      const result = await j(api('/harnesses/' + encodeURIComponent(harness.name)), {method: 'DELETE'});
+      if (!result.ok) { alert('Could not remove harness: ' + result.error); return; }
+      await loadRoster(); render();
+    };
+    card.append(remove); harnessList.append(card);
+  }
+  if (!(m.harnesses || []).length) harnessList.append(el('div', 'none', 'No foreign harnesses granted · native Apiary loop only'));
+  const harnessForm = el('details');
+  harnessForm.append(el('summary', null, 'Add a harness'));
+  const hName = el('input'); hName.placeholder = 'e.g. goose-workspace';
+  const hCommand = el('input'); hCommand.placeholder = 'e.g. goose';
+  const hArgs = el('textarea', 'address-list'); hArgs.rows = 3; hArgs.placeholder = 'One argument per line';
+  const hWorkdir = el('input'); hWorkdir.placeholder = 'Optional working directory';
+  const hAccess = el('select');
+  for (const [value, label] of [['inference-only', 'Inference only · deny ACP tool requests'], ['curated', 'Curated native tools · approve selected requests'], ['full', 'Full harness · approve native tools']]) {
+    const option = el('option', null, label); option.value = value; hAccess.append(option);
+  }
+  const hProfile = el('select');
+  for (const [value, label] of [['isolated', 'Isolated profile · clean HOME'], ['curated', 'Curated profile · selected environment'], ['inherit', 'Full host profile · global agents, skills and credentials']]) {
+    const option = el('option', null, label); option.value = value; hProfile.append(option);
+  }
+  const hTools = el('textarea', 'address-list'); hTools.rows = 3; hTools.placeholder = 'ACP permission title, one per line (curated tools only)';
+  const hEnv = el('textarea', 'address-list'); hEnv.rows = 2; hEnv.placeholder = 'Environment variable names, one per line (curated profile only)';
+  const hMetering = el('select');
+  for (const [value, label] of [['strict', 'Strict · refuse unknown usage'], ['estimated', 'Estimated · charge a fixed amount'], ['unmetered', 'Unmetered · daily token limit does not apply']]) {
+    const option = el('option', null, label); option.value = value; hMetering.append(option);
+  }
+  const hEstimate = el('input'); hEstimate.type = 'number'; hEstimate.min = '1'; hEstimate.max = '64000'; hEstimate.value = '8192';
+  const harnessSave = el('button', 'btn', 'Add harness');
+  const harnessStatus = el('span', 'meta', '');
+  const hRow = el('div', 'row'); hRow.append(harnessSave, harnessStatus);
+  harnessForm.append(field('Name', hName), field('Command', hCommand),
+    field('Arguments', hArgs, 'One per line; arguments are exact and ratified.'),
+    field('Working directory', hWorkdir, 'Optional. This selects cwd but does not confine the process.'),
+    field('Native tool access', hAccess), field('Host profile', hProfile),
+    field('Allowed tool titles', hTools), field('Inherited environment', hEnv),
+    field('Token accounting', hMetering), field('Estimated tokens per run', hEstimate),
+    help('Full host profile deliberately inherits the harness user’s global agents, skills, extensions, credentials, and environment. Isolated creates a clean per-agent HOME. Goose mode is pinned to chat, approve, or auto from the selected access. Other harnesses must honor ACP permission requests; filesystem/network confinement still requires a sandbox.'), hRow);
+  harnessSave.onclick = async () => {
+    const lines = value => value.split('\n').map(item => item.trim()).filter(Boolean);
+    const harness = {
+      name: hName.value.trim(), kind: 'acp', command: hCommand.value.trim(), args: lines(hArgs.value),
+      access: hAccess.value, profile: hProfile.value, allowed_tools: lines(hTools.value),
+      inherit_env: lines(hEnv.value), metering: hMetering.value,
+    };
+    if (hWorkdir.value.trim()) harness.workdir = hWorkdir.value.trim();
+    if (hMetering.value === 'estimated') harness.estimated_tokens_per_run = Number(hEstimate.value);
+    harnessSave.disabled = true; harnessStatus.textContent = 'Saving amendment…';
+    const result = await j(api('/harnesses'), {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({harness})});
+    harnessSave.disabled = false;
+    if (!result.ok) { harnessStatus.textContent = 'Could not save: ' + result.error; return; }
+    harnessStatus.textContent = 'Saved. Approve the amendment before use.';
+    await loadRoster(); render();
+  };
+  harnessSection.append(harnessList, harnessForm);
+  c.append(harnessSection);
+
+  const control = section('Agent management access',
+    'Create a time-bounded MCP credential signed by this agent. If another agent names this one as a manager, this credential lets it use Apiary’s control MCP server as its own identity. It never inherits a human manager’s authority.');
+  const ttl = el('select');
+  for (const [seconds, label] of [[3600, '1 hour'], [86400, '24 hours'], [604800, '7 days'], [2592000, '30 days'], [7776000, '90 days']]) {
+    const option = el('option', null, label); option.value = String(seconds); if (seconds === 86400) option.selected = true; ttl.append(option);
+  }
+  const createToken = el('button', 'btn', 'Create MCP access token');
+  const tokenStatus = el('span', 'meta', '');
+  const tokenOutput = el('textarea', 'address-list'); tokenOutput.rows = 4; tokenOutput.readOnly = true;
+  tokenOutput.placeholder = 'The token is shown here once created.';
+  const tokenUrl = el('input'); tokenUrl.readOnly = true; tokenUrl.placeholder = 'MCP URL';
+  createToken.onclick = async () => {
+    createToken.disabled = true; tokenStatus.textContent = 'Signing token…';
+    const result = await j(api('/control-token'), {
+      method: 'POST', headers: {'content-type': 'application/json'},
+      body: JSON.stringify({expires_in_seconds: Number(ttl.value)}),
+    });
+    createToken.disabled = false;
+    if (!result.ok) { tokenStatus.textContent = 'Could not create token: ' + result.error; return; }
+    tokenOutput.value = result.token; tokenUrl.value = result.mcp_url;
+    tokenStatus.textContent = 'Created. Copy it now and store it only as this agent’s sealed MCP credential.';
+  };
+  const tokenRow = el('div', 'row'); tokenRow.append(ttl, createToken, tokenStatus);
+  control.append(tokenRow, field('MCP URL', tokenUrl), field('Bearer credential', tokenOutput),
+    help('This token acts as the agent. Removing the agent from another agent’s manager list revokes that relationship immediately; the token itself expires at the selected time.'));
+  c.append(control);
 
   const active = section('Always-on presence', declared.length
     ? 'Activation keeps declared channels available on this host. One-time tasks work while inactive.'
@@ -1182,7 +1290,9 @@ async function renderInference(c) {
 
 // ------------------------------------------------------------ run
 
-function renderRun(c) {
+async function renderRun(c) {
+  const manifestResult = await j(api('/manifest'));
+  const harnesses = manifestResult.ok ? ((manifestResult.manifest || {}).harnesses || []) : [];
   c.append(help('One governed task. The stream below is AG-UI presence (steps, tool calls, text); the signed log is truth — every model call lands as a signed checkpoint entry. Budget reservations are taken before the call and settled after.'));
   const box = el('div'); box.id = 'runbox';
   const ta = el('textarea'); ta.id = 'task'; ta.placeholder = 'task for this agent…';
@@ -1192,14 +1302,17 @@ function renderRun(c) {
   const row = el('div', 'row');
   const cls = el('input'); cls.placeholder = 'class (optional, e.g. reasoning)';
   const dcls = el('input'); dcls.placeholder = 'data class (optional, e.g. sensitive)';
+  const harness = el('select');
+  const native = el('option', null, 'Native Apiary loop'); native.value = 'native'; harness.append(native);
+  for (const grant of harnesses) { const option = el('option', null, `${grant.name} · ${grant.access || 'inference-only'} · ${grant.profile || 'isolated'}`); option.value = grant.name; harness.append(option); }
   cls.setAttribute('aria-label', 'Routing class');
   dcls.setAttribute('aria-label', 'Data class');
-  row.append(cls, dcls);
+  row.append(cls, dcls, harness);
   c.append(box, row,
     help('class picks a routing rule from the manifest (which model slot handles this kind of task). data class engages routing floors — e.g. a "sensitive" floor can pin such tasks to a local model regardless of what routing would prefer.'));
   const events = el('div'); events.id = 'events';
   c.append(events);
-  go.onclick = () => runTask(ta, go, events, cls.value.trim() || null, dcls.value.trim() || null);
+  go.onclick = () => runTask(ta, go, events, cls.value.trim() || null, dcls.value.trim() || null, harness.value);
 }
 
 function ev(events, cls, text) {
@@ -1209,7 +1322,7 @@ function ev(events, cls, text) {
   return node;
 }
 
-async function runTask(ta, go, events, cls, dcls) {
+async function runTask(ta, go, events, cls, dcls, harness) {
   const task = ta.value.trim();
   if (!task) return;
   go.disabled = true;
@@ -1218,7 +1331,7 @@ async function runTask(ta, go, events, cls, dcls) {
     const resp = await fetch(api('/run'), {
       method: 'POST',
       headers: hdrs({ 'content-type': 'application/json' }),
-      body: JSON.stringify({ task, class: cls, data_class: dcls }),
+      body: JSON.stringify({ task, class: cls, data_class: dcls, harness }),
     });
     if (!resp.ok) {
       let msg = String(resp.status);
@@ -2316,7 +2429,7 @@ async function renderLibrary(c) {
       caps: buildCaps,
       validate: () => {
         if (tr.value === 'stdio' && !cmd.value.trim()) return 'command required';
-        if (tr.value === 'http' && !/^https?:\/\//.test(url.value.trim())) return 'a full URL is required';
+        if (tr.value === 'http' && !(/^(https?:\/\/|apiary:\/\/local\/mcp$)/.test(url.value.trim()))) return 'use a full HTTP URL or apiary://local/mcp';
         if (!picked.size) return 'allow at least one tool (Discover, then tick) — or * for all';
         if (access.value === 'read-only' && known.length && !known.some(t => t.read_only)) return 'this server marks no tools as read only; choose Read + write or use a server with readOnlyHint metadata';
         return null;

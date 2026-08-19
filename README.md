@@ -82,6 +82,16 @@ model runs). What exists today:
   `annotations.readOnlyHint: true`; missing annotations fail closed. Because
   MCP annotations are server-supplied hints, only trusted servers should be
   treated as faithfully classified
+- MCP control server at `POST /mcp`: an outside harness can inspect and manage
+  Apiary through `apiary_list_agents`, `apiary_get_agent_environment`, and a
+  governed REST adapter. Calls authenticate with NIP-98 or a time-bounded
+  `Bearer apiary_...` event signed by an Apiary agent's own Nostr identity.
+  Every forwarded operation re-enters the ordinary REST router, so target
+  governorship and host-manager checks remain authoritative; MCP creates no
+  new access. Credential opening, host unlock, agent-key export, UI event
+  streams, and folder picking are intentionally not exposed. Calls append a
+  local `0600` hash-chained record to `control-audit.jsonl`; request bodies
+  and credentials are represented only by hashes
 - Foreign harnesses via ACP (proven with claude-code-acp): permission
   requests decided host-side, default deny, harness attribution in the log
 - Tiered log publication: public entries publish as-is, self-tier publish
@@ -313,9 +323,10 @@ trusted processes on both machines form the operator boundary.
   credentials, and lock state. Add them by public `npub` or hex key. Apiary
   stores only the public identity in `~/.apiary/host-managers.json`; each person
   keeps their private key in their own signer.
-- **Agent managers** are the `governance.suspend_keys` on one agent. They can
-  approve, stop, and operate that agent without automatically receiving access
-  to the rest of the host.
+- **Agent managers** are the `governance.suspend_keys` on one agent. An entry
+  may identify a person or a separate Apiary agent. It can approve, stop, and
+  operate that agent without automatically receiving access to the rest of the
+  host. An agent can never name its own identity as a manager.
 
 New and existing agents can name multiple people. Each listed person has
 independent authority; this is an allowlist, not M-of-N approval. Changing an
@@ -325,6 +336,87 @@ manager supplied by `--admin` remains until the daemon restarts without that
 flag. Host-manager Nostr signatures are enforced when the daemon uses
 `--auth nip98`; in local desktop and SSH-tunnel `open` mode, the per-launch
 token or SSH account remains the request boundary.
+
+### Apiary control MCP
+
+The daemon and desktop host the same stateless MCP endpoint at `/mcp`. It
+speaks the current `server/discover` protocol and falls back to the
+`2025-06-18` initialize handshake. Its tools are:
+
+- `apiary_describe` — protocol, authorization, route coverage, and exclusions
+- `apiary_list_agents` — only agents governed by the authenticated identity
+- `apiary_get_agent_environment` — manifest, skills, inference, spend,
+  routines, lease, and listener state
+- `apiary_request` — `GET`, `POST`, `PUT`, or `DELETE` an allowed `/api/...`
+  route through the existing authorization and amendment gates
+
+For a human or external Nostr identity, sign each `POST /mcp` as an ordinary
+NIP-98 request. For a hosted manager agent, open that agent in the cockpit,
+use **Agent management access → Create MCP access token**, and store the
+result only as that agent's sealed MCP bearer credential. The token is an
+event signed by the agent, scoped to this Apiary installation's stable host
+identity (so a desktop port change does not invalidate it), and
+expires after 1–90 days. It identifies the caller but grants nothing by
+itself: add the manager agent's npub to each target agent separately.
+
+Example HTTP MCP configuration:
+
+```yaml
+transport: http
+url: https://apiary.example/mcp
+bearer: apiary_<signed-token>
+allowed_tools:
+  - apiary_describe
+  - apiary_list_agents
+  - apiary_get_agent_environment
+  - apiary_request
+```
+
+`apiary_request` deliberately cannot open credential plaintext, unlock the
+host, export an agent key bundle, hold the UI event stream, or invoke the
+desktop folder picker. Connector credentials remain sealed to their agent.
+
+### Per-agent harness policy
+
+Foreign harnesses are ratified capabilities in `manifest.harnesses[]`, not
+commands an operator can inject at run time. Each grant independently chooses:
+
+- `access`: `inference-only`, `curated` ACP permission titles, or the `full`
+  native harness tool surface
+- `profile`: `isolated` per-agent HOME, `curated` environment inheritance, or
+  the complete host `inherit` profile (including its global agents, skills,
+  extensions, credentials, and environment)
+- `metering`: `strict` refusal while ACP usage is unknown, a fixed
+  `estimated` charge, or intentionally `unmetered` operation outside the
+  daily token limit
+- exact command, arguments, optional working directory, and environment names
+
+Example:
+
+```yaml
+harnesses:
+  - name: goose-workspace
+    kind: acp
+    command: goose
+    args: [acp]
+    access: curated
+    profile: isolated
+    allowed_tools: [read_file, write_file, shell]
+    metering: estimated
+    estimated_tokens_per_run: 8192
+    workdir: /srv/workspaces/customer-support
+```
+
+The cockpit exposes these choices under **Harnesses and native tools**, and
+the Run page selects only a manifest-granted harness name. CLI overrides may
+assert the exact command/arguments but cannot widen the ratified access.
+Profile isolation prevents accidental global configuration inheritance; it is
+not a filesystem or network sandbox. A full inherited profile is therefore a
+legitimate, visibly broad grant rather than a misleadingly “safe” preset.
+For Goose, Apiary also pins `GOOSE_MODE` to `chat`, `approve`, or `auto` from
+the ratified access level. Other harnesses must faithfully emit ACP permission
+requests for title-level curation to be enforceable; the signed log records
+what Apiary approved and what the harness reported, not an imaginary sandbox.
 
 ## Layout
 

@@ -81,11 +81,19 @@ async fn main() {
             .clone()
             .unwrap_or_else(|| format!("http://{}", args.bind)),
         token: None,
+        internal_token: apiary_core::identity::generate()
+            .secret_key()
+            .to_secret_hex(),
+        control_audit: std::sync::Mutex::new(()),
         listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
         pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
         supervisor_notes: std::sync::Mutex::new(std::collections::HashMap::new()),
         admitted: std::sync::Mutex::new(std::collections::HashMap::new()),
         managers: std::sync::RwLock::new(managers),
+    });
+    apiary_hostd::write_control_discovery(&state).unwrap_or_else(|error| {
+        eprintln!("error: control-plane discovery: {error}");
+        std::process::exit(2);
     });
     apiary_hostd::ops::spawn_supervisor(state.clone());
     let app = build_router(state);

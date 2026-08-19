@@ -18,6 +18,7 @@ serde_json.workspace = true
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+tower = "0.5"
 clap = { version = "4", features = ["derive", "env"] }
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }

@@ -25,6 +25,10 @@ use tokio_stream::StreamExt;
 #[derive(serde::Deserialize)]
 pub struct RunBody {
     task: String,
+    /// "native" or the stable name of a harness granted in this agent's
+    /// ratified manifest. Callers select; they cannot supply commands/tools.
+    #[serde(default)]
+    harness: Option<String>,
     #[serde(default)]
     class: Option<String>,
     #[serde(default)]
@@ -145,12 +149,59 @@ pub async fn run_stream(
         tokens_per_run: None,
     };
     let task = body.task.clone();
+    let selected_harness = body.harness.clone().unwrap_or_else(|| "native".into());
     let run_id2 = run_id.clone();
     let thread_id2 = thread_id.clone();
     let tx2 = tx.clone();
 
     tokio::task::spawn_blocking(move || {
         let msg_id = format!("{run_id2}-msg");
+        if selected_harness != "native" {
+            let Some(grant) = manifest
+                .harnesses
+                .iter()
+                .find(|grant| grant.name == selected_harness)
+            else {
+                let _ = tx2.send(agui(
+                    "RUN_ERROR",
+                    json!({"message": format!("harness '{}' is not granted to this agent", selected_harness)}),
+                ));
+                return;
+            };
+            match apiary_runtime::runner::run_acp_task(
+                &manifest, &dir, &custody, &handle, &task, grant,
+            ) {
+                Ok(out) => {
+                    let _ = tx2.send(agui(
+                        "TEXT_MESSAGE_START",
+                        json!({"messageId": msg_id, "role": "assistant"}),
+                    ));
+                    let _ = tx2.send(agui(
+                        "TEXT_MESSAGE_CONTENT",
+                        json!({"messageId": msg_id, "delta": out.text}),
+                    ));
+                    let _ = tx2.send(agui("TEXT_MESSAGE_END", json!({"messageId": msg_id})));
+                    let _ = tx2.send(agui(
+                        "CUSTOM",
+                        json!({"name": "apiary.checkpoint", "value": {
+                            "log_event": out.log_event_id,
+                            "harness": selected_harness,
+                            "outcome": out.stop_reason,
+                            "tool_calls": out.tool_calls,
+                            "permission_decisions": out.permissions,
+                        }}),
+                    ));
+                    let _ = tx2.send(agui(
+                        "RUN_FINISHED",
+                        json!({"threadId": thread_id2, "runId": run_id2}),
+                    ));
+                }
+                Err(error) => {
+                    let _ = tx2.send(agui("RUN_ERROR", json!({"message": error.to_string()})));
+                }
+            }
+            return;
+        }
         // Streamed deltas open the message; the completion branch then
         // only closes it (no duplicate content).
         let streamed = std::sync::atomic::AtomicBool::new(false);

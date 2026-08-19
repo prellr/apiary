@@ -236,6 +236,10 @@ fn run_local(home: PathBuf, bootstrap: DesktopBootstrap) {
         auth: AuthMode::Open,
         origin: format!("http://127.0.0.1:{port}"),
         token: Some(token.clone()),
+        internal_token: apiary_core::identity::generate()
+            .secret_key()
+            .to_secret_hex(),
+        control_audit: std::sync::Mutex::new(()),
         listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
         pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
         supervisor_notes: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -244,6 +248,9 @@ fn run_local(home: PathBuf, bootstrap: DesktopBootstrap) {
         // IS the request boundary there. Stored manager npubs become the
         // NIP-98 allowlist when this home later runs headless.
         managers: std::sync::RwLock::new(managers),
+    });
+    apiary_hostd::write_control_discovery(&state).unwrap_or_else(|error| {
+        startup_error("Control-plane discovery error", error.to_string(), 2)
     });
 
     std::thread::spawn(move || {

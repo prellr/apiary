@@ -37,6 +37,38 @@ fn push_line(lines: &Mutex<VecDeque<String>>, line: String) {
     }
 }
 
+#[derive(serde::Deserialize)]
+pub struct AuditQuery {
+    #[serde(default = "default_audit_tail")]
+    tail: usize,
+}
+
+fn default_audit_tail() -> usize {
+    100
+}
+
+/// Host-manager view of the local, hash-chained MCP management audit. Bodies
+/// and credentials are never recorded; mutating calls carry only a body hash.
+pub async fn control_audit_get(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    Query(query): Query<AuditQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if let Err(error) = check_admin(&state, &headers, "GET", &uri, None) {
+        return error.into_response();
+    }
+    let path = state.home.join("control-audit.jsonl");
+    let lines = std::fs::read_to_string(path).unwrap_or_default();
+    let entries = lines
+        .lines()
+        .rev()
+        .take(query.tail.clamp(1, 1000))
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect::<Vec<_>>();
+    Json(json!({"ok": true, "entries": entries})).into_response()
+}
+
 /// The common request gate: token/NIP-98 check, agent resolution, manifest
 /// load, governor authorization. Every per-agent endpoint goes through this.
 #[allow(clippy::type_complexity)]
@@ -600,6 +632,123 @@ pub async fn skill_delete(
         "manifest_sha256": ceremony::manifest_hash(&yaml),
         "ratified": false,
         "note": "skill removed — review and approve the amendment before the agent runs",
+    }))
+    .into_response()
+}
+
+// ----------------------------------------------------------- harness policy
+
+pub async fn harnesses_get(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, _npub, _dir, _raw, manifest) = match gate(&state, &headers, "GET", &uri, None, &npub)
+    {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    Json(json!({"ok": true, "harnesses": manifest.harnesses})).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct HarnessBody {
+    harness: apiary_core::manifest::HarnessGrant,
+    #[serde(default)]
+    original_name: Option<String>,
+}
+
+pub async fn harness_upsert(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    let body: HarnessBody = match serde_json::from_slice(&raw_body) {
+        Ok(body) => body,
+        Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    if let Err(error) = body.harness.validate() {
+        return err(StatusCode::BAD_REQUEST, error).into_response();
+    }
+    let original = body.original_name.as_deref().unwrap_or(&body.harness.name);
+    if original != body.harness.name
+        && manifest
+            .harnesses
+            .iter()
+            .any(|existing| existing.name == body.harness.name)
+    {
+        return err(
+            StatusCode::CONFLICT,
+            format!("a harness named '{}' already exists", body.harness.name),
+        )
+        .into_response();
+    }
+    manifest
+        .harnesses
+        .retain(|existing| existing.name != original);
+    manifest.harnesses.push(body.harness.clone());
+    manifest
+        .harnesses
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    if let Err(error) = manifest.validate() {
+        return err(StatusCode::BAD_REQUEST, error).into_response();
+    }
+    let yaml = match manifest.to_yaml() {
+        Ok(yaml) => yaml,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    if let Err(error) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "harness": body.harness.name,
+        "manifest_sha256": ceremony::manifest_hash(&yaml),
+        "ratified": false,
+        "note": "harness policy saved — review its authority and approve the amendment before the agent runs",
+    }))
+    .into_response()
+}
+
+pub async fn harness_delete(
+    State(state): State<App>,
+    AxPath((npub, name)): AxPath<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "DELETE", &uri, None, &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    let before = manifest.harnesses.len();
+    manifest.harnesses.retain(|harness| harness.name != name);
+    if manifest.harnesses.len() == before {
+        return err(StatusCode::NOT_FOUND, format!("no harness named '{name}'")).into_response();
+    }
+    let yaml = match manifest.to_yaml() {
+        Ok(yaml) => yaml,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    if let Err(error) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "removed": name,
+        "manifest_sha256": ceremony::manifest_hash(&yaml),
+        "ratified": false,
+        "note": "harness removed — review and approve the amendment before the agent runs",
     }))
     .into_response()
 }
@@ -1755,6 +1904,70 @@ pub async fn ratify_import(
 // ---------------------------------------------------------------- creds
 
 #[derive(serde::Deserialize)]
+pub struct ControlTokenBody {
+    /// Short-lived by default; bounded to 90 days by the token verifier.
+    #[serde(default = "default_control_token_ttl")]
+    expires_in_seconds: u64,
+}
+
+fn default_control_token_ttl() -> u64 {
+    24 * 60 * 60
+}
+
+/// Issue a bearer credential signed by this agent's own Nostr identity.
+/// A governor authorizes issuance, but the resulting MCP caller acts as the
+/// agent—not as that human. It can therefore manage only agents which list
+/// this agent's npub (or the host, if explicitly made a host manager).
+pub async fn control_token_issue(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (ks, npub, _dir, _raw, _manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    let body: ControlTokenBody = if raw_body.is_empty() {
+        ControlTokenBody {
+            expires_in_seconds: default_control_token_ttl(),
+        }
+    } else {
+        match serde_json::from_slice(&raw_body) {
+            Ok(body) => body,
+            Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+        }
+    };
+    let (custody, handle) = match crate::admit_agent(&state, &ks, &npub) {
+        Ok(value) => value,
+        Err(error) => return err(StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+    };
+    let host_id = apiary_runtime::lease::host_id(&state.home);
+    match nip98::issue_control_token(
+        &custody,
+        &handle,
+        &host_id,
+        body.expires_in_seconds,
+    ) {
+        Ok((token, expires_at)) => Json(json!({
+            "ok": true,
+            "agent": npub,
+            "token": token,
+            "expires_at": expires_at,
+            "mcp_url": format!("{}/mcp", state.origin.trim_end_matches('/')),
+            "local_mcp_url": "apiary://local/mcp",
+            "host_id": host_id,
+            "authorization": "Bearer <token>",
+            "note": "This bearer acts as the agent identity. Store it as a sealed credential and never log it."
+        }))
+        .into_response(),
+        Err(error) => err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
 pub struct SealBody {
     plaintext: String,
 }
@@ -2226,7 +2439,7 @@ pub async fn set_active(
 ///
 /// Granting copies a library entry into an agent's manifest connectors[]
 /// (sealing a credential to that agent if provided). That edit changes the
-/// manifest hash, so every grant is ratified by a human — and because the
+/// manifest hash, so every grant is ratified by a governor — and because the
 /// grant lives in the manifest, it travels with the agent: portability
 /// includes capabilities and their sealed credentials. The destination
 /// host must merely bind the kind (BOUND_KINDS); an unbindable declared
@@ -2253,6 +2466,23 @@ pub struct LibraryEntry {
 /// layer later without making registry publication a trust decision.
 fn connector_catalog() -> serde_json::Value {
     json!([
+        {
+            "id": "apiary-control",
+            "name": "Apiary management",
+            "description": "Inspect and manage the Apiary agents assigned to this agent identity. Every operation remains subject to per-agent governance and host-manager authorization.",
+            "kind": "mcp",
+            "risk": "read + write agent control",
+            "publisher": "Apiary",
+            "source": "built-in control plane",
+            "setup": "credential",
+            "credential_label": "Agent MCP access token",
+            "caps": {
+                "transport": "http",
+                "url": "apiary://local/mcp",
+                "access": "read-write",
+                "allowed_tools": ["apiary_describe", "apiary_list_agents", "apiary_get_agent_environment", "apiary_request"]
+            }
+        },
         {
             "id": "web-search-research",
             "name": "Full web search & research",
@@ -2442,6 +2672,10 @@ pub async fn connectors_discover(
     };
     let caps = body["caps"].clone();
     let bearer = body["bearer"].as_str().map(String::from);
+    let local_control_url = std::fs::read_to_string(state.home.join("control.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|value| value["url"].as_str().map(String::from));
     let res = tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Value>, String> {
         let cap_str = |k: &str| caps.get(k).and_then(|v| v.as_str()).map(String::from);
         let cap_list = |k: &str| -> Vec<String> {
@@ -2462,7 +2696,12 @@ pub async fn connectors_discover(
                 env_passthrough: cap_list("env"),
             },
             "http" => apiary_runtime::mcp::Binding::Http {
-                url: cap_str("url").ok_or("mcp http requires url")?,
+                url: match cap_str("url").ok_or("mcp http requires url")?.as_str() {
+                    "apiary://local/mcp" => local_control_url
+                        .clone()
+                        .ok_or("local Apiary control discovery is unavailable")?,
+                    url => url.to_string(),
+                },
                 bearer,
             },
             other => return Err(format!("transport '{other}' not supported (stdio | http)")),
@@ -2557,6 +2796,10 @@ pub async fn agent_connector_discover(
         None => None,
     };
     let caps = serde_json::to_value(&entry.caps).unwrap_or_default();
+    let local_control_url = std::fs::read_to_string(state.home.join("control.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|value| value["url"].as_str().map(String::from));
     let res = tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Value>, String> {
         let cap_str = |k: &str| caps.get(k).and_then(|v| v.as_str()).map(String::from);
         let cap_list = |k: &str| -> Vec<String> {
@@ -2579,7 +2822,12 @@ pub async fn agent_connector_discover(
                 env_passthrough: cap_list("env"),
             },
             _ => apiary_runtime::mcp::Binding::Http {
-                url: cap_str("url").ok_or("mcp http requires url")?,
+                url: match cap_str("url").ok_or("mcp http requires url")?.as_str() {
+                    "apiary://local/mcp" => local_control_url
+                        .clone()
+                        .ok_or("local Apiary control discovery is unavailable")?,
+                    url => url.to_string(),
+                },
                 bearer,
             },
         };
