@@ -182,16 +182,25 @@ async fn call_tool(
         }
         _ => return Err((-32601, format!("unknown tool: {name}"))),
     };
-    let is_error = output
-        .get("status")
-        .and_then(Value::as_u64)
-        .is_some_and(|status| !(200..300).contains(&status));
+    let is_error = response_is_error(&output);
     Ok(json!({
         "resultType": "complete",
         "content": [{"type": "text", "text": serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string())}],
         "structuredContent": output,
         "isError": is_error
     }))
+}
+
+fn response_is_error(output: &Value) -> bool {
+    let direct = output
+        .get("status")
+        .and_then(Value::as_u64)
+        .is_some_and(|status| !(200..300).contains(&status));
+    direct
+        || output
+            .get("environment")
+            .and_then(Value::as_object)
+            .is_some_and(|environment| environment.values().any(response_is_error))
 }
 
 fn describe() -> Value {
@@ -430,6 +439,16 @@ mod tests {
             .iter()
             .all(|tool| tool["annotations"]["readOnlyHint"] == true));
         assert_eq!(catalog[3]["annotations"]["readOnlyHint"], false);
+    }
+
+    #[test]
+    fn bundled_environment_denials_are_mcp_tool_errors() {
+        assert!(!response_is_error(&json!({
+            "environment": {"manifest": {"status": 200}, "skills": {"status": 200}}
+        })));
+        assert!(response_is_error(&json!({
+            "environment": {"manifest": {"status": 403}, "skills": {"status": 403}}
+        })));
     }
 
     #[tokio::test]

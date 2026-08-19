@@ -237,7 +237,10 @@ pub fn authorize_governor(
     signer: Option<PublicKey>,
     suspend_keys: &[PublicKey],
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if state.auth == AuthMode::Open {
+    // A signer-less request in open mode is the trusted local desktop
+    // operator. An explicit signer (notably a signed MCP control token)
+    // always acts as that identity and must never inherit operator access.
+    if state.auth == AuthMode::Open && signer.is_none() {
         return Ok(());
     }
     match signer {
@@ -256,12 +259,13 @@ pub fn authorize_governor(
 /// Host-scoped authorization: in nip98 mode the signer must be a listed
 /// HOST MANAGER — being a valid nostr key (or even some agent's governor)
 /// grants nothing over the host itself. The registry combines bootstrap
-/// `--admin` keys with stored managers. Open mode remains local trust.
+/// `--admin` keys with stored managers. Signer-less open-mode requests retain
+/// local trust; an explicit signer remains constrained even on the desktop.
 pub fn authorize_admin(
     state: &AppState,
     signer: Option<PublicKey>,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if state.auth == AuthMode::Open {
+    if state.auth == AuthMode::Open && signer.is_none() {
         return Ok(());
     }
     let managers = state.managers.read().map_err(|_| {
@@ -474,8 +478,12 @@ mod tests {
         assert!(authorize_governor(&s, Some(gov), &[gov]).is_ok());
         assert!(authorize_governor(&s, Some(stranger), &[gov]).is_err());
         assert!(authorize_governor(&s, None, &[gov]).is_err());
-        // Open mode: local trust, no binding.
-        assert!(authorize_governor(&state(AuthMode::Open), None, &[gov]).is_ok());
+        // Open mode grants local signer-less requests operator trust, but an
+        // authenticated agent identity remains bound to its own grants.
+        let open = state(AuthMode::Open);
+        assert!(authorize_governor(&open, None, &[gov]).is_ok());
+        assert!(authorize_governor(&open, Some(gov), &[gov]).is_ok());
+        assert!(authorize_governor(&open, Some(stranger), &[gov]).is_err());
     }
 
     #[test]
@@ -488,5 +496,12 @@ mod tests {
         assert!(authorize_admin(&s, Some(manager)).is_ok());
         assert!(authorize_admin(&s, Some(stranger)).is_err());
         assert!(authorize_admin(&s, None).is_err());
+
+        let mut open = state(AuthMode::Open);
+        open.managers =
+            std::sync::RwLock::new(crate::access::ManagerRegistry::in_memory(vec![manager]));
+        assert!(authorize_admin(&open, None).is_ok());
+        assert!(authorize_admin(&open, Some(manager)).is_ok());
+        assert!(authorize_admin(&open, Some(stranger)).is_err());
     }
 }
