@@ -131,14 +131,41 @@ impl SpendLedger {
     }
 
     pub fn today(&self) -> Result<DaySpend, crate::Error> {
-        self.with_locked(|s| {
-            Ok(DaySpend {
-                date: s.date.clone(),
-                input_tokens: s.input_tokens,
-                output_tokens: s.output_tokens,
-                reservations: s.reservations.clone(),
-            })
-        })
+        let mut lock_opts = std::fs::OpenOptions::new();
+        lock_opts.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            lock_opts.mode(0o600);
+        }
+        let lock = lock_opts.open(&self.lock_path)?;
+        lock.lock_shared()
+            .map_err(|e| crate::Error::Budget(format!("ledger lock: {e}")))?;
+        let today = utc_date_today();
+        let mut state = if self.path.exists() {
+            let stored: DaySpend = serde_json::from_str(&std::fs::read_to_string(&self.path)?)?;
+            if stored.date == today {
+                stored
+            } else {
+                DaySpend {
+                    date: today,
+                    ..Default::default()
+                }
+            }
+        } else {
+            DaySpend {
+                date: today,
+                ..Default::default()
+            }
+        };
+        // Expiry affects the observed capacity immediately, but a status GET
+        // is not a mutation. The next reserve/settle persists this projection.
+        let cutoff = now_secs().saturating_sub(RESERVATION_TTL_SECS);
+        state
+            .reservations
+            .retain(|reservation| reservation.at > cutoff);
+        let _ = fs2::FileExt::unlock(&lock);
+        Ok(state)
     }
 
     /// Atomically reserve remaining capacity for one run. With no cap the

@@ -19,12 +19,33 @@ use std::time::Duration;
 
 /// Host policy for the harness's permission requests. Default deny: a
 /// hijacked or overeager loop is bounded by construction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionMode {
-    /// Reject every request (read-only observation of the harness).
+    /// Reject every ACP permission request. Harnesses that perform native
+    /// actions without requesting permission need their own mode or sandbox.
     Deny,
     /// Approve every request (the human explicitly opted in for this run).
     Allow,
+    /// Approve only matching ACP tool titles; reject every other request.
+    AllowList(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileMode {
+    /// Scrubbed environment and a fresh per-agent HOME.
+    Isolated,
+    /// Isolated profile plus explicitly named environment variables.
+    Curated(Vec<String>),
+    /// The harness receives the host user's complete environment and HOME.
+    Inherit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxMode {
+    None,
+    ReadOnly,
+    NoNetwork,
+    ReadOnlyNoNetwork,
 }
 
 pub struct AcpOutcome {
@@ -37,26 +58,151 @@ pub struct AcpOutcome {
     pub permissions: Vec<(String, String)>,
 }
 
+fn goose_mode(command: &str, mode: &PermissionMode) -> Option<&'static str> {
+    let name = std::path::Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())?;
+    // Goose's upstream CLI is normally named `goose`; Berd bundles the same
+    // ACP server as `goosed`. Both expose native execution modes that must be
+    // pinned from the ratified Apiary access policy rather than inherited
+    // from the host environment.
+    if name != "goose"
+        && name != "goosed"
+        && !name.starts_with("goose-")
+        && !name.starts_with("goosed-")
+    {
+        return None;
+    }
+    Some(match mode {
+        PermissionMode::Deny => "chat",
+        PermissionMode::AllowList(_) => "approve",
+        PermissionMode::Allow => "auto",
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn sandbox_profile(mode: SandboxMode) -> Option<&'static str> {
+    match mode {
+        SandboxMode::None => None,
+        SandboxMode::ReadOnly => Some("(version 1)(allow default)(deny file-write*)"),
+        SandboxMode::NoNetwork => Some("(version 1)(allow default)(deny network*)"),
+        SandboxMode::ReadOnlyNoNetwork => {
+            Some("(version 1)(allow default)(deny file-write*)(deny network*)")
+        }
+    }
+}
+
+fn sandboxed_command(
+    command: &str,
+    args: &[String],
+    sandbox: SandboxMode,
+) -> Result<Command, crate::Error> {
+    if sandbox == SandboxMode::None {
+        let mut process = Command::new(command);
+        process.args(args);
+        return Ok(process);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let profile = sandbox_profile(sandbox).expect("non-none sandbox has a profile");
+        let mut process = Command::new("/usr/bin/sandbox-exec");
+        process.args(["-p", profile, command]).args(args);
+        Ok(process)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let executable = std::env::var_os("PATH")
+            .and_then(|path| {
+                std::env::split_paths(&path)
+                    .map(|directory| directory.join("bwrap"))
+                    .find(|candidate| candidate.is_file())
+            })
+            .ok_or_else(|| {
+                crate::Error::Provider(
+                    "OS sandbox requested, but Bubblewrap (bwrap) is not installed".into(),
+                )
+            })?;
+        let mut process = Command::new(executable);
+        process.args(["--die-with-parent", "--new-session"]);
+        match sandbox {
+            SandboxMode::ReadOnly | SandboxMode::ReadOnlyNoNetwork => {
+                process.args(["--ro-bind", "/", "/"]);
+            }
+            SandboxMode::NoNetwork => {
+                process.args(["--bind", "/", "/"]);
+            }
+            SandboxMode::None => unreachable!("handled above"),
+        }
+        if matches!(
+            sandbox,
+            SandboxMode::NoNetwork | SandboxMode::ReadOnlyNoNetwork
+        ) {
+            process.arg("--unshare-net");
+        }
+        process.arg("--").arg(command).args(args);
+        Ok(process)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (command, args);
+        Err(crate::Error::Provider(format!(
+            "OS sandbox {sandbox:?} was requested, but this host has no supported sandbox backend"
+        )))
+    }
+}
+
 /// Run one prompt through an ACP agent subprocess.
+#[allow(clippy::too_many_arguments)]
 pub fn run_acp_prompt(
     command: &str,
     args: &[String],
     workdir: &std::path::Path,
+    profile_root: &std::path::Path,
     task: &str,
     mode: PermissionMode,
+    profile: ProfileMode,
+    sandbox: SandboxMode,
+    profile_name: &str,
     turn_timeout: Duration,
 ) -> Result<AcpOutcome, crate::Error> {
-    // The harness gets a MINIMAL environment, not ours: no APIARY_PASSPHRASE,
-    // no provider credentials, no session markers. Capability flows through
-    // permission-gated tools, never through inherited env. (Filesystem and
-    // network isolation still require an OS sandbox — documented limit.)
+    // Isolated and curated profiles get a per-agent HOME, so global agents,
+    // skills, extensions, and credentials do not leak in accidentally. Full
+    // inheritance is a separate ratified choice. This is profile isolation,
+    // not a filesystem/network sandbox; the manifest and UI say so plainly.
     const ENV_ALLOWLIST: &[&str] = &["PATH", "HOME", "USER", "SHELL", "LANG", "TMPDIR", "TERM"];
-    let mut cmd = Command::new(command);
-    cmd.args(args).current_dir(workdir).env_clear();
-    for key in ENV_ALLOWLIST {
-        if let Ok(v) = std::env::var(key) {
-            cmd.env(key, v);
+    let mut cmd = sandboxed_command(command, args, sandbox)?;
+    cmd.current_dir(workdir);
+    if profile != ProfileMode::Inherit {
+        cmd.env_clear();
+        for key in ENV_ALLOWLIST {
+            if *key != "HOME" {
+                if let Ok(value) = std::env::var(key) {
+                    cmd.env(key, value);
+                }
+            }
         }
+        if let ProfileMode::Curated(names) = &profile {
+            for name in names {
+                if let Ok(value) = std::env::var(name) {
+                    cmd.env(name, value);
+                }
+            }
+        }
+        let profile_home = profile_root
+            .join(".apiary-harnesses")
+            .join(profile_name)
+            .join("home");
+        std::fs::create_dir_all(&profile_home)?;
+        cmd.env("HOME", &profile_home)
+            .env("XDG_CONFIG_HOME", profile_home.join(".config"))
+            .env("XDG_DATA_HOME", profile_home.join(".local/share"))
+            .env("XDG_CACHE_HOME", profile_home.join(".cache"));
+    }
+    // Goose has an explicit native execution mode in addition to ACP
+    // permission requests. Pin it from the ratified access policy so an
+    // inherited global GOOSE_MODE cannot silently widen this agent.
+    if let Some(goose_mode) = goose_mode(command, &mode) {
+        cmd.env("GOOSE_MODE", goose_mode);
     }
     let mut child = cmd
         .stdin(Stdio::piped())
@@ -151,9 +297,17 @@ fn drive(
                     // back to an allow option — a malformed option list gets
                     // a JSON-RPC error, which the harness must treat as
                     // not-granted.
-                    let acceptable = |kind: &str| match mode {
-                        PermissionMode::Allow => kind.starts_with("allow"),
-                        PermissionMode::Deny => {
+                    let tool_allowed = match &mode {
+                        PermissionMode::Allow => true,
+                        PermissionMode::AllowList(allowed) => {
+                            allowed.iter().any(|item| item == &title)
+                        }
+                        PermissionMode::Deny => false,
+                    };
+                    let acceptable = |kind: &str| {
+                        if tool_allowed {
+                            kind.starts_with("allow")
+                        } else {
                             kind.starts_with("reject") || kind.starts_with("deny")
                         }
                     };
@@ -250,5 +404,80 @@ fn drive(
                 return Ok(out);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{goose_mode, PermissionMode};
+
+    #[test]
+    fn goose_native_mode_is_pinned_from_ratified_access() {
+        assert_eq!(goose_mode("goose", &PermissionMode::Deny), Some("chat"));
+        assert_eq!(
+            goose_mode(
+                "/usr/local/bin/goose-acp",
+                &PermissionMode::AllowList(vec!["shell".into()])
+            ),
+            Some("approve")
+        );
+        assert_eq!(
+            goose_mode("/opt/bin/goose", &PermissionMode::Allow),
+            Some("auto")
+        );
+        assert_eq!(goose_mode("claude", &PermissionMode::Allow), None);
+        assert_eq!(
+            goose_mode(
+                "/Applications/Berd.app/Contents/MacOS/goosed",
+                &PermissionMode::Deny
+            ),
+            Some("chat")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_read_only_sandbox_denies_child_writes() {
+        use super::{sandboxed_command, SandboxMode};
+        use std::process::Stdio;
+
+        let path =
+            std::env::temp_dir().join(format!("apiary-sandbox-write-probe-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut command = sandboxed_command(
+            "/usr/bin/touch",
+            &[path.to_string_lossy().into_owned()],
+            SandboxMode::ReadOnly,
+        )
+        .unwrap();
+        let status = command
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success());
+        assert!(!path.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_no_network_sandbox_denies_loopback_connections() {
+        use super::{sandboxed_command, SandboxMode};
+        use std::process::Stdio;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port().to_string();
+        let mut command = sandboxed_command(
+            "/usr/bin/nc",
+            &["-z".into(), "127.0.0.1".into(), port],
+            SandboxMode::NoNetwork,
+        )
+        .unwrap();
+        let status = command
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success());
     }
 }

@@ -1,12 +1,12 @@
 [package]
 name = "apiary-desktop"
-description = "Apiary desktop app: the hostd router in-process, the cockpit in a native window"
+description = "Apiary desktop app: local embedded host or SSH-connected remote host"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "apiary-desktop"
+name = "Apiary"
 path = "src/main.rs"
 
 [build-dependencies]
@@ -16,7 +16,13 @@ tauri-build = { version = "2", features = [] }
 apiary-core = { path = "../apiary-core" }
 apiary-hostd = { path = "../apiary-hostd" }
 axum = "0.8"
+serde.workspace = true
 serde_json.workspace = true
+zeroize.workspace = true
+fs2 = "0.4"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7"

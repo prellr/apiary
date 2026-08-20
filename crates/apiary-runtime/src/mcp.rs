@@ -43,6 +43,9 @@ pub struct McpTool {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    /// Server-declared MCP `annotations.readOnlyHint`. Missing is false,
+    /// per the protocol. This is still server-supplied trust metadata.
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -398,7 +401,7 @@ impl McpClient {
                     serde_json::from_str(&body).map_err(|e| {
                         crate::Error::Provider(format!(
                             "mcp: non-JSON response ({e}): {}",
-                            &body.chars().take(200).collect::<String>()
+                            body.chars().take(200).collect::<String>()
                         ))
                     })
                 }
@@ -434,6 +437,11 @@ impl McpClient {
                         .get("inputSchema")
                         .cloned()
                         .unwrap_or_else(|| json!({"type": "object"})),
+                    read_only: t
+                        .get("annotations")
+                        .and_then(|a| a.get("readOnlyHint"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                 })
             })
             .collect())

@@ -16,6 +16,68 @@ use std::net::TcpStream;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
+/// Re-read a short tail after a socket reconnect or a manifest-triggered
+/// channel bounce. Nostr `since` is inclusive, so the durable recent-id set
+/// below suppresses anything already handed to the presence engine.
+const REPLAY_OVERLAP_SECS: u64 = 120;
+const RECENT_EVENT_LIMIT: usize = 256;
+
+fn subscription_since(now: u64) -> u64 {
+    now.saturating_sub(REPLAY_OVERLAP_SECS)
+}
+
+#[derive(Default)]
+struct RecentEventIds {
+    ids: std::collections::VecDeque<String>,
+}
+
+impl RecentEventIds {
+    fn load(path: Option<&std::path::Path>) -> Self {
+        let Some(path) = path else {
+            return Self::default();
+        };
+        let Ok(bytes) = std::fs::read(path) else {
+            return Self::default();
+        };
+        let Ok(ids) = serde_json::from_slice::<Vec<String>>(&bytes) else {
+            return Self::default();
+        };
+        Self {
+            ids: ids
+                .into_iter()
+                .rev()
+                .take(RECENT_EVENT_LIMIT)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect(),
+        }
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.ids.iter().any(|seen| seen == id)
+    }
+
+    fn remember(&mut self, id: String, path: Option<&std::path::Path>) {
+        if self.contains(&id) {
+            return;
+        }
+        self.ids.push_back(id);
+        while self.ids.len() > RECENT_EVENT_LIMIT {
+            self.ids.pop_front();
+        }
+        let Some(path) = path else { return };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(bytes) = serde_json::to_vec(&self.ids) {
+            // This cursor is a disposable local optimization, not governed
+            // agent state. A failed write only means a possible replay.
+            let _ = std::fs::write(path, bytes);
+        }
+    }
+}
+
 /// Buzz stream message kind (NIP-29-style group chat).
 pub const KIND_STREAM_MESSAGE: u16 = 9;
 /// NIP-42 client auth kind.
@@ -338,12 +400,14 @@ impl<'a> BuzzSession<'a> {
     /// One subscription per channel, mirroring buzz-acp's wire shape
     /// (send_subscribe in crates/buzz-acp/src/relay.rs): kinds + single-value
     /// #h + since. Distinct sub ids so relay-side per-channel gating applies
-    /// cleanly.
+    /// cleanly. The overlap closes the otherwise permanent blind spot while
+    /// a listener is restarting; the adapter deduplicates replayed ids.
     fn subscribe_channels(&mut self, channels: &[String]) -> Result<(), crate::Error> {
-        let since = std::time::SystemTime::now()
+        let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        let since = subscription_since(now);
         for (i, channel) in channels.iter().enumerate() {
             self.send(json!([
                 "REQ",
@@ -356,9 +420,9 @@ impl<'a> BuzzSession<'a> {
 
     /// Block until a kind-9 message MENTIONS this agent (p tag, or the
     /// literal `@name` trigger in the text) — or until `stop` flips, which
-    /// returns Ok(None). Subscribes live on first call (only messages after
-    /// that moment); drains any events buffered while other calls held the
-    /// socket. Stop latency is bounded by the keepalive timeout.
+    /// returns Ok(None). Subscribes on first call with a short replay overlap;
+    /// drains any events buffered while other calls held the socket. Stop
+    /// latency is bounded by the keepalive timeout.
     pub fn next_mention(
         &mut self,
         trigger: &str,
@@ -483,6 +547,8 @@ pub struct BuzzAdapter<'a> {
     relay: String,
     custody: &'a Custody,
     handle: &'a AgentHandle,
+    cursor_path: Option<std::path::PathBuf>,
+    recent: RecentEventIds,
 }
 
 impl<'a> BuzzAdapter<'a> {
@@ -492,9 +558,24 @@ impl<'a> BuzzAdapter<'a> {
         handle: &'a AgentHandle,
         trigger: String,
     ) -> Result<Self, crate::Error> {
+        Self::connect_with_cursor(relay, custody, handle, trigger, None)
+    }
+
+    /// Connect a long-running presence adapter with a local replay cursor.
+    /// The cursor contains only recent Nostr event ids; it is deliberately
+    /// host-local and disposable, while the actual mention remains signed in
+    /// the agent's episodic log.
+    pub fn connect_with_cursor(
+        relay: &str,
+        custody: &'a Custody,
+        handle: &'a AgentHandle,
+        trigger: String,
+        cursor_path: Option<std::path::PathBuf>,
+    ) -> Result<Self, crate::Error> {
         let mut session = BuzzSession::connect(relay, custody, handle)?;
         session.enable_keepalive(std::time::Duration::from_secs(15));
         let channels = channel_ids(&mut session)?;
+        let recent = RecentEventIds::load(cursor_path.as_deref());
         Ok(Self {
             session,
             channels,
@@ -502,6 +583,8 @@ impl<'a> BuzzAdapter<'a> {
             relay: relay.to_string(),
             custody,
             handle,
+            cursor_path,
+            recent,
         })
     }
 }
@@ -525,48 +608,55 @@ impl crate::presence::ChannelAdapter for BuzzAdapter<'_> {
         stop: &std::sync::atomic::AtomicBool,
     ) -> Result<Option<crate::presence::Mention>, crate::Error> {
         use std::sync::atomic::Ordering;
-        match self
-            .session
-            .next_mention(&self.trigger, &self.channels, stop)
-        {
-            Ok(Some(event)) => {
-                let Some(channel) = channel_of(&event) else {
-                    return Ok(None); // malformed: treat as tick
-                };
-                Ok(Some(crate::presence::Mention {
-                    channel,
-                    author: event.pubkey.to_hex(),
-                    text: event.content.clone(),
-                    // The mention's created_at rides along for the causal
-                    // timestamp floor on the reply.
-                    reply_ref: event.created_at.as_secs().to_string(),
-                    // Nostr embeds images as URLs in content; fetching
-                    // arbitrary URLs is a policy decision, deliberately
-                    // not a silent default. Text-only for now.
-                    attachments: Vec::new(),
-                }))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => {
-                // Dead or dropped connection: reconnect with backoff rather
-                // than dying — resilience is the platform's quirk, so it
-                // lives in the adapter.
-                for _ in 0..5 {
-                    if stop.load(Ordering::Relaxed) {
-                        return Ok(None);
+        loop {
+            match self
+                .session
+                .next_mention(&self.trigger, &self.channels, stop)
+            {
+                Ok(Some(event)) => {
+                    let event_id = event.id.to_hex();
+                    if self.recent.contains(&event_id) {
+                        continue;
                     }
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    self.recent.remember(event_id, self.cursor_path.as_deref());
+                    let Some(channel) = channel_of(&event) else {
+                        return Ok(None); // malformed: treat as tick
+                    };
+                    return Ok(Some(crate::presence::Mention {
+                        channel,
+                        author: event.pubkey.to_hex(),
+                        text: event.content.clone(),
+                        // The mention's created_at rides along for the causal
+                        // timestamp floor on the reply.
+                        reply_ref: event.created_at.as_secs().to_string(),
+                        // Nostr embeds images as URLs in content; fetching
+                        // arbitrary URLs is a policy decision, deliberately
+                        // not a silent default. Text-only for now.
+                        attachments: Vec::new(),
+                    }));
                 }
-                match BuzzSession::connect(&self.relay, self.custody, self.handle) {
-                    Ok(mut fresh) => {
-                        fresh.enable_keepalive(std::time::Duration::from_secs(15));
-                        self.session = fresh;
-                        Ok(None) // tick; resubscribes on the next call
+                Ok(None) => return Ok(None),
+                Err(e) => {
+                    // Dead or dropped connection: reconnect with backoff rather
+                    // than dying — resilience is the platform's quirk, so it
+                    // lives in the adapter.
+                    for _ in 0..5 {
+                        if stop.load(Ordering::Relaxed) {
+                            return Ok(None);
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(1));
                     }
-                    Err(_) => {
-                        let _ = e;
-                        Ok(None) // keep retrying on subsequent ticks
-                    }
+                    return match BuzzSession::connect(&self.relay, self.custody, self.handle) {
+                        Ok(mut fresh) => {
+                            fresh.enable_keepalive(std::time::Duration::from_secs(15));
+                            self.session = fresh;
+                            Ok(None) // tick; resubscribes on the next call
+                        }
+                        Err(_) => {
+                            let _ = e;
+                            Ok(None) // keep retrying on subsequent ticks
+                        }
+                    };
                 }
             }
         }
@@ -700,4 +790,37 @@ pub fn run_mention_service(
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscriptions_overlap_listener_restarts() {
+        assert_eq!(subscription_since(1_000), 880);
+        assert_eq!(subscription_since(30), 0);
+    }
+
+    #[test]
+    fn recent_event_ids_survive_adapter_recreation() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "apiary-buzz-recent-{}-{unique}.json",
+            std::process::id()
+        ));
+        let mut recent = RecentEventIds::default();
+        recent.remember("event-a".into(), Some(&path));
+        recent.remember("event-a".into(), Some(&path));
+        recent.remember("event-b".into(), Some(&path));
+
+        let loaded = RecentEventIds::load(Some(&path));
+        assert!(loaded.contains("event-a"));
+        assert!(loaded.contains("event-b"));
+        assert_eq!(loaded.ids.len(), 2);
+        let _ = std::fs::remove_file(path);
+    }
 }

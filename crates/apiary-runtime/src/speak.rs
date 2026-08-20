@@ -78,9 +78,9 @@ pub fn bind_speaker(
                 .get("base_url")
                 .and_then(|v| v.as_str())
                 .map(String::from);
-            // Same rule as the inference provider: a compatible endpoint
-            // named by base_url may be keyless (a local Kokoro server); the
-            // hosted default is not.
+            // Same rule as the inference provider: an exact loopback
+            // endpoint may be keyless (a local Kokoro server); remote
+            // endpoints and the hosted default are not.
             let key = credential
                 .or_else(|| {
                     std::env::var("OPENAI_API_KEY")
@@ -91,6 +91,7 @@ pub fn bind_speaker(
                 .or_else(|| {
                     base_url
                         .as_ref()
+                        .filter(|url| crate::inference::is_loopback_base_url(url))
                         .map(|_| Zeroizing::new("local".to_string()))
                 })?;
             Some(Box::new(OpenAiSpeaker {

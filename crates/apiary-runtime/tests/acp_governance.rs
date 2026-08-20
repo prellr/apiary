@@ -3,7 +3,9 @@
 
 use apiary_core::custody::Custody;
 use apiary_core::log::EpisodicLog;
-use apiary_core::manifest::Manifest;
+use apiary_core::manifest::{
+    HarnessAccess, HarnessGrant, HarnessMetering, HarnessProfile, HarnessSandbox, Manifest,
+};
 use nostr::prelude::*;
 
 fn setup(
@@ -28,19 +30,42 @@ fn setup(
     (manifest, dir, custody, handle)
 }
 
+fn grant(command: &str, access: HarnessAccess) -> HarnessGrant {
+    HarnessGrant {
+        name: "mock-acp".into(),
+        kind: "acp".into(),
+        command: command.into(),
+        args: Vec::new(),
+        access,
+        profile: HarnessProfile::Isolated,
+        sandbox: HarnessSandbox::None,
+        allowed_tools: Vec::new(),
+        inherit_env: Vec::new(),
+        metering: HarnessMetering::Unmetered,
+        estimated_tokens_per_run: None,
+        workdir: None,
+    }
+}
+
 #[test]
 fn acp_deny_mode_blocks_tool_and_logs_harness() {
-    let (manifest, dir, custody, handle) = setup("deny");
+    let (mut manifest, dir, custody, handle) = setup("deny");
     let mock = env!("CARGO_BIN_EXE_mock-acp-agent");
+    let grant = grant(mock, HarnessAccess::InferenceOnly);
+    #[cfg(target_os = "macos")]
+    let grant = {
+        let mut grant = grant;
+        grant.sandbox = HarnessSandbox::ReadOnly;
+        grant
+    };
+    manifest.harnesses.push(grant.clone());
     let out = apiary_runtime::runner::run_acp_task(
         &manifest,
         &dir,
         &custody,
         &handle,
         "do something",
-        mock,
-        &[],
-        false,
+        &grant,
     )
     .unwrap();
 
@@ -67,23 +92,20 @@ fn acp_deny_mode_blocks_tool_and_logs_harness() {
     let body = EpisodicLog::parse_body(entries.last().unwrap()).unwrap();
     assert_eq!(body.action, "run.task");
     assert!(body.harness.as_deref().unwrap_or("").starts_with("acp:"));
+    #[cfg(target_os = "macos")]
+    assert_eq!(body.detail.as_ref().unwrap()["sandbox"], "read-only");
     assert_eq!(log.verify().unwrap(), 1);
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn acp_allow_mode_grants_tool() {
-    let (manifest, dir, custody, handle) = setup("allow");
+    let (mut manifest, dir, custody, handle) = setup("allow");
     let mock = env!("CARGO_BIN_EXE_mock-acp-agent");
+    let grant = grant(mock, HarnessAccess::Full);
+    manifest.harnesses.push(grant.clone());
     let out = apiary_runtime::runner::run_acp_task(
-        &manifest,
-        &dir,
-        &custody,
-        &handle,
-        "write it",
-        mock,
-        &[],
-        true,
+        &manifest, &dir, &custody, &handle, "write it", &grant,
     )
     .unwrap();
     assert_eq!(
@@ -94,5 +116,47 @@ fn acp_allow_mode_grants_tool() {
         .tool_calls
         .iter()
         .any(|(t, s)| t == "write_file" && s == "completed"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn curated_acp_access_matches_exact_permission_titles() {
+    let (mut manifest, dir, custody, handle) = setup("curated");
+    let mock = env!("CARGO_BIN_EXE_mock-acp-agent");
+    let mut allowed = grant(mock, HarnessAccess::Curated);
+    allowed.allowed_tools = vec!["write_file".into()];
+    manifest.harnesses.push(allowed.clone());
+    let out = apiary_runtime::runner::run_acp_task(
+        &manifest, &dir, &custody, &handle, "write it", &allowed,
+    )
+    .unwrap();
+    assert_eq!(out.permissions[0].1, "allow_once");
+
+    let mut denied = allowed;
+    denied.allowed_tools = vec!["read_file".into()];
+    manifest.harnesses.clear();
+    manifest.harnesses.push(denied.clone());
+    let out = apiary_runtime::runner::run_acp_task(
+        &manifest, &dir, &custody, &handle, "write it", &denied,
+    )
+    .unwrap();
+    assert_eq!(out.permissions[0].1, "reject_once");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn strict_unknown_usage_refuses_before_spawning() {
+    let (mut manifest, dir, custody, handle) = setup("strict");
+    let mut strict = grant("definitely-not-a-command", HarnessAccess::Full);
+    strict.metering = HarnessMetering::Strict;
+    manifest.harnesses.push(strict.clone());
+    let error =
+        apiary_runtime::runner::run_acp_task(&manifest, &dir, &custody, &handle, "do it", &strict)
+            .err()
+            .unwrap();
+    assert!(error
+        .to_string()
+        .contains("does not report authoritative token usage"));
+    assert_eq!(EpisodicLog::open(&dir).verify().unwrap(), 1);
     std::fs::remove_dir_all(&dir).ok();
 }

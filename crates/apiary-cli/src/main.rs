@@ -86,17 +86,18 @@ enum Command {
         /// Data class for routing floors (e.g. "sensitive").
         #[arg(long)]
         data_class: Option<String>,
-        /// Which loop runs the task: "native" (Apiary's loop) or "acp"
-        /// (a foreign harness subprocess under Apiary's governance shell).
+        /// Which loop runs the task: "native" or a harness name declared in
+        /// this agent's ratified manifest.
         #[arg(long, default_value = "native")]
         harness: String,
-        /// ACP harness command (e.g. "goose", "claude-code-acp").
+        /// Legacy selector: match a declared ACP harness by exact command.
         #[arg(long)]
         acp_cmd: Option<String>,
-        /// Extra args for the ACP command (repeatable).
+        /// Legacy assertion: must exactly match the declared harness args.
         #[arg(long = "acp-arg")]
         acp_args: Vec<String>,
-        /// Approve the harness's permission requests (default: deny all).
+        /// Legacy assertion that the declared harness has full access. This
+        /// flag can never widen the ratified policy.
         #[arg(long)]
         acp_allow: bool,
     },
@@ -141,8 +142,8 @@ enum AgentCmd {
         /// Human-readable label (stored in the manifest directory only).
         #[arg(long)]
         name: Option<String>,
-        /// Human suspend key (npub). Required: suspension authority can never
-        /// rest with the agent's own key (SPEC §8).
+        /// Independent governor identity (npub), belonging to a person or a
+        /// separate manager agent. It can never be the new agent's own key.
         #[arg(long, required = true)]
         suspend_key: Vec<String>,
     },
@@ -1023,17 +1024,38 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
             let mut custody = Custody::new();
             let handle = custody.admit(ks.load(npub, passphrase)?);
 
-            if harness == "acp" {
-                let cmd = acp_cmd
-                    .as_deref()
-                    .ok_or("--acp-cmd is required with --harness acp")?;
+            if harness != "native" {
+                let grant = if harness == "acp" {
+                    let cmd = acp_cmd
+                        .as_deref()
+                        .ok_or("--acp-cmd is required with legacy --harness acp")?;
+                    manifest
+                        .harnesses
+                        .iter()
+                        .find(|grant| grant.command == cmd)
+                        .ok_or_else(|| format!("no ratified harness grants command '{cmd}'"))?
+                } else {
+                    manifest
+                        .harnesses
+                        .iter()
+                        .find(|grant| grant.name == *harness)
+                        .ok_or_else(|| {
+                            format!("harness '{harness}' is not granted to this agent")
+                        })?
+                };
+                if !acp_args.is_empty() && acp_args != &grant.args {
+                    return Err("--acp-arg cannot override the ratified harness arguments".into());
+                }
+                if *acp_allow && grant.access != apiary_core::manifest::HarnessAccess::Full {
+                    return Err("--acp-allow cannot widen the ratified harness access".into());
+                }
                 let out = apiary_runtime::runner::run_acp_task(
-                    &manifest, &agent_dir, &custody, &handle, task, cmd, acp_args, *acp_allow,
+                    &manifest, &agent_dir, &custody, &handle, task, grant,
                 )?;
                 return Ok(json!({
                     "ok": true,
                     "npub": npub,
-                    "harness": format!("acp:{cmd}"),
+                    "harness": grant.name,
                     "outcome": out.stop_reason,
                     "tool_calls": out.tool_calls,
                     "permission_decisions": out.permissions,
@@ -1041,15 +1063,14 @@ fn run(cli: &Cli) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
                     "response": out.text,
                 }));
             }
-            if harness != "native" {
-                return Err(format!("unknown harness '{harness}' (native | acp)").into());
-            }
 
             let ctx = apiary_runtime::routing::TaskContext {
                 attachments: Vec::new(),
                 task_class: class.clone(),
                 data_class: data_class.clone(),
                 tokens_per_run: None,
+                disable_tools: false,
+                ..Default::default()
             };
             let out = apiary_runtime::runner::run_task(
                 &manifest, &agent_dir, &custody, &handle, task, &ctx,

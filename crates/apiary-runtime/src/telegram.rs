@@ -230,6 +230,17 @@ impl crate::presence::ChannelAdapter for TelegramAdapter {
             } else {
                 text
             };
+            // Telegram confirms an update only when a later getUpdates call
+            // carries an offset beyond it. Confirm this claim before the
+            // governed model call: a manifest bounce may stop the adapter as
+            // soon as that call returns, otherwise the same message is
+            // replayed to the replacement listener. Any update returned by
+            // this zero-timeout call remains unconfirmed at `self.offset` and
+            // will be read normally on the next poll.
+            let _ = self.call(
+                "getUpdates",
+                json!({"timeout": 0, "offset": self.offset, "limit": 1, "allowed_updates": ["message"]}),
+            );
             return Ok(Some(crate::presence::Mention {
                 channel: chat_id,
                 author,

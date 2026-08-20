@@ -17,6 +17,7 @@ use sha2::Digest;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use zeroize::Zeroizing;
 
 type Resp = (StatusCode, Json<serde_json::Value>);
 
@@ -36,8 +37,112 @@ fn push_line(lines: &Mutex<VecDeque<String>>, line: String) {
     }
 }
 
+#[derive(serde::Deserialize)]
+pub struct AuditQuery {
+    #[serde(default = "default_audit_tail")]
+    tail: usize,
+}
+
+fn default_audit_tail() -> usize {
+    100
+}
+
+/// Host-manager view of the local, hash-chained MCP management audit. Bodies
+/// and credentials are never recorded; mutating calls carry only a body hash.
+pub async fn control_audit_get(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    Query(query): Query<AuditQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if let Err(error) = check_admin(&state, &headers, "GET", &uri, None) {
+        return error.into_response();
+    }
+    let path = state.home.join("control-audit.jsonl");
+    let lines = std::fs::read_to_string(path).unwrap_or_default();
+    let mut parsed = Vec::new();
+    let mut chain_error = None;
+    for (index, line) in lines.lines().enumerate() {
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(entry) => parsed.push(entry),
+            Err(error) => {
+                chain_error = Some(format!("entry {index} is invalid JSON: {error}"));
+                break;
+            }
+        }
+    }
+    let mut previous: Option<String> = None;
+    for (index, entry) in parsed.iter().enumerate() {
+        if chain_error.is_some() {
+            break;
+        }
+        let stored_previous = entry.get("prev").and_then(|value| value.as_str());
+        if stored_previous != previous.as_deref() {
+            chain_error = Some(format!("entry {index} has a broken previous-hash link"));
+            break;
+        }
+        let stored_hash = entry.get("hash").and_then(|value| value.as_str());
+        let mut unsigned = entry.clone();
+        if let Some(object) = unsigned.as_object_mut() {
+            object.remove("hash");
+        }
+        let computed = format!(
+            "{:x}",
+            sha2::Sha256::digest(unsigned.to_string().as_bytes())
+        );
+        if stored_hash != Some(computed.as_str()) {
+            chain_error = Some(format!("entry {index} has an invalid hash"));
+            break;
+        }
+        previous = Some(computed);
+    }
+    let total = parsed.len();
+    let entries = parsed
+        .into_iter()
+        .rev()
+        .take(query.tail.clamp(1, 1000))
+        .collect::<Vec<_>>();
+    Json(json!({
+        "ok": true,
+        "chain": {"valid": chain_error.is_none(), "entries": total, "error": chain_error},
+        "entries": entries,
+    }))
+    .into_response()
+}
+
+pub async fn control_tokens_all_get(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if let Err(error) = check_admin(&state, &headers, "GET", &uri, None) {
+        return error.into_response();
+    }
+    match nip98::list_all_control_tokens(&state) {
+        Ok(tokens) => {
+            let now = now_secs();
+            let tokens = tokens
+                .into_iter()
+                .map(|token| {
+                    json!({
+                        "id": token.id,
+                        "agent": token.agent,
+                        "label": token.label,
+                        "created_at": token.created_at,
+                        "expires_at": token.expires_at,
+                        "revoked_at": token.revoked_at,
+                        "active": token.revoked_at.is_none() && token.expires_at > now,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Json(json!({"ok": true, "tokens": tokens})).into_response()
+        }
+        Err(error) => err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
+}
+
 /// The common request gate: token/NIP-98 check, agent resolution, manifest
-/// load, governor authorization. Every per-agent endpoint goes through this.
+/// load, role authorization. Every per-agent endpoint goes through this.
 #[allow(clippy::type_complexity)]
 fn gate(
     state: &AppState,
@@ -63,7 +168,7 @@ fn gate(
     let signer = nip98::check(state, headers, method, &pq, body)?;
     let (ks, npub, dir) = agent_ctx(state, npub)?;
     let (raw, manifest) = load_manifest(&dir)?;
-    nip98::authorize_governor(state, signer, &suspend_pks(&manifest))?;
+    nip98::authorize_agent_request(state, signer, &manifest, method, &pq)?;
     Ok((ks, npub, dir, raw, manifest))
 }
 
@@ -97,6 +202,31 @@ fn require_pass(state: &AppState) -> Result<String, Resp> {
     })
 }
 
+fn check_admin(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    method: &str,
+    uri: &axum::http::Uri,
+    body: Option<&[u8]>,
+) -> Result<(), Resp> {
+    let pq = uri
+        .path_and_query()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| uri.path().to_string());
+    let signer = nip98::check(state, headers, method, &pq, body)?;
+    nip98::authorize_admin(state, signer)
+}
+
+fn write_private(path: &std::path::Path, content: &str) -> Result<(), std::io::Error> {
+    std::fs::write(path, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 fn admit(
     ks: &Keystore,
     npub: &str,
@@ -112,6 +242,189 @@ fn admit(
 
 // ---------------------------------------------------------------- status
 
+/// Exchange one fresh NIP-98 signature for an in-memory browser session.
+/// The cookie is HttpOnly and the returned request token is required in a
+/// custom header, so same-site form posts cannot exercise the session.
+pub async fn browser_session_create(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let signed = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("Nostr "));
+    if state.auth != crate::AuthMode::Nip98 || !signed {
+        return err(
+            StatusCode::UNAUTHORIZED,
+            "a fresh NIP-98 signature is required to open a browser session",
+        )
+        .into_response();
+    }
+    let pq = uri
+        .path_and_query()
+        .map(|path| path.to_string())
+        .unwrap_or_else(|| uri.path().to_string());
+    let signer = match nip98::check(&state, &headers, "POST", &pq, None) {
+        Ok(Some(signer)) => signer,
+        Ok(None) => {
+            return err(StatusCode::UNAUTHORIZED, "NIP-98 signer is missing").into_response()
+        }
+        Err(error) => return error.into_response(),
+    };
+    // Do not issue a reusable browser session to an arbitrary valid Nostr
+    // identity. Host managers and people assigned to at least one agent may
+    // enter; individual routes still enforce their narrower role.
+    if let Err(error) = nip98::authorize_cockpit(&state, Some(signer)) {
+        return error.into_response();
+    }
+    let secure = state.origin.starts_with("https://");
+    browser_session_response(&state, signer, secure)
+}
+
+#[derive(Default, serde::Deserialize)]
+pub struct DesktopSessionRequest {
+    manager: Option<String>,
+}
+
+/// Exchange the daemon's per-process desktop credential for the same
+/// manager-bound session created by NIP-98. The credential is only published
+/// in a 0600 file and is retrieved after SSH has authenticated the desktop.
+/// It is never a general API bearer token.
+pub async fn desktop_session_create(
+    State(state): State<App>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<DesktopSessionRequest>,
+) -> axum::response::Response {
+    if state.auth != crate::AuthMode::Nip98 {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "desktop session exchange is only used in NIP-98 mode",
+        )
+        .into_response();
+    }
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    let expected = state.desktop_token.as_deref().unwrap_or_default();
+    if expected.is_empty() || !nip98::constant_time_eq(presented, expected) {
+        return err(StatusCode::UNAUTHORIZED, "desktop credential was refused").into_response();
+    }
+
+    let managers = match state.managers.read() {
+        Ok(managers) => managers,
+        Err(_) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "manager registry unavailable",
+            )
+            .into_response()
+        }
+    };
+    let views = managers.views();
+    let selected = match body.manager.as_deref() {
+        Some(npub) => views.iter().find(|manager| manager.npub == npub),
+        None if views.len() == 1 => views.first(),
+        None => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "ok": false,
+                    "error": "choose the approved manager identity for this desktop session",
+                    "managers": views,
+                })),
+            )
+                .into_response()
+        }
+    };
+    let Some(selected) = selected else {
+        return err(StatusCode::FORBIDDEN, "that identity is not a host manager").into_response();
+    };
+    let signer = match apiary_core::identity::parse_npub(&selected.npub) {
+        Ok(signer) => signer,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    drop(managers);
+
+    // This cookie is deliberately not Secure: this endpoint is consumed over
+    // the SSH-forwarded loopback origin (http://127.0.0.1). The unpredictable
+    // bearer above is still required, and the resulting cookie remains
+    // HttpOnly, SameSite=Strict, manager-bound, and CSRF-bound.
+    browser_session_response(&state, signer, false)
+}
+
+fn browser_session_response(
+    state: &AppState,
+    signer: PublicKey,
+    secure_cookie: bool,
+) -> axum::response::Response {
+    let session = match nip98::issue_browser_session(state, signer) {
+        Ok(session) => session,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    let npub = match apiary_core::identity::to_npub(&signer) {
+        Ok(npub) => npub,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    let secure = if secure_cookie { "; Secure" } else { "" };
+    let cookie = format!(
+        "apiary_session={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
+        session.token,
+        session.expires_at.saturating_sub(now_secs()),
+        secure,
+    );
+    let mut response = Json(json!({
+        "ok": true,
+        "npub": npub,
+        "csrf": session.csrf,
+        "expires_at": session.expires_at,
+    }))
+    .into_response();
+    response.headers_mut().insert(
+        axum::http::header::SET_COOKIE,
+        cookie.parse().expect("session cookie is valid"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// Explicitly revoke the current browser session and expire its cookie.
+pub async fn browser_session_delete(
+    State(state): State<App>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if state.auth != crate::AuthMode::Nip98 {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "browser sessions are only used in NIP-98 mode",
+        )
+        .into_response();
+    }
+    if let Err(error) = nip98::revoke_browser_session(&state, &headers) {
+        return error.into_response();
+    }
+    let secure = if state.origin.starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie = format!(
+        "apiary_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
+        secure,
+    );
+    let mut response = Json(json!({ "ok": true })).into_response();
+    response.headers_mut().insert(
+        axum::http::header::SET_COOKIE,
+        cookie.parse().expect("expired session cookie is valid"),
+    );
+    response
+}
+
 pub async fn status(
     State(state): State<App>,
     OriginalUri(uri): OriginalUri,
@@ -121,18 +434,35 @@ pub async fn status(
         .path_and_query()
         .map(|p| p.to_string())
         .unwrap_or_else(|| uri.path().to_string());
-    if let Err(e) = nip98::check(&state, &headers, "GET", &pq, None) {
-        return e.into_response();
+    let signer = match nip98::check(&state, &headers, "GET", &pq, None) {
+        Ok(signer) => signer,
+        Err(error) => return error.into_response(),
+    };
+    if let Err(error) = nip98::authorize_cockpit(&state, signer) {
+        return error.into_response();
     }
     let unlocked = state
         .passphrase
         .read()
         .map(|g| g.is_some())
         .unwrap_or(false);
-    let agents = Keystore::open(&state.home)
-        .and_then(|ks| ks.list())
-        .map(|v| v.len())
-        .unwrap_or(0);
+    let (agents, owners) = Keystore::open(&state.home)
+        .and_then(|ks| {
+            let slots = ks.list()?;
+            let agents = slots
+                .iter()
+                .filter(|npub| ks.agent_dir(npub).join("manifest.yaml").exists())
+                .count();
+            let owners = slots
+                .iter()
+                .filter(|npub| {
+                    std::fs::read_to_string(ks.agent_dir(npub).join("principal.kind"))
+                        .is_ok_and(|kind| kind.trim() == "owner")
+                })
+                .count();
+            Ok((agents, owners))
+        })
+        .unwrap_or((0, 0));
     let listeners: Vec<serde_json::Value> = state
         .listeners
         .lock()
@@ -161,18 +491,801 @@ pub async fn status(
         "auth": match state.auth { crate::AuthMode::Open => "open", crate::AuthMode::Nip98 => "nip98" },
         "token_gated": state.token.is_some(),
         "unlocked": unlocked,
+        "automatic_unlock": state.automatic_unlock.load(Ordering::Relaxed),
+        "can_remember_unlock": state.remember_passphrase.is_some(),
+        "can_forget_unlock": state.forget_passphrase.is_some(),
         "agents": agents,
+        "owners": owners,
+        "managers": state.managers.read().map(|registry| registry.len()).unwrap_or(0),
         "listeners": listeners,
-        "anthropic_key_present": std::env::var("ANTHROPIC_API_KEY").is_ok()
-            || std::env::var("ANTHROPIC_AUTH_TOKEN").is_ok(),
+        "anthropic_key_present": nonempty_env("ANTHROPIC_API_KEY")
+            || nonempty_env("ANTHROPIC_AUTH_TOKEN"),
         "relay_pool": apiary_runtime::relay::stats(),
     }))
     .into_response()
 }
 
+// ---------------------------------------------------------- host managers
+
+#[derive(serde::Deserialize)]
+pub struct ManagerBody {
+    name: String,
+    npub: String,
+}
+
+/// List public Nostr identities with full host-scoped authority. Private keys
+/// are never accepted here; each person signs through their own Nostr signer.
+pub async fn managers_get(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = check_admin(&state, &headers, "GET", &uri, None) {
+        return e.into_response();
+    }
+    match state.managers.read() {
+        Ok(registry) => Json(json!({"ok": true, "managers": registry.views()})).into_response(),
+        Err(_) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "host manager registry is unavailable",
+        )
+        .into_response(),
+    }
+}
+
+/// Add a manager or update their local display name. Every manager has equal,
+/// independent host authority; this is deliberately not a role hierarchy.
+pub async fn managers_upsert(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    if let Err(e) = check_admin(&state, &headers, "POST", &uri, Some(&raw_body)) {
+        return e.into_response();
+    }
+    let body: ManagerBody = match serde_json::from_slice(&raw_body) {
+        Ok(body) => body,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    if let Err(error) = crate::access::validate_name(&body.name) {
+        return err(StatusCode::BAD_REQUEST, error).into_response();
+    }
+    let key = match apiary_core::identity::parse_npub(body.npub.trim()) {
+        Ok(key) => key,
+        Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let canonical = match apiary_core::identity::to_npub(&key) {
+        Ok(npub) => npub,
+        Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let mut registry = match state.managers.write() {
+        Ok(registry) => registry,
+        Err(_) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "host manager registry is unavailable",
+            )
+            .into_response()
+        }
+    };
+    if let Err(error) = registry.upsert(key, body.name.trim().to_string()) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
+    Json(json!({"ok": true, "npub": canonical, "managers": registry.views()})).into_response()
+}
+
+pub async fn managers_remove(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    AxPath(npub): AxPath<String>,
+) -> impl IntoResponse {
+    if let Err(e) = check_admin(&state, &headers, "DELETE", &uri, None) {
+        return e.into_response();
+    }
+    let key = match apiary_core::identity::parse_npub(&npub) {
+        Ok(key) => key,
+        Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let mut registry = match state.managers.write() {
+        Ok(registry) => registry,
+        Err(_) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "host manager registry is unavailable",
+            )
+            .into_response()
+        }
+    };
+    match registry.remove(&key) {
+        Ok(crate::access::RemoveOutcome::Removed) => {
+            Json(json!({"ok": true, "managers": registry.views()})).into_response()
+        }
+        Ok(crate::access::RemoveOutcome::NotFound) => {
+            err(StatusCode::NOT_FOUND, "host manager was not found").into_response()
+        }
+        Ok(crate::access::RemoveOutcome::StartupManager) => err(
+            StatusCode::CONFLICT,
+            "this manager came from --admin; restart without that flag before removing them",
+        )
+        .into_response(),
+        Ok(crate::access::RemoveOutcome::LastManager) => err(
+            StatusCode::CONFLICT,
+            "the last host manager cannot be removed; add a replacement first",
+        )
+        .into_response(),
+        Err(error) => err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct GovernorsBody {
+    #[serde(default)]
+    npubs: Vec<String>,
+    #[serde(default)]
+    managers: Vec<apiary_core::manifest::ManagerGrant>,
+}
+
+/// Replace an agent's manager roles. The legacy `npubs` shape remains accepted
+/// and treats every listed identity as a governor. Authorization is checked
+/// against the current manifest before the inert amendment is written.
+pub async fn governors_set(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    let body: GovernorsBody = match serde_json::from_slice(&raw_body) {
+        Ok(body) => body,
+        Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    if !body.npubs.is_empty() && !body.managers.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "send either legacy npubs or role-bearing managers, not both",
+        )
+        .into_response();
+    }
+    let requested = if body.managers.is_empty() {
+        body.npubs
+            .into_iter()
+            .map(|npub| apiary_core::manifest::ManagerGrant {
+                npub,
+                role: apiary_core::manifest::ManagerRole::Governor,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        body.managers
+    };
+    if requested.is_empty()
+        || !requested
+            .iter()
+            .any(|manager| manager.role == apiary_core::manifest::ManagerRole::Governor)
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "at least one agent governor is required",
+        )
+        .into_response();
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut normalized = Vec::new();
+    for manager in requested {
+        let key = match apiary_core::identity::parse_npub(manager.npub.trim()) {
+            Ok(key) => key,
+            Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+        };
+        if !seen.insert(key) {
+            return err(StatusCode::BAD_REQUEST, "duplicate agent manager identity")
+                .into_response();
+        }
+        let npub = match apiary_core::identity::to_npub(&key) {
+            Ok(npub) => npub,
+            Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+        };
+        normalized.push(apiary_core::manifest::ManagerGrant {
+            npub,
+            role: manager.role,
+        });
+    }
+    manifest.governance.suspend_keys = normalized
+        .iter()
+        .filter(|manager| manager.role == apiary_core::manifest::ManagerRole::Governor)
+        .map(|manager| manager.npub.clone())
+        .collect();
+    manifest.governance.managers = normalized
+        .iter()
+        .filter(|manager| manager.role != apiary_core::manifest::ManagerRole::Governor)
+        .cloned()
+        .collect();
+    if let Err(error) = manifest.validate() {
+        return err(StatusCode::BAD_REQUEST, error).into_response();
+    }
+    let yaml = match manifest.to_yaml() {
+        Ok(yaml) => yaml,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    if let Err(error) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "managers": normalized,
+        "manifest_sha256": ceremony::manifest_hash(&yaml),
+        "ratified": false,
+        "note": "agent managers changed — the agent is paused until one of the newly listed governors ratifies",
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct ConstitutionBody {
+    #[serde(default)]
+    purpose: String,
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    voice: String,
+    #[serde(default)]
+    principles: Vec<String>,
+    #[serde(default)]
+    boundaries: Vec<String>,
+}
+
+/// Replace the agent's ratified operating character. This changes only how
+/// the agent should behave; it cannot add tools or loosen connector caps.
+pub async fn constitution_set(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    let body: ConstitutionBody = match serde_json::from_slice(&raw_body) {
+        Ok(body) => body,
+        Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let clean_list = |items: Vec<String>| {
+        items
+            .into_iter()
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect()
+    };
+    manifest.constitution = apiary_core::manifest::Constitution {
+        purpose: body.purpose.trim().to_string(),
+        role: body.role.trim().to_string(),
+        voice: body.voice.trim().to_string(),
+        principles: clean_list(body.principles),
+        boundaries: clean_list(body.boundaries),
+    };
+    let yaml = match manifest.to_yaml() {
+        Ok(yaml) => yaml,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    if let Err(error) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "constitution": manifest.constitution,
+        "manifest_sha256": ceremony::manifest_hash(&yaml),
+        "ratified": false,
+        "note": "role and personality changed — review and approve before the agent runs",
+    }))
+    .into_response()
+}
+
+/// Return the SKILL.md interchange form plus requirement status. Skill bodies
+/// are safe to return to governors; credentials remain in separate sealed
+/// connector fields and never appear here.
+pub async fn skills_get(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, _npub, _dir, _raw, manifest) = match gate(&state, &headers, "GET", &uri, None, &npub)
+    {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    let skills = manifest
+        .skills
+        .iter()
+        .map(|skill| {
+            let missing: Vec<&String> = skill
+                .requires_connectors
+                .iter()
+                .filter(|required| {
+                    !manifest
+                        .connectors
+                        .iter()
+                        .any(|connector| connector.kind.as_str() == required.as_str())
+                })
+                .collect();
+            json!({
+                "name": skill.name,
+                "description": skill.description,
+                "markdown": skill.to_markdown().unwrap_or_default(),
+                "requires_connectors": skill.requires_connectors,
+                "available": missing.is_empty(),
+                "missing_connectors": missing,
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(json!({"ok": true, "skills": skills})).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct SkillBody {
+    markdown: String,
+    #[serde(default)]
+    requires_connectors: Vec<String>,
+    #[serde(default)]
+    original_name: Option<String>,
+}
+
+/// Import or update one SKILL.md. The parsed body is embedded in the
+/// manifest, so approval covers the exact instructions and exports remain
+/// self-contained. Connector requirements are checks, never grants.
+pub async fn skill_upsert(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    let body: SkillBody = match serde_json::from_slice(&raw_body) {
+        Ok(body) => body,
+        Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let skill =
+        match apiary_core::manifest::Skill::from_markdown(&body.markdown, body.requires_connectors)
+        {
+            Ok(skill) => skill,
+            Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+        };
+    let original = body.original_name.as_deref().unwrap_or(&skill.name);
+    if original != skill.name
+        && manifest
+            .skills
+            .iter()
+            .any(|existing| existing.name == skill.name)
+    {
+        return err(
+            StatusCode::CONFLICT,
+            format!("a skill named '{}' already exists", skill.name),
+        )
+        .into_response();
+    }
+    manifest.skills.retain(|existing| existing.name != original);
+    manifest.skills.push(skill.clone());
+    manifest
+        .skills
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    if let Err(error) = manifest.validate() {
+        return err(StatusCode::BAD_REQUEST, error).into_response();
+    }
+    let yaml = match manifest.to_yaml() {
+        Ok(yaml) => yaml,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    if let Err(error) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "skill": skill.name,
+        "manifest_sha256": ceremony::manifest_hash(&yaml),
+        "ratified": false,
+        "note": "skill saved — review its instructions and approve the amendment before the agent runs",
+    }))
+    .into_response()
+}
+
+pub async fn skill_delete(
+    State(state): State<App>,
+    AxPath((npub, name)): AxPath<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "DELETE", &uri, None, &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    let before = manifest.skills.len();
+    manifest.skills.retain(|skill| skill.name != name);
+    if manifest.skills.len() == before {
+        return err(StatusCode::NOT_FOUND, format!("no skill named '{name}'")).into_response();
+    }
+    let yaml = match manifest.to_yaml() {
+        Ok(yaml) => yaml,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    if let Err(error) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "removed": name,
+        "manifest_sha256": ceremony::manifest_hash(&yaml),
+        "ratified": false,
+        "note": "skill removed — review and approve the amendment before the agent runs",
+    }))
+    .into_response()
+}
+
+// ----------------------------------------------------------- harness policy
+
+pub async fn harnesses_get(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, _npub, _dir, _raw, manifest) = match gate(&state, &headers, "GET", &uri, None, &npub)
+    {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    Json(json!({"ok": true, "harnesses": manifest.harnesses})).into_response()
+}
+
+#[derive(serde::Serialize)]
+struct DiscoveredHarness {
+    id: &'static str,
+    name: &'static str,
+    description: &'static str,
+    command: String,
+    args: Vec<&'static str>,
+    source: &'static str,
+}
+
+fn executable(path: &std::path::Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    true
+}
+
+fn discover_acp_harnesses_from(
+    berd_paths: &[std::path::PathBuf],
+    search_path: Option<&std::ffi::OsStr>,
+) -> Vec<DiscoveredHarness> {
+    let mut found = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+
+    for path in berd_paths {
+        if executable(path) && seen.insert(path.clone()) {
+            found.push(DiscoveredHarness {
+                id: "berd-goose",
+                name: "Berd's Goose harness",
+                description: "Berd's bundled Goose ACP loop; Apiary still governs its profile, tools, sandbox, and accounting.",
+                command: path.to_string_lossy().into_owned(),
+                args: vec!["acp"],
+                source: "Berd application",
+            });
+        }
+    }
+
+    if let Some(path) = search_path {
+        for directory in std::env::split_paths(&path) {
+            for (binary, id, name) in [
+                ("goose", "goose", "Goose harness"),
+                ("goosed", "goose-daemon", "Goose harness"),
+            ] {
+                let candidate = directory.join(binary);
+                if executable(&candidate) && seen.insert(candidate.clone()) {
+                    found.push(DiscoveredHarness {
+                        id,
+                        name,
+                        description: "Installed Goose ACP loop; Apiary still governs its profile, tools, sandbox, and accounting.",
+                        command: candidate.to_string_lossy().into_owned(),
+                        args: vec!["acp"],
+                        source: "PATH",
+                    });
+                }
+            }
+        }
+    }
+    found
+}
+
+fn discover_acp_harnesses() -> Vec<DiscoveredHarness> {
+    let mut berd_paths = vec![std::path::PathBuf::from(
+        "/Applications/Berd.app/Contents/MacOS/goosed",
+    )];
+    if let Some(home) = std::env::var_os("HOME") {
+        berd_paths.push(
+            std::path::PathBuf::from(home).join("Applications/Berd.app/Contents/MacOS/goosed"),
+        );
+    }
+    let search_path = std::env::var_os("PATH");
+    discover_acp_harnesses_from(&berd_paths, search_path.as_deref())
+}
+
+#[cfg(test)]
+mod harness_discovery_tests {
+    use super::discover_acp_harnesses_from;
+
+    #[cfg(unix)]
+    #[test]
+    fn berd_and_path_goose_are_prefilled_as_stdio_acp_without_launching() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("apiary-harness-discovery-{}", std::process::id()));
+        let berd = root.join("Berd.app/Contents/MacOS/goosed");
+        let path_bin = root.join("bin");
+        std::fs::create_dir_all(berd.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&path_bin).unwrap();
+        std::fs::write(&berd, b"test").unwrap();
+        std::fs::write(path_bin.join("goose"), b"test").unwrap();
+        std::fs::set_permissions(&berd, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            path_bin.join("goose"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let found =
+            discover_acp_harnesses_from(std::slice::from_ref(&berd), Some(path_bin.as_os_str()));
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].id, "berd-goose");
+        assert_eq!(found[0].command, berd.to_string_lossy());
+        assert_eq!(found[0].args, vec!["acp"]);
+        assert_eq!(found[1].id, "goose");
+        assert_eq!(found[1].args, vec!["acp"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// Discover known ACP harness executables without launching them. Discovery
+/// is agent-scoped so the same viewer/editor/governor policy as the harness
+/// page applies; it never imports the foreign harness's profile or secrets.
+pub async fn harnesses_discover(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if let Err(error) = gate(&state, &headers, "GET", &uri, None, &npub) {
+        return error.into_response();
+    }
+    Json(json!({"ok": true, "harnesses": discover_acp_harnesses()})).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct HarnessBody {
+    harness: apiary_core::manifest::HarnessGrant,
+    #[serde(default)]
+    original_name: Option<String>,
+}
+
+pub async fn harness_upsert(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    let body: HarnessBody = match serde_json::from_slice(&raw_body) {
+        Ok(body) => body,
+        Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    if let Err(error) = body.harness.validate() {
+        return err(StatusCode::BAD_REQUEST, error).into_response();
+    }
+    let original = body.original_name.as_deref().unwrap_or(&body.harness.name);
+    if original != body.harness.name
+        && manifest
+            .harnesses
+            .iter()
+            .any(|existing| existing.name == body.harness.name)
+    {
+        return err(
+            StatusCode::CONFLICT,
+            format!("a harness named '{}' already exists", body.harness.name),
+        )
+        .into_response();
+    }
+    manifest
+        .harnesses
+        .retain(|existing| existing.name != original);
+    manifest.harnesses.push(body.harness.clone());
+    manifest
+        .harnesses
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    if let Err(error) = manifest.validate() {
+        return err(StatusCode::BAD_REQUEST, error).into_response();
+    }
+    let yaml = match manifest.to_yaml() {
+        Ok(yaml) => yaml,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    if let Err(error) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "harness": body.harness.name,
+        "manifest_sha256": ceremony::manifest_hash(&yaml),
+        "ratified": false,
+        "note": "harness policy saved — review its authority and approve the amendment before the agent runs",
+    }))
+    .into_response()
+}
+
+pub async fn harness_delete(
+    State(state): State<App>,
+    AxPath((npub, name)): AxPath<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "DELETE", &uri, None, &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    let before = manifest.harnesses.len();
+    manifest.harnesses.retain(|harness| harness.name != name);
+    if manifest.harnesses.len() == before {
+        return err(StatusCode::NOT_FOUND, format!("no harness named '{name}'")).into_response();
+    }
+    let yaml = match manifest.to_yaml() {
+        Ok(yaml) => yaml,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    if let Err(error) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "removed": name,
+        "manifest_sha256": ceremony::manifest_hash(&yaml),
+        "ratified": false,
+        "note": "harness removed — review and approve the amendment before the agent runs",
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------------- owners
+
+#[derive(serde::Deserialize)]
+pub struct CreateOwnerBody {
+    name: String,
+}
+
+/// List locally held human approval identities. They occupy an encrypted
+/// keystore slot but deliberately have no agent manifest, so they never run,
+/// appear in the roster, or acquire capabilities.
+pub async fn owners_get(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = check_admin(&state, &headers, "GET", &uri, None) {
+        return e.into_response();
+    }
+    let ks = match Keystore::open(&state.home) {
+        Ok(ks) => ks,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let mut owners = Vec::new();
+    for npub in ks.list().unwrap_or_default() {
+        let dir = ks.agent_dir(&npub);
+        let is_owner = std::fs::read_to_string(dir.join("principal.kind"))
+            .is_ok_and(|kind| kind.trim() == "owner");
+        if !is_owner {
+            continue;
+        }
+        let name = std::fs::read_to_string(dir.join("name"))
+            .unwrap_or_else(|_| "Owner".into())
+            .trim()
+            .to_string();
+        owners.push(json!({"npub": npub, "name": name}));
+    }
+    Json(json!({"ok": true, "owners": owners})).into_response()
+}
+
+/// Create a separate human approval identity for desktop-first onboarding.
+/// It is NIP-49-encrypted under the already-unlocked keystore passphrase and
+/// can ratify agents, but it is not itself an agent.
+pub async fn owners_create(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    if let Err(e) = check_admin(&state, &headers, "POST", &uri, Some(&raw_body)) {
+        return e.into_response();
+    }
+    let body: CreateOwnerBody = match serde_json::from_slice(&raw_body) {
+        Ok(body) => body,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let name = body.name.trim().to_string();
+    if name.is_empty() || name.chars().count() > 60 {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "owner name must be 1–60 characters",
+        )
+        .into_response();
+    }
+    let pass = match require_pass(&state) {
+        Ok(pass) => pass,
+        Err(e) => return e.into_response(),
+    };
+    let home = state.home.clone();
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, Resp> {
+        let ks = Keystore::open(&home).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let keys = apiary_core::identity::generate();
+        let npub = apiary_core::identity::to_npub(&keys.public_key())
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        ks.store(&keys, &pass)
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let dir = ks.agent_dir(&npub);
+        write_private(&dir.join("principal.kind"), "owner\n")
+            .and_then(|_| write_private(&dir.join("name"), &name))
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        Ok(json!({
+            "ok": true,
+            "npub": npub,
+            "name": name,
+            "note": "owner identity created and encrypted in this keystore",
+        }))
+    })
+    .await
+    .unwrap_or_else(|e| Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)));
+    match out {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 #[derive(serde::Deserialize)]
 pub struct UnlockBody {
     passphrase: String,
+    #[serde(default)]
+    remember: bool,
 }
 
 /// Unlock the keystore for this daemon's lifetime. Verified against a real
@@ -222,11 +1335,30 @@ pub async fn unlock(
     .unwrap_or_else(|e| Err(e.to_string()));
     match verified {
         Ok(checked) => {
+            let mut remember_warning = None;
+            if body.remember {
+                match state.remember_passphrase.as_ref() {
+                    Some(remember) => match remember(&body.passphrase) {
+                        Ok(()) => state.automatic_unlock.store(true, Ordering::Relaxed),
+                        Err(error) => remember_warning = Some(error),
+                    },
+                    None => {
+                        remember_warning =
+                            Some("automatic unlock is not available in this host build".to_string())
+                    }
+                }
+            }
             if let Ok(mut g) = state.passphrase.write() {
                 *g = Some(body.passphrase);
             }
-            Json(json!({"ok": true, "unlocked": true, "verified_against_key": checked}))
-                .into_response()
+            Json(json!({
+                "ok": true,
+                "unlocked": true,
+                "verified_against_key": checked,
+                "automatic_unlock": state.automatic_unlock.load(Ordering::Relaxed),
+                "remember_warning": remember_warning,
+            }))
+            .into_response()
         }
         Err(e) => err(StatusCode::UNAUTHORIZED, e).into_response(),
     }
@@ -255,6 +1387,36 @@ pub async fn lock(
         *g = None;
     }
     Json(json!({"ok": true, "unlocked": false})).into_response()
+}
+
+pub async fn forget_automatic_unlock(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let pq = uri
+        .path_and_query()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| uri.path().to_string());
+    let signer = match nip98::check(&state, &headers, "POST", &pq, None) {
+        Ok(sig) => sig,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = nip98::authorize_admin(&state, signer) {
+        return e.into_response();
+    }
+    let Some(forget) = state.forget_passphrase.as_ref() else {
+        return err(
+            StatusCode::NOT_IMPLEMENTED,
+            "automatic unlock is not available in this host build",
+        )
+        .into_response();
+    };
+    if let Err(error) = forget() {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
+    state.automatic_unlock.store(false, Ordering::Relaxed);
+    Json(json!({"ok": true, "automatic_unlock": false})).into_response()
 }
 
 // ---------------------------------------------------------------- key tool
@@ -322,6 +1484,836 @@ pub async fn spend_status(
             .into_response()
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+// ----------------------------------------------------------- inference setup
+
+fn inference_role(name: &str) -> &'static str {
+    match name {
+        "embed" => "embedding",
+        "transcribe" => "transcription",
+        "speak" => "speech",
+        _ => "language",
+    }
+}
+
+fn valid_inference_provider(role: &str, provider: &str) -> bool {
+    match role {
+        "embedding" => matches!(provider, "ollama" | "hash" | "mock"),
+        "transcription" => matches!(provider, "apple-speech" | "whisper-cpp" | "openai" | "mock"),
+        "speech" => matches!(provider, "apple-speech" | "macos-say" | "openai" | "mock"),
+        _ => matches!(
+            provider,
+            "claude-code"
+                | "codex"
+                | "anthropic"
+                | "openai"
+                | "xai"
+                | "ollama"
+                | "mock"
+                | "mock-tool"
+        ),
+    }
+}
+
+fn loopback_url(raw: &str) -> Option<reqwest::Url> {
+    let url = reqwest::Url::parse(raw).ok()?;
+    match url.host_str()? {
+        "127.0.0.1" | "localhost" | "::1" | "[::1]" => Some(url),
+        _ => None,
+    }
+}
+
+fn nonempty_env(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| !value.is_empty())
+}
+
+fn credential_source(slot: &apiary_core::manifest::InferenceSlot) -> String {
+    if slot.provider == "claude-code" {
+        return "local Claude Code sign-in".into();
+    }
+    if slot.provider == "codex" {
+        return "local ChatGPT sign-in".into();
+    }
+    if slot.credential.is_some() {
+        return "sealed API key".into();
+    }
+    let env = match slot.provider.as_str() {
+        "anthropic" => nonempty_env("ANTHROPIC_API_KEY") || nonempty_env("ANTHROPIC_AUTH_TOKEN"),
+        "openai" => nonempty_env("OPENAI_API_KEY"),
+        "xai" => nonempty_env("XAI_API_KEY"),
+        _ => false,
+    };
+    if env {
+        "host environment".into()
+    } else {
+        "none".into()
+    }
+}
+
+fn probe_inference_slot(slot: &apiary_core::manifest::InferenceSlot) -> serde_json::Value {
+    let role = inference_role(&slot.name);
+    let provider = slot.provider.as_str();
+    let credential = credential_source(slot);
+    let base_url = slot.requires.get("base_url").and_then(|v| v.as_str());
+    let configured = credential != "none";
+    let result = |state: &str, detail: String| json!({"state": state, "detail": detail});
+
+    match provider {
+        "ollama" => {
+            let client = match reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => return result("unavailable", e.to_string()),
+            };
+            let response = client.get("http://127.0.0.1:11434/api/tags").send();
+            let Ok(response) = response else {
+                return result(
+                    "unavailable",
+                    "Ollama is not reachable on localhost:11434".into(),
+                );
+            };
+            let payload: serde_json::Value = response.json().unwrap_or_default();
+            let requested = slot.model.as_deref().unwrap_or("");
+            let present = requested.is_empty()
+                || payload["models"].as_array().is_some_and(|models| {
+                    models.iter().any(|m| {
+                        let found = m["name"].as_str().unwrap_or("");
+                        found == requested
+                            || found.strip_suffix(":latest") == Some(requested)
+                            || requested.strip_suffix(":latest") == Some(found)
+                    })
+                });
+            if present {
+                result(
+                    "ready",
+                    format!("Local Ollama model {requested} is installed"),
+                )
+            } else {
+                result(
+                    "unavailable",
+                    format!("Ollama is running, but {requested} is not installed"),
+                )
+            }
+        }
+        "apple-speech" => {
+            let command = slot
+                .requires
+                .get("command")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let engine = apiary_runtime::transcribe::AppleSpeech::new(command, None);
+            match engine.probe() {
+                Ok(probe) => result(
+                    "ready",
+                    format!(
+                        "On-device Apple Speech: {}{}",
+                        if probe["transcribe"].as_bool() == Some(true) {
+                            "transcription"
+                        } else {
+                            "speech"
+                        },
+                        if probe["speak"].as_bool() == Some(true) {
+                            " + synthesis"
+                        } else {
+                            ""
+                        }
+                    ),
+                ),
+                Err(e) => result("unavailable", e.to_string()),
+            }
+        }
+        "macos-say" => {
+            if std::path::Path::new("/usr/bin/say").is_file() {
+                result("ready", "macOS speech synthesis is available".into())
+            } else {
+                result(
+                    "unavailable",
+                    "The macOS say command is not installed".into(),
+                )
+            }
+        }
+        "hash" | "mock" | "mock-tool" => {
+            result("ready", "Built into Apiary; no external connection".into())
+        }
+        "whisper-cpp" => result(
+            "configured",
+            "Local whisper.cpp is checked when audio is received".into(),
+        ),
+        "claude-code" => {
+            if !apiary_runtime::inference::claude_code_is_installed() {
+                result("unavailable", "Claude Code is not installed".into())
+            } else {
+                match apiary_runtime::inference::claude_code_auth_status() {
+                    Ok(account) => result(
+                        "ready",
+                        format!("Claude Code is signed in on this Mac ({account})"),
+                    ),
+                    Err(error) => result("unavailable", error.to_string()),
+                }
+            }
+        }
+        "codex" => {
+            if !apiary_runtime::inference::codex_is_installed() {
+                result("unavailable", "Codex CLI is not installed".into())
+            } else {
+                match apiary_runtime::inference::codex_auth_status() {
+                    Ok(account) => result(
+                        "ready",
+                        format!("Codex is signed in on this Mac ({account})"),
+                    ),
+                    Err(apiary_runtime::Error::Provider(detail)) => {
+                        result("unavailable", detail)
+                    }
+                    Err(error) => result("unavailable", error.to_string()),
+                }
+            }
+        }
+        "anthropic"
+            if slot.requires.get("auth").and_then(|value| value.as_str()) == Some("oauth") =>
+        {
+            result(
+                "unavailable",
+                "Legacy Claude OAuth source: open Edit connection and save it to migrate to Claude Code"
+                    .into(),
+            )
+        }
+        "anthropic" | "xai" => {
+            if configured {
+                result(
+                    "configured",
+                    "Credential is available; no billable test request was sent".into(),
+                )
+            } else {
+                result(
+                    "unavailable",
+                    "Add an API credential for this connection".into(),
+                )
+            }
+        }
+        "openai" => {
+            if let Some(raw) = base_url {
+                if let Some(url) = loopback_url(raw) {
+                    let root = url.as_str().trim_end_matches('/').trim_end_matches("/v1");
+                    let target = if role == "speech" {
+                        format!("{root}/health")
+                    } else {
+                        format!("{root}/v1/models")
+                    };
+                    let response = reqwest::blocking::Client::builder()
+                        .timeout(std::time::Duration::from_secs(2))
+                        .redirect(reqwest::redirect::Policy::none())
+                        .build()
+                        .and_then(|c| c.get(target).send());
+                    return match response {
+                        Ok(r) if r.status().is_success() => {
+                            result("ready", format!("Local compatible endpoint at {raw}"))
+                        }
+                        _ => result("unavailable", format!("Nothing answered at {raw}")),
+                    };
+                }
+            }
+            if configured {
+                result(
+                    "configured",
+                    "Credential is available; no billable test request was sent".into(),
+                )
+            } else {
+                result(
+                    "unavailable",
+                    "Add an API credential or a local base URL".into(),
+                )
+            }
+        }
+        _ => result(
+            "unavailable",
+            format!("Provider '{provider}' is not supported for {role}"),
+        ),
+    }
+}
+
+fn inference_probe_key(slot: &apiary_core::manifest::InferenceSlot) -> String {
+    if slot.provider == "claude-code" {
+        // All Claude Code routes share one local account and executable.
+        return "claude-code-account".into();
+    }
+    if slot.provider == "codex" {
+        // All Codex routes share one local ChatGPT account and executable.
+        return "codex-chatgpt-account".into();
+    }
+    serde_json::to_string(&json!({
+        "provider": slot.provider,
+        "role": inference_role(&slot.name),
+        "model": slot.model,
+        "requires": slot.requires,
+    }))
+    .unwrap_or_else(|_| format!("{}:{}", slot.provider, slot.name))
+}
+
+fn probe_inference_slots(slots: &[apiary_core::manifest::InferenceSlot]) -> Vec<serde_json::Value> {
+    let mut representatives = std::collections::BTreeMap::new();
+    for slot in slots {
+        representatives
+            .entry(inference_probe_key(slot))
+            .or_insert_with(|| slot.clone());
+    }
+    let statuses = std::thread::scope(|scope| {
+        let handles = representatives
+            .into_iter()
+            .map(|(key, slot)| scope.spawn(move || (key, probe_inference_slot(&slot))))
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok())
+            .collect::<std::collections::HashMap<_, _>>()
+    });
+    slots
+        .iter()
+        .map(|slot| {
+            json!({
+                "name": slot.name,
+                "role": inference_role(&slot.name),
+                "provider": slot.provider,
+                "model": slot.model,
+                "requires": slot.requires,
+                "credential_source": credential_source(slot),
+                "status": statuses.get(&inference_probe_key(slot)).cloned().unwrap_or_else(|| json!({
+                    "state": "unavailable",
+                    "detail": "provider health check did not complete"
+                })),
+            })
+        })
+        .collect()
+}
+
+pub async fn inference_status(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, raw, manifest) = match gate(&state, &headers, "GET", &uri, None, &npub) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    let ratified = crate::agent_decision(&state, &dir, &npub, &raw, &manifest).ratified;
+    let slots = manifest.inference.clone();
+    let default = manifest.routing.default.clone();
+    let rules = manifest.routing.rules.clone();
+    let floors = manifest.routing.floors.clone();
+    let fallbacks = manifest.routing.fallbacks.clone();
+    let configuration = ceremony::manifest_hash(&raw);
+    let state_for_probe = state.clone();
+    let npub_for_probe = npub.clone();
+    let probed = tokio::task::spawn_blocking(move || {
+        state_for_probe
+            .decisions
+            .inference_probes(&npub_for_probe, &configuration, || {
+                probe_inference_slots(&slots)
+            })
+    })
+    .await
+    .unwrap_or_default();
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "ratified": ratified,
+        "slots": probed,
+        "routing": {"default": default, "rules": rules, "floors": floors, "fallbacks": fallbacks},
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct InferenceFallbackBody {
+    primary: String,
+    #[serde(default)]
+    fallback: Option<String>,
+}
+
+/// Set one explicit failover route. This is routing authority, so it amends
+/// the manifest and pauses the agent until a governor ratifies it.
+pub async fn inference_set_fallback(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    let body: InferenceFallbackBody = match serde_json::from_slice(&raw_body) {
+        Ok(body) => body,
+        Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let is_language = |name: &str| {
+        manifest
+            .inference
+            .iter()
+            .any(|slot| slot.name == name && inference_role(&slot.name) == "language")
+    };
+    if !is_language(&body.primary) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("'{}' is not a task-model route", body.primary),
+        )
+        .into_response();
+    }
+    match body.fallback.as_deref().filter(|name| !name.is_empty()) {
+        Some(fallback) if fallback == body.primary => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "a route cannot fall back to itself",
+            )
+            .into_response()
+        }
+        Some(fallback) if !is_language(fallback) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!("'{fallback}' is not a task-model route"),
+            )
+            .into_response()
+        }
+        Some(fallback) => {
+            manifest
+                .routing
+                .fallbacks
+                .insert(body.primary.clone(), vec![fallback.to_string()]);
+        }
+        None => {
+            manifest.routing.fallbacks.remove(&body.primary);
+        }
+    }
+    let yaml = match manifest.to_yaml() {
+        Ok(yaml) => yaml,
+        Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    if let Err(error) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
+    state.decisions.invalidate(&npub);
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "primary": body.primary,
+        "fallback": body.fallback,
+        "note": "fallback saved — review and approve before the agent runs",
+    }))
+    .into_response()
+}
+
+/// Make one tiny, governed call through an exact approved route. The test
+/// consumes the agent's token budget and lands as a signed run checkpoint;
+/// it skips memory and connectors and never masks failure with fallback.
+pub async fn inference_test(
+    State(state): State<App>,
+    AxPath((npub, name)): AxPath<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (ks, npub, dir, raw, manifest) = match gate(&state, &headers, "POST", &uri, None, &npub) {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    if !crate::agent_decision(&state, &dir, &npub, &raw, &manifest).ratified {
+        return err(
+            StatusCode::CONFLICT,
+            "approve the current configuration before testing inference",
+        )
+        .into_response();
+    }
+    if !manifest
+        .inference
+        .iter()
+        .any(|slot| slot.name == name && inference_role(&slot.name) == "language")
+    {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("no task-model route '{name}'"),
+        )
+        .into_response();
+    }
+    let passphrase = match require_pass(&state) {
+        Ok(passphrase) => passphrase,
+        Err(error) => return error.into_response(),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let (custody, handle) = admit(&ks, &npub, &passphrase)?;
+        let context = apiary_runtime::routing::TaskContext {
+            tokens_per_run: Some(4_096),
+            disable_tools: true,
+            route_override: Some(name),
+            lightweight: true,
+            disable_fallback: true,
+            ..Default::default()
+        };
+        apiary_runtime::runner::run_task(
+            &manifest,
+            &dir,
+            &custody,
+            &handle,
+            "Connection check. Reply exactly OK.",
+            &context,
+        )
+        .map_err(|error| err(StatusCode::BAD_GATEWAY, error))
+    })
+    .await
+    .unwrap_or_else(|error| Err(err(StatusCode::INTERNAL_SERVER_ERROR, error)));
+    match result {
+        Ok(outcome) => Json(json!({
+            "ok": true,
+            "slot": outcome.slot,
+            "model": outcome.completion.model,
+            "response": outcome.completion.text,
+            "input_tokens": outcome.completion.input_tokens,
+            "output_tokens": outcome.completion.output_tokens,
+            "elapsed_ms": outcome.timings.total_ms,
+            "log_event": outcome.log_event_id,
+        }))
+        .into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct InferenceUpsertBody {
+    #[serde(default)]
+    original_name: Option<String>,
+    name: String,
+    provider: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    credential: Option<String>,
+    #[serde(default)]
+    clear_credential: bool,
+    #[serde(default)]
+    requires: std::collections::BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    set_default: bool,
+}
+
+fn validate_inference_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 40
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
+pub async fn inference_upsert(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (ks, npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    let body: InferenceUpsertBody = match serde_json::from_slice(&raw_body) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let name = body.name.trim().to_string();
+    let provider = body.provider.trim().to_lowercase();
+    if !validate_inference_name(&name) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "connection name must be 1–40 letters, numbers, dashes, or underscores",
+        )
+        .into_response();
+    }
+    let role = inference_role(&name);
+    if !valid_inference_provider(role, &provider) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("provider '{provider}' cannot serve the {role} role"),
+        )
+        .into_response();
+    }
+    let model = body
+        .model
+        .filter(|m| !m.trim().is_empty())
+        .map(|m| m.trim().to_string());
+    let auth = body.requires.get("auth").and_then(|value| value.as_str());
+    if provider == "anthropic" && !matches!(auth, None | Some("api-key")) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "Anthropic API authentication must use an API key",
+        )
+        .into_response();
+    }
+    if provider != "anthropic" && auth.is_some() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "requires.auth is only supported for Anthropic connections",
+        )
+        .into_response();
+    }
+    if matches!(provider.as_str(), "claude-code" | "codex")
+        && body
+            .credential
+            .as_deref()
+            .is_some_and(|secret| !secret.trim().is_empty())
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{} uses the account signed in on this Mac; it does not accept a per-route credential",
+                if provider == "codex" { "Codex" } else { "Claude Code" }
+            ),
+        )
+        .into_response();
+    }
+    if role == "language" && model.is_none() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "task model connections require an explicit model identifier",
+        )
+        .into_response();
+    }
+    let original = body.original_name.as_deref().unwrap_or(&name);
+    let existing = manifest
+        .inference
+        .iter()
+        .find(|s| s.name == original)
+        .cloned();
+    if original != name && manifest.inference.iter().any(|s| s.name == name) {
+        return err(
+            StatusCode::CONFLICT,
+            format!("connection '{name}' already exists"),
+        )
+        .into_response();
+    }
+    let supplied_secret = body
+        .credential
+        .filter(|secret| !secret.trim().is_empty())
+        .map(|secret| Zeroizing::new(secret.trim().to_string()));
+    let credential =
+        if matches!(provider.as_str(), "claude-code" | "codex") || body.clear_credential {
+            None
+        } else if let Some(secret) = supplied_secret {
+            let pass = match require_pass(&state) {
+                Ok(p) => p,
+                Err(e) => return e.into_response(),
+            };
+            let npub2 = npub.clone();
+            match tokio::task::spawn_blocking(move || {
+                let (custody, handle) = admit(&ks, &npub2, &pass)?;
+                custody
+                    .seal(&handle, secret.as_str())
+                    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+            })
+            .await
+            .unwrap_or_else(|e| Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)))
+            {
+                Ok(blob) => Some(blob),
+                Err(e) => return e.into_response(),
+            }
+        } else {
+            let auth_unchanged = existing.as_ref().is_none_or(|slot| {
+                slot.requires.get("auth").and_then(|value| value.as_str()) == auth
+            });
+            existing
+                .as_ref()
+                .filter(|slot| slot.provider == provider && auth_unchanged)
+                .and_then(|s| s.credential.clone())
+        };
+    let slot = apiary_core::manifest::InferenceSlot {
+        name: name.clone(),
+        provider,
+        model,
+        credential,
+        requires: body.requires,
+    };
+    if let Some(index) = manifest.inference.iter().position(|s| s.name == original) {
+        manifest.inference[index] = slot;
+        if original != name {
+            if manifest.routing.default.as_deref() == Some(original) {
+                manifest.routing.default = Some(name.clone());
+            }
+            for rule in manifest
+                .routing
+                .rules
+                .iter_mut()
+                .chain(manifest.routing.floors.iter_mut())
+            {
+                if rule.to == original {
+                    rule.to = name.clone();
+                }
+            }
+        }
+    } else {
+        manifest.inference.push(slot);
+    }
+    if body.set_default {
+        if inference_role(&name) != "language" {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "only a language model can be the default route",
+            )
+            .into_response();
+        }
+        manifest.routing.default = Some(name.clone());
+    }
+    if let Err(e) = manifest.validate() {
+        return err(StatusCode::BAD_REQUEST, e).into_response();
+    }
+    let yaml = match serde_yaml::to_string(&manifest) {
+        Ok(y) => y,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "name": name,
+        "ratified": false,
+        "note": "inference connection saved — review and approve before the agent runs",
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct InferenceDefaultBody {
+    name: String,
+}
+
+pub async fn inference_set_default(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (_ks, _npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    let body: InferenceDefaultBody = match serde_json::from_slice(&raw_body) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    if !manifest
+        .inference
+        .iter()
+        .any(|s| s.name == body.name && inference_role(&s.name) == "language")
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "default must name a language model connection",
+        )
+        .into_response();
+    }
+    manifest.routing.default = Some(body.name.clone());
+    let yaml = match serde_yaml::to_string(&manifest) {
+        Ok(y) => y,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(json!({"ok": true, "default": body.name, "ratified": false})).into_response()
+}
+
+pub async fn inference_delete(
+    State(state): State<App>,
+    AxPath((npub, name)): AxPath<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, _npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "DELETE", &uri, None, &npub) {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+    if manifest.routing.default.as_deref() == Some(&name)
+        || manifest
+            .routing
+            .rules
+            .iter()
+            .chain(manifest.routing.floors.iter())
+            .any(|r| r.to == name)
+    {
+        return err(
+            StatusCode::CONFLICT,
+            "this connection is still used by routing; choose another default or edit its rules first",
+        )
+        .into_response();
+    }
+    let before = manifest.inference.len();
+    manifest.inference.retain(|s| s.name != name);
+    if manifest.inference.len() == before {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("no inference connection '{name}'"),
+        )
+        .into_response();
+    }
+    let yaml = match serde_yaml::to_string(&manifest) {
+        Ok(y) => y,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(json!({"ok": true, "removed": name, "ratified": false})).into_response()
+}
+
+#[cfg(test)]
+mod inference_setup_tests {
+    use super::*;
+
+    #[test]
+    fn reserved_names_select_supporting_roles() {
+        assert_eq!(inference_role("workhorse"), "language");
+        assert_eq!(inference_role("embed"), "embedding");
+        assert_eq!(inference_role("transcribe"), "transcription");
+        assert_eq!(inference_role("speak"), "speech");
+    }
+
+    #[test]
+    fn provider_matrix_rejects_cross_role_bindings() {
+        assert!(valid_inference_provider("language", "claude-code"));
+        assert!(valid_inference_provider("language", "codex"));
+        assert!(valid_inference_provider("language", "anthropic"));
+        assert!(valid_inference_provider("embedding", "ollama"));
+        assert!(valid_inference_provider("transcription", "apple-speech"));
+        assert!(valid_inference_provider("speech", "macos-say"));
+        assert!(!valid_inference_provider("embedding", "anthropic"));
+        assert!(!valid_inference_provider("language", "apple-speech"));
+    }
+
+    #[test]
+    fn diagnostics_only_probe_exact_loopback_hosts() {
+        assert!(loopback_url("http://127.0.0.1:8880/v1").is_some());
+        assert!(loopback_url("http://localhost:11434").is_some());
+        assert!(loopback_url("http://[::1]:8080/v1").is_some());
+        assert!(loopback_url("https://localhost.example.com/v1").is_none());
+        assert!(loopback_url("https://api.openai.com/v1").is_none());
+    }
+
+    #[test]
+    fn catalog_distinguishes_search_from_known_url_fetching() {
+        let entries = connector_catalog().as_array().unwrap().clone();
+        let search = entries
+            .iter()
+            .find(|entry| entry["kind"] == "web-search")
+            .unwrap();
+        assert_eq!(search["setup"], "credential");
+        assert_eq!(search["caps"]["fetch_public_pages"], true);
+        assert!(entries.iter().any(|entry| entry["kind"] == "web-fetch"));
     }
 }
 
@@ -541,6 +2533,8 @@ pub async fn ratify_import(
         Err(e) => return e.into_response(),
     };
     let listed = suspend_pks(&manifest);
+    let state_for_decision = state.clone();
+    let npub_for_decision = npub.clone();
     let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, Resp> {
         let (custody, handle) = admit(&ks, &npub, &pass)?;
         let log = EpisodicLog::open(&dir);
@@ -550,6 +2544,12 @@ pub async fn ratify_import(
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
         ceremony::import_ratification(&log, &event, &raw, &listed)
             .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+        // Importing the signed event is authoritative. Keep a missing review
+        // snapshot as a warning instead of claiming ratification failed.
+        let snapshot_warning = write_private(&dir.join("manifest.approved.yaml"), &raw)
+            .err()
+            .map(|e| e.to_string());
+        state_for_decision.decisions.invalidate(&npub_for_decision);
         Ok(json!({
             "ok": true,
             "npub": npub,
@@ -557,6 +2557,7 @@ pub async fn ratify_import(
             "imported": event.id.to_hex(),
             "ratified_by": event.pubkey.to_hex(),
             "manifest_sha256": ceremony::manifest_hash(&raw),
+            "snapshot_warning": snapshot_warning,
         }))
     })
     .await
@@ -568,6 +2569,148 @@ pub async fn ratify_import(
 }
 
 // ---------------------------------------------------------------- creds
+
+#[derive(serde::Deserialize)]
+pub struct ControlTokenBody {
+    /// Short-lived by default; bounded to 90 days by the token verifier.
+    #[serde(default = "default_control_token_ttl")]
+    expires_in_seconds: u64,
+    #[serde(default)]
+    label: String,
+}
+
+fn default_control_token_ttl() -> u64 {
+    24 * 60 * 60
+}
+
+/// Issue a bearer credential signed by this agent's own Nostr identity.
+/// A governor authorizes issuance, but the resulting protocol client acts as
+/// the agent—not as that human. It may run that same agent through AG-UI and
+/// manage only agents which list this agent's npub (or the host, if explicitly
+/// made a host manager).
+pub async fn control_token_issue(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (ks, npub, _dir, _raw, _manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    let body: ControlTokenBody = if raw_body.is_empty() {
+        ControlTokenBody {
+            expires_in_seconds: default_control_token_ttl(),
+            label: String::new(),
+        }
+    } else {
+        match serde_json::from_slice(&raw_body) {
+            Ok(body) => body,
+            Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+        }
+    };
+    let label = body.label.trim();
+    if label.len() > 80 || label.chars().any(char::is_control) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "control-token label must be at most 80 printable characters",
+        )
+        .into_response();
+    }
+    let (custody, handle) = match crate::admit_agent(&state, &ks, &npub) {
+        Ok(value) => value,
+        Err(error) => return err(StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+    };
+    let host_id = apiary_runtime::lease::host_id(&state.home);
+    match nip98::issue_control_token(&custody, &handle, &host_id, body.expires_in_seconds) {
+        Ok((token, mut record)) => {
+            record.label = label.to_string();
+            if let Err(error) = nip98::register_control_token(&state, record.clone()) {
+                return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+            }
+            Json(json!({
+                "ok": true,
+                "agent": npub,
+                "id": record.id,
+                "label": record.label,
+                "token": token,
+                "expires_at": record.expires_at,
+                "mcp_url": format!("{}/mcp", state.origin.trim_end_matches('/')),
+                "local_mcp_url": "apiary://local/mcp",
+                "host_id": host_id,
+                "authorization": "Bearer <token>",
+                "note": "This bearer acts as the agent identity. Store it as a sealed credential and never log it."
+            }))
+            .into_response()
+        }
+        Err(error) => err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
+}
+
+pub async fn control_tokens_get(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, npub, _dir, _raw, _manifest) = match gate(&state, &headers, "GET", &uri, None, &npub)
+    {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    match nip98::list_control_tokens(&state, &npub) {
+        Ok(tokens) => {
+            let now = now_secs();
+            let tokens = tokens
+                .into_iter()
+                .map(|token| {
+                    json!({
+                        "id": token.id,
+                        "agent": token.agent,
+                        "label": token.label,
+                        "created_at": token.created_at,
+                        "expires_at": token.expires_at,
+                        "revoked_at": token.revoked_at,
+                        "active": token.revoked_at.is_none() && token.expires_at > now,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Json(json!({"ok": true, "tokens": tokens})).into_response()
+        }
+        Err(error) => err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
+}
+
+pub async fn control_token_revoke(
+    State(state): State<App>,
+    AxPath((npub, id)): AxPath<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (_ks, npub, _dir, _raw, _manifest) =
+        match gate(&state, &headers, "DELETE", &uri, None, &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return err(StatusCode::BAD_REQUEST, "invalid control-token ID").into_response();
+    }
+    match nip98::revoke_control_token(&state, &npub, &id) {
+        Ok(token) => Json(json!({
+            "ok": true,
+            "id": token.id,
+            "agent": token.agent,
+            "revoked_at": token.revoked_at,
+        }))
+        .into_response(),
+        Err(error) if error.contains("not found") => {
+            err(StatusCode::NOT_FOUND, error).into_response()
+        }
+        Err(error) => err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
+}
 
 #[derive(serde::Deserialize)]
 pub struct SealBody {
@@ -1041,7 +3184,7 @@ pub async fn set_active(
 ///
 /// Granting copies a library entry into an agent's manifest connectors[]
 /// (sealing a credential to that agent if provided). That edit changes the
-/// manifest hash, so every grant is ratified by a human — and because the
+/// manifest hash, so every grant is ratified by a governor — and because the
 /// grant lives in the manifest, it travels with the agent: portability
 /// includes capabilities and their sealed credentials. The destination
 /// host must merely bind the kind (BOUND_KINDS); an unbindable declared
@@ -1060,6 +3203,102 @@ pub struct LibraryEntry {
     pub kind: String,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub caps: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// Trusted setup templates, not grants. Catalog entries contain no secret
+/// and do not enter an agent manifest until a human configures, grants, and
+/// approves them. Remote registry discovery can sit behind this curated
+/// layer later without making registry publication a trust decision.
+fn connector_catalog() -> serde_json::Value {
+    json!([
+        {
+            "id": "apiary-control",
+            "name": "Apiary management",
+            "description": "Inspect and manage the Apiary agents assigned to this agent identity. Every operation remains subject to per-agent governance and host-manager authorization.",
+            "kind": "mcp",
+            "risk": "read + write agent control",
+            "publisher": "Apiary",
+            "source": "built-in control plane",
+            "setup": "credential",
+            "credential_label": "Agent MCP access token",
+            "caps": {
+                "transport": "http",
+                "url": "apiary://local/mcp",
+                "access": "read-write",
+                "allowed_tools": ["apiary_describe", "apiary_list_agents", "apiary_get_agent_environment", "apiary_request"]
+            }
+        },
+        {
+            "id": "web-search-research",
+            "name": "Full web search & research",
+            "description": "Search Brave's independent web index, then open and inspect public sources with the bundled page reader.",
+            "kind": "web-search",
+            "risk": "read-only public network",
+            "publisher": "Apiary + Brave Search",
+            "source": "https://api-dashboard.search.brave.com/documentation/quickstart",
+            "setup": "credential",
+            "credential_label": "Brave Search API key",
+            "caps": {
+                "provider": "brave",
+                "country": "US",
+                "search_lang": "en",
+                "safesearch": "moderate",
+                "max_results": 10,
+                "fetch_public_pages": true,
+                "fetch_max_bytes": 262144
+            }
+        },
+        {
+            "id": "web-research",
+            "name": "Web page reader",
+            "description": "Open public HTTPS pages when you already have a URL. Private networks stay blocked and every redirect is rechecked.",
+            "kind": "web-fetch",
+            "risk": "read-only public network",
+            "publisher": "Apiary",
+            "source": "built-in",
+            "setup": "none",
+            "caps": {"allow_all_public": true, "allowed_domains": [], "allow_subdomains": false, "max_bytes": 262144}
+        },
+        {
+            "id": "files-readonly",
+            "name": "Files and documents",
+            "description": "List, search, and read approved text files without exposing the rest of the device.",
+            "kind": "files",
+            "risk": "read-only local",
+            "publisher": "Apiary",
+            "source": "built-in",
+            "setup": "folders",
+            "caps": {"roots": [], "extensions": ["txt","md","json","jsonl","yaml","yml","csv","tsv","log","xml","html","toml"], "max_bytes": 262144}
+        },
+        {
+            "id": "git-readonly",
+            "name": "Git repositories",
+            "description": "Inspect status, history, diffs, revisions, and tracked text in approved repositories.",
+            "kind": "git",
+            "risk": "read-only local",
+            "publisher": "Apiary",
+            "source": "built-in",
+            "setup": "repositories",
+            "caps": {"repos": []}
+        },
+        {
+            "id": "github-readonly",
+            "name": "GitHub",
+            "description": "Read repository contents and search code through GitHub's official remote MCP server.",
+            "kind": "mcp",
+            "risk": "read-only account",
+            "publisher": "GitHub",
+            "source": "https://github.com/github/github-mcp-server",
+            "setup": "credential",
+            "credential_label": "GitHub access token",
+            "caps": {
+                "transport": "http",
+                "url": "https://api.githubcopilot.com/mcp/x/repos/readonly",
+                "access": "read-only",
+                "allowed_tools": ["get_file_contents", "search_code", "search_repositories"]
+            }
+        }
+    ])
 }
 
 fn library_path(state: &AppState) -> std::path::PathBuf {
@@ -1097,6 +3336,7 @@ pub async fn connectors_get(
             "ok": true,
             "library": lib.connectors,
             "host_binds": apiary_runtime::connector::BOUND_KINDS,
+            "catalog": connector_catalog(),
         }))
         .into_response(),
         Err(e) => e.into_response(),
@@ -1177,6 +3417,10 @@ pub async fn connectors_discover(
     };
     let caps = body["caps"].clone();
     let bearer = body["bearer"].as_str().map(String::from);
+    let local_control_url = std::fs::read_to_string(state.home.join("control.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|value| value["url"].as_str().map(String::from));
     let res = tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Value>, String> {
         let cap_str = |k: &str| caps.get(k).and_then(|v| v.as_str()).map(String::from);
         let cap_list = |k: &str| -> Vec<String> {
@@ -1197,7 +3441,12 @@ pub async fn connectors_discover(
                 env_passthrough: cap_list("env"),
             },
             "http" => apiary_runtime::mcp::Binding::Http {
-                url: cap_str("url").ok_or("mcp http requires url")?,
+                url: match cap_str("url").ok_or("mcp http requires url")?.as_str() {
+                    "apiary://local/mcp" => local_control_url
+                        .clone()
+                        .ok_or("local Apiary control discovery is unavailable")?,
+                    url => url.to_string(),
+                },
                 bearer,
             },
             other => return Err(format!("transport '{other}' not supported (stdio | http)")),
@@ -1207,7 +3456,9 @@ pub async fn connectors_discover(
         let tools = client.tools_list().map_err(|e| e.to_string())?;
         Ok(tools
             .into_iter()
-            .map(|t| json!({"name": t.name, "description": t.description}))
+            .map(
+                |t| json!({"name": t.name, "description": t.description, "read_only": t.read_only}),
+            )
             .collect())
     })
     .await
@@ -1290,6 +3541,10 @@ pub async fn agent_connector_discover(
         None => None,
     };
     let caps = serde_json::to_value(&entry.caps).unwrap_or_default();
+    let local_control_url = std::fs::read_to_string(state.home.join("control.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|value| value["url"].as_str().map(String::from));
     let res = tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Value>, String> {
         let cap_str = |k: &str| caps.get(k).and_then(|v| v.as_str()).map(String::from);
         let cap_list = |k: &str| -> Vec<String> {
@@ -1312,7 +3567,12 @@ pub async fn agent_connector_discover(
                 env_passthrough: cap_list("env"),
             },
             _ => apiary_runtime::mcp::Binding::Http {
-                url: cap_str("url").ok_or("mcp http requires url")?,
+                url: match cap_str("url").ok_or("mcp http requires url")?.as_str() {
+                    "apiary://local/mcp" => local_control_url
+                        .clone()
+                        .ok_or("local Apiary control discovery is unavailable")?,
+                    url => url.to_string(),
+                },
                 bearer,
             },
         };
@@ -1322,7 +3582,9 @@ pub async fn agent_connector_discover(
             .tools_list()
             .map_err(|e| e.to_string())?
             .into_iter()
-            .map(|t| json!({"name": t.name, "description": t.description}))
+            .map(
+                |t| json!({"name": t.name, "description": t.description, "read_only": t.read_only}),
+            )
             .collect())
     })
     .await
@@ -1581,10 +3843,14 @@ fn write_grant(
     credential: Option<apiary_core::manifest::EncryptedBlob>,
 ) -> Result<String, Resp> {
     manifest.connectors.retain(|c| c.kind != entry.kind);
+    let mut caps = entry.caps.clone();
+    // Library-only provenance helps the cockpit explain a curated template,
+    // but is not an agent capability and should not travel in its manifest.
+    caps.remove("catalog_id");
     manifest.connectors.push(apiary_core::manifest::Connector {
         kind: entry.kind.clone(),
         credential,
-        caps: entry.caps.clone(),
+        caps,
     });
     let yaml =
         serde_yaml::to_string(manifest).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -2122,40 +4388,58 @@ pub async fn lease_status(
         Ok(pk) => pk.to_hex(),
         Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
     };
-    let relays2 = relays.clone();
-    let view =
-        tokio::task::spawn_blocking(move || apiary_runtime::lease::fetch(&relays2, &agent_hex))
-            .await
-            .unwrap_or(None);
-    match view {
-        Some(l) => {
-            let expired = l.expired(now_secs());
-            Json(json!({
+    let configuration =
+        serde_json::to_string(&json!({"relays": relays, "host": host})).unwrap_or_default();
+    let key = format!("lease:{npub}");
+    let state_for_view = state.clone();
+    let npub_for_view = npub.clone();
+    let host_for_view = host.clone();
+    let view = tokio::task::spawn_blocking(move || {
+        state_for_view.decisions.observation(
+            &key,
+            &configuration,
+            std::time::Duration::from_secs(10),
+            || match apiary_runtime::lease::fetch(&relays, &agent_hex) {
+                Some(lease) => {
+                    let expired = lease.expired(now_secs());
+                    json!({
+                        "ok": true,
+                        "npub": npub_for_view,
+                        "mechanism": "relay-event",
+                        "coordinated": true,
+                        "host_id": host_for_view,
+                        "lease": {
+                            "holder": lease.host,
+                            "ours": lease.host == host_for_view,
+                            "seq": lease.seq,
+                            "expires_at": lease.expires_at,
+                            "expired": expired,
+                        },
+                    })
+                }
+                None => json!({
+                    "ok": true,
+                    "npub": npub_for_view,
+                    "mechanism": "relay-event",
+                    "coordinated": true,
+                    "host_id": host_for_view,
+                    "lease": null,
+                }),
+            },
+        )
+    })
+    .await
+    .unwrap_or_else(|_| {
+        json!({
                 "ok": true,
                 "npub": npub,
                 "mechanism": "relay-event",
                 "coordinated": true,
                 "host_id": host,
-                "lease": {
-                    "holder": l.host,
-                    "ours": l.host == host,
-                    "seq": l.seq,
-                    "expires_at": l.expires_at,
-                    "expired": expired,
-                },
-            }))
-            .into_response()
-        }
-        None => Json(json!({
-            "ok": true,
-            "npub": npub,
-            "mechanism": "relay-event",
-            "coordinated": true,
-            "host_id": host,
-            "lease": null,
-        }))
-        .into_response(),
-    }
+                "lease": null,
+        })
+    });
+    Json(view).into_response()
 }
 
 /// The human decision "contested-human" defers to: supersede a live foreign
@@ -2494,14 +4778,24 @@ pub struct AgentPresence {
     pub manifest_sha: String,
     pub keeper: Option<KeeperHandle>,
     pub channels: std::collections::HashMap<String, ChannelHandle>,
+    /// Threads from the previous manifest generation. A replacement must not
+    /// start until these have left their in-flight channel/model calls, or two
+    /// Telegram long polls can claim the same update.
+    pub retiring: Vec<Arc<AtomicBool>>,
+}
+
+fn stop_channels(p: &mut AgentPresence) {
+    for (_, ch) in p.channels.drain() {
+        ch.stop.store(true, Ordering::Relaxed);
+        p.retiring.push(ch.done);
+    }
 }
 
 fn stop_all(p: &mut AgentPresence) {
-    for (_, ch) in p.channels.drain() {
-        ch.stop.store(true, Ordering::Relaxed);
-    }
+    stop_channels(p);
     if let Some(k) = p.keeper.take() {
         k.stop.store(true, Ordering::Relaxed);
+        p.retiring.push(k.done);
     }
 }
 
@@ -2527,7 +4821,7 @@ pub fn available_kinds(state: &AppState) -> Vec<String> {
 /// and flip `done` so the supervisor can reap, note, and back off.
 #[allow(clippy::too_many_arguments)]
 fn spawn_channel(
-    state: &AppState,
+    state: &App,
     npub: &str,
     kind: &str,
     dir: std::path::PathBuf,
@@ -2539,10 +4833,10 @@ fn spawn_channel(
         .channel(kind)
         .cloned()
         .ok_or_else(|| format!("manifest declares no presence.{kind}"))?;
-    let pass = state
-        .passphrase_clone()
-        .ok_or("keystore is locked — unlock first")?;
-    let home = state.home.clone();
+    if state.passphrase_clone().is_none() {
+        return Err("keystore is locked — unlock first".into());
+    }
+    let state = state.clone();
     let npub = npub.to_string();
     let kind = kind.to_string();
     let stop = Arc::new(AtomicBool::new(false));
@@ -2574,13 +4868,13 @@ fn spawn_channel(
             push_line(lines, msg);
             done.store(true, Ordering::Relaxed);
         };
-        let ks = match Keystore::open(&home) {
+        let ks = match Keystore::open(&state.home) {
             Ok(k) => k,
             Err(e) => return fail(&lines, &done, format!("keystore: {e}")),
         };
-        let (custody, agent_handle) = match admit(&ks, &npub, &pass) {
+        let (custody, agent_handle) = match crate::admit_agent(&state, &ks, &npub) {
             Ok(v) => v,
-            Err((_, j)) => return fail(&lines, &done, format!("channel died: {}", j.0)),
+            Err(error) => return fail(&lines, &done, format!("channel died: {error}")),
         };
         let name = std::fs::read_to_string(dir.join("name"))
             .unwrap_or_default()
@@ -2621,11 +4915,12 @@ fn spawn_channel(
                         .str_config("trigger")
                         .map(String::from)
                         .unwrap_or_else(|| format!("@{name}"));
-                    Box::new(apiary_runtime::buzz::BuzzAdapter::connect(
+                    Box::new(apiary_runtime::buzz::BuzzAdapter::connect_with_cursor(
                         &relay,
                         &custody,
                         &agent_handle,
                         trigger,
+                        Some(dir.join("presence").join("buzz-recent.json")),
                     )?)
                 }
                 "telegram" => {
@@ -2687,7 +4982,7 @@ fn spawn_channel(
 }
 
 fn spawn_keeper(
-    state: &AppState,
+    state: &App,
     npub: &str,
     manifest: &apiary_core::manifest::Manifest,
 ) -> Result<Option<KeeperHandle>, String> {
@@ -2695,10 +4990,10 @@ fn spawn_keeper(
     if relays.is_empty() {
         return Ok(None); // uncoordinated, loudly noted by the caller
     }
-    let pass = state
-        .passphrase_clone()
-        .ok_or("keystore is locked — unlock first")?;
-    let home = state.home.clone();
+    if state.passphrase_clone().is_none() {
+        return Err("keystore is locked — unlock first".into());
+    }
+    let state = state.clone();
     let npub = npub.to_string();
     let heartbeat = manifest.lease.heartbeat_secs;
     let expiry = manifest.lease.expiry_secs;
@@ -2716,11 +5011,11 @@ fn spawn_keeper(
         let sink_lines = lines.clone();
         let mut sink = move |l: String| push_line(&sink_lines, l);
         let run = (|| -> Result<(), apiary_runtime::Error> {
-            let ks = Keystore::open(&home)?;
-            let (custody, agent_handle) = admit(&ks, &npub, &pass)
-                .map_err(|(_, j)| apiary_runtime::Error::Provider(j.0.to_string()))?;
+            let ks = Keystore::open(&state.home)?;
+            let (custody, agent_handle) =
+                crate::admit_agent(&state, &ks, &npub).map_err(apiary_runtime::Error::Provider)?;
             let agent_hex = agent_handle.pubkey().to_hex();
-            let host = apiary_runtime::lease::host_id(&home);
+            let host = apiary_runtime::lease::host_id(&state.home);
             apiary_runtime::lease::run_keeper(
                 &custody,
                 &agent_handle,
@@ -2747,9 +5042,9 @@ pub fn spawn_supervisor(state: App) {
     tokio::spawn(async move {
         let mut backoff: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             reconcile(&state, &mut backoff);
             crate::routines::reconcile_routines(&state);
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
     });
 }
@@ -2774,8 +5069,16 @@ fn reconcile(state: &App, backoff: &mut std::collections::HashMap<String, u64>) 
         let raw = std::fs::read_to_string(dir.join("manifest.yaml")).unwrap_or_default();
         let disk_sha = ceremony::manifest_hash(&raw);
         let manifest = apiary_core::manifest::Manifest::from_yaml(&raw).ok();
+        if active {
+            if let Some(manifest) = manifest.clone() {
+                apiary_runtime::index::schedule_refresh(manifest, dir.clone());
+            }
+        }
         let mut map = state.listeners.lock().unwrap_or_else(|e| e.into_inner());
         let presence = map.entry(npub.clone()).or_default();
+        presence
+            .retiring
+            .retain(|done| !done.load(Ordering::Relaxed));
 
         // Inactive, unparseable, or amended: everything stops.
         let declared: Vec<String> = manifest
@@ -2790,7 +5093,12 @@ fn reconcile(state: &App, backoff: &mut std::collections::HashMap<String, u64>) 
             .unwrap_or(false);
         if !active || manifest.is_none() || (declared.is_empty() && !has_routines) {
             stop_all(presence);
-            map.remove(&npub);
+            presence
+                .retiring
+                .retain(|done| !done.load(Ordering::Relaxed));
+            if presence.retiring.is_empty() {
+                map.remove(&npub);
+            }
             continue;
         }
         if !presence.channels.is_empty() && presence.manifest_sha != disk_sha {
@@ -2799,18 +5107,16 @@ fn reconcile(state: &App, backoff: &mut std::collections::HashMap<String, u64>) 
             presence.manifest_sha.clear();
             continue; // restart next tick, ratification permitting
         }
+        if !presence.retiring.is_empty() {
+            continue; // never overlap two generations of a channel adapter
+        }
         let manifest = manifest.expect("checked above");
 
         // Ratification gates everything (checked only when we may start).
         let needs_start = presence.keeper.is_none()
             || declared.iter().any(|k| !presence.channels.contains_key(k));
         if needs_start {
-            let suspend = suspend_pks(&manifest);
-            let Ok(agent_pk) = apiary_core::identity::parse_npub(&npub) else {
-                continue;
-            };
-            let log = EpisodicLog::open(&dir);
-            if !ceremony::is_ratified(&log, &raw, &agent_pk, &suspend).unwrap_or(false) {
+            if !crate::agent_decision(state, &dir, &npub, &raw, &manifest).ratified {
                 state
                     .supervisor_notes
                     .lock()
@@ -2831,6 +5137,7 @@ fn reconcile(state: &App, backoff: &mut std::collections::HashMap<String, u64>) 
         let mut keeper_lost = None;
         if let Some(k) = &presence.keeper {
             if k.lost.load(Ordering::Relaxed) {
+                let keeper_done = k.done.load(Ordering::Relaxed);
                 // Contested or superseded: stop channels; retry the claim
                 // after backoff (a released/expired foreign lease clears it).
                 let note = k
@@ -2844,10 +5151,8 @@ fn reconcile(state: &App, backoff: &mut std::collections::HashMap<String, u64>) 
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(npub.clone(), note);
-                for (_, ch) in presence.channels.drain() {
-                    ch.stop.store(true, Ordering::Relaxed);
-                }
-                if k.done.load(Ordering::Relaxed)
+                stop_channels(presence);
+                if keeper_done
                     && now_secs().saturating_sub(*backoff.get(&npub).unwrap_or(&0))
                         >= RETRY_BACKOFF_SECS
                 {

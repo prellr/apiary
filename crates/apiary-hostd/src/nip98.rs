@@ -10,6 +10,10 @@
 //! caller must bind it to the operation (governorship) — see `authorize`.
 
 use crate::{AppState, AuthMode};
+use apiary_core::{
+    keystore::Keystore,
+    manifest::{ManagerRole, Manifest},
+};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use base64::Engine;
@@ -17,7 +21,409 @@ use nostr::prelude::*;
 use sha2::{Digest, Sha256};
 
 const NIP98_KIND: u16 = 27235;
+const CONTROL_TOKEN_KIND: u16 = 27236;
 const FRESHNESS_SECS: u64 = 60;
+const BROWSER_SESSION_SECS: u64 = 8 * 60 * 60;
+const MAX_CONTROL_TOKEN_SECS: u64 = 90 * 24 * 60 * 60;
+const CONTROL_TOKEN_REGISTRY: &str = "control-tokens.json";
+
+#[derive(Clone, Debug)]
+pub struct BrowserSession {
+    pub signer: PublicKey,
+    pub csrf: String,
+    pub expires_at: u64,
+}
+
+pub struct NewBrowserSession {
+    pub token: String,
+    pub csrf: String,
+    pub expires_at: u64,
+}
+
+pub fn issue_browser_session(
+    state: &AppState,
+    signer: PublicKey,
+) -> Result<NewBrowserSession, String> {
+    let token = apiary_core::identity::generate()
+        .secret_key()
+        .to_secret_hex();
+    let csrf = apiary_core::identity::generate()
+        .secret_key()
+        .to_secret_hex();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let expires_at = now.saturating_add(BROWSER_SESSION_SECS);
+    let mut sessions = state
+        .browser_sessions
+        .lock()
+        .map_err(|_| "browser session registry is unavailable".to_string())?;
+    sessions.retain(|_, session| session.expires_at > now);
+    sessions.insert(
+        token.clone(),
+        BrowserSession {
+            signer,
+            csrf: csrf.clone(),
+            expires_at,
+        },
+    );
+    Ok(NewBrowserSession {
+        token,
+        csrf,
+        expires_at,
+    })
+}
+
+fn check_browser_session(
+    state: &AppState,
+    headers: &HeaderMap,
+    require_csrf: bool,
+) -> Result<Option<PublicKey>, (StatusCode, Json<serde_json::Value>)> {
+    let token = headers
+        .get("cookie")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|cookie| {
+                let (name, value) = cookie.trim().split_once('=')?;
+                (name == "apiary_session").then(|| value.to_string())
+            })
+        });
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut sessions = state
+        .browser_sessions
+        .lock()
+        .map_err(|_| crate::err(StatusCode::UNAUTHORIZED, "apiary session is unavailable"))?;
+    sessions.retain(|_, session| session.expires_at > now);
+    let session = sessions
+        .get(&token)
+        .ok_or_else(|| crate::err(StatusCode::UNAUTHORIZED, "apiary session expired"))?;
+    if require_csrf {
+        let csrf = headers
+            .get("x-apiary-csrf")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if !constant_time_eq(csrf, &session.csrf) {
+            return Err(crate::err(
+                StatusCode::UNAUTHORIZED,
+                "apiary session is missing its request token",
+            ));
+        }
+    }
+    Ok(Some(session.signer))
+}
+
+/// Resolve the HttpOnly browser cookie for a top-level cockpit navigation.
+/// Navigations cannot attach Apiary's CSRF header, so this only proves the
+/// session identity. The cockpit access check still binds that identity to a
+/// host or agent role before any private HTML is returned.
+pub fn browser_navigation_signer(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<PublicKey>, (StatusCode, Json<serde_json::Value>)> {
+    check_browser_session(state, headers, false)
+}
+
+/// Revoke the browser session named by the HttpOnly cookie. Logout is a
+/// state-changing request, so it requires the same per-session CSRF value as
+/// every other cookie-authenticated mutation.
+pub fn revoke_browser_session(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<PublicKey, (StatusCode, Json<serde_json::Value>)> {
+    let token = headers
+        .get("cookie")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|cookie| {
+                let (name, value) = cookie.trim().split_once('=')?;
+                (name == "apiary_session").then(|| value.to_string())
+            })
+        })
+        .ok_or_else(|| crate::err(StatusCode::UNAUTHORIZED, "apiary session is missing"))?;
+    let csrf = headers
+        .get("x-apiary-csrf")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut sessions = state
+        .browser_sessions
+        .lock()
+        .map_err(|_| crate::err(StatusCode::UNAUTHORIZED, "apiary session is unavailable"))?;
+    sessions.retain(|_, session| session.expires_at > now);
+    let session = sessions
+        .get(&token)
+        .ok_or_else(|| crate::err(StatusCode::UNAUTHORIZED, "apiary session expired"))?;
+    if !constant_time_eq(csrf, &session.csrf) {
+        return Err(crate::err(
+            StatusCode::UNAUTHORIZED,
+            "apiary session is missing its request token",
+        ));
+    }
+    let signer = session.signer;
+    sessions.remove(&token);
+    Ok(signer)
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ControlTokenFile {
+    version: u32,
+    tokens: Vec<ControlTokenRecord>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlTokenRecord {
+    pub id: String,
+    pub agent: String,
+    pub label: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub revoked_at: Option<u64>,
+}
+
+fn load_control_tokens(state: &AppState) -> Result<ControlTokenFile, String> {
+    let path = state.home.join(CONTROL_TOKEN_REGISTRY);
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => {
+            let file: ControlTokenFile = serde_json::from_str(&raw)
+                .map_err(|error| format!("{} is invalid: {error}", path.display()))?;
+            if file.version != 1 {
+                return Err(format!(
+                    "{} has unsupported version {}",
+                    path.display(),
+                    file.version
+                ));
+            }
+            Ok(file)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ControlTokenFile {
+            version: 1,
+            tokens: Vec::new(),
+        }),
+        Err(error) => Err(format!("could not read {}: {error}", path.display())),
+    }
+}
+
+fn save_control_tokens(state: &AppState, file: &ControlTokenFile) -> Result<(), String> {
+    std::fs::create_dir_all(&state.home).map_err(|error| error.to_string())?;
+    let path = state.home.join(CONTROL_TOKEN_REGISTRY);
+    let temporary = state.home.join("control-tokens.json.tmp");
+    let body = serde_json::to_vec_pretty(file).map_err(|error| error.to_string())?;
+    std::fs::write(&temporary, body).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| error.to_string())?;
+    }
+    std::fs::rename(&temporary, &path).map_err(|error| error.to_string())
+}
+
+pub fn register_control_token(state: &AppState, record: ControlTokenRecord) -> Result<(), String> {
+    let _guard = state
+        .control_tokens
+        .lock()
+        .map_err(|_| "control-token registry is unavailable".to_string())?;
+    let mut file = load_control_tokens(state)?;
+    if file.tokens.iter().any(|token| token.id == record.id) {
+        return Err("control-token ID collision".into());
+    }
+    file.tokens.push(record);
+    save_control_tokens(state, &file)
+}
+
+pub fn list_control_tokens(
+    state: &AppState,
+    agent: &str,
+) -> Result<Vec<ControlTokenRecord>, String> {
+    let _guard = state
+        .control_tokens
+        .lock()
+        .map_err(|_| "control-token registry is unavailable".to_string())?;
+    let mut tokens = load_control_tokens(state)?
+        .tokens
+        .into_iter()
+        .filter(|token| token.agent == agent)
+        .collect::<Vec<_>>();
+    tokens.sort_by_key(|token| std::cmp::Reverse(token.created_at));
+    Ok(tokens)
+}
+
+pub fn list_all_control_tokens(state: &AppState) -> Result<Vec<ControlTokenRecord>, String> {
+    let _guard = state
+        .control_tokens
+        .lock()
+        .map_err(|_| "control-token registry is unavailable".to_string())?;
+    let mut tokens = load_control_tokens(state)?.tokens;
+    tokens.sort_by_key(|token| std::cmp::Reverse(token.created_at));
+    Ok(tokens)
+}
+
+pub fn revoke_control_token(
+    state: &AppState,
+    agent: &str,
+    id: &str,
+) -> Result<ControlTokenRecord, String> {
+    let _guard = state
+        .control_tokens
+        .lock()
+        .map_err(|_| "control-token registry is unavailable".to_string())?;
+    let mut file = load_control_tokens(state)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let token = file
+        .tokens
+        .iter_mut()
+        .find(|token| token.agent == agent && token.id == id)
+        .ok_or_else(|| "control token not found for this agent".to_string())?;
+    token.revoked_at.get_or_insert(now);
+    let result = token.clone();
+    save_control_tokens(state, &file)?;
+    Ok(result)
+}
+
+pub(crate) fn constant_time_eq(presented: &str, expected: &str) -> bool {
+    presented.len() == expected.len()
+        && presented
+            .bytes()
+            .zip(expected.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+}
+
+/// Authenticate a long-lived protocol client (control MCP or AG-UI). In
+/// addition to ordinary NIP-98, it accepts a time-bounded token signed by an
+/// Apiary agent's own Nostr key. The bearer proves only identity; every called
+/// operation still checks that identity against the route's authorization.
+pub fn check_control(
+    state: &AppState,
+    headers: &HeaderMap,
+    method: &str,
+    path_and_query: &str,
+    body: Option<&[u8]>,
+) -> Result<Option<PublicKey>, (StatusCode, Json<serde_json::Value>)> {
+    let bearer = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer apiary_"));
+    if let Some(encoded) = bearer {
+        return verify_control_token(state, encoded).map(Some);
+    }
+    check(state, headers, method, path_and_query, body)
+}
+
+pub fn issue_control_token(
+    custody: &apiary_core::custody::Custody,
+    handle: &apiary_core::custody::AgentHandle,
+    host_id: &str,
+    expires_in_secs: u64,
+) -> Result<(String, ControlTokenRecord), apiary_core::Error> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let ttl = expires_in_secs.clamp(60, MAX_CONTROL_TOKEN_SECS);
+    let expires_at = now.saturating_add(ttl);
+    let audience = format!("apiary-host:{host_id}");
+    let event = custody.sign(
+        handle,
+        EventBuilder::new(Kind::Custom(CONTROL_TOKEN_KIND), "apiary-control")
+            .tag(Tag::custom("aud", vec![audience]))
+            .tag(Tag::custom("exp", vec![expires_at.to_string()])),
+    )?;
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(event.as_json());
+    let agent = apiary_core::identity::to_npub(&event.pubkey)?;
+    Ok((
+        format!("apiary_{encoded}"),
+        ControlTokenRecord {
+            id: event.id.to_hex(),
+            agent,
+            label: String::new(),
+            created_at: event.created_at.as_secs(),
+            expires_at,
+            revoked_at: None,
+        },
+    ))
+}
+
+fn verify_control_token(
+    state: &AppState,
+    encoded: &str,
+) -> Result<PublicKey, (StatusCode, Json<serde_json::Value>)> {
+    let fail = |message: &str| {
+        crate::err(
+            StatusCode::UNAUTHORIZED,
+            format!("apiary control token: {message}"),
+        )
+    };
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| fail("bad base64"))?;
+    let event = Event::from_json(String::from_utf8_lossy(&bytes).as_ref())
+        .map_err(|_| fail("bad event JSON"))?;
+    if event.kind != Kind::Custom(CONTROL_TOKEN_KIND) || event.content != "apiary-control" {
+        return Err(fail("wrong kind or purpose"));
+    }
+    event.verify().map_err(|_| fail("bad signature"))?;
+    let tag = |name: &str| {
+        event.tags.iter().find_map(|tag| {
+            let values = tag.as_slice();
+            (values.first().map(String::as_str) == Some(name)).then(|| values.get(1).cloned())?
+        })
+    };
+    let audience = format!(
+        "apiary-host:{}",
+        apiary_runtime::lease::host_id(&state.home)
+    );
+    if tag("aud").as_deref() != Some(audience.as_str()) {
+        return Err(fail("audience does not match this Apiary host"));
+    }
+    let expires_at = tag("exp")
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| fail("missing or invalid expiry"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if expires_at <= now {
+        return Err(fail("expired"));
+    }
+    if event.created_at.as_secs() > now.saturating_add(FRESHNESS_SECS)
+        || expires_at.saturating_sub(event.created_at.as_secs()) > MAX_CONTROL_TOKEN_SECS
+    {
+        return Err(fail("lifetime is invalid"));
+    }
+    let id = event.id.to_hex();
+    let agent = apiary_core::identity::to_npub(&event.pubkey)
+        .map_err(|_| fail("agent identity is invalid"))?;
+    let _guard = state
+        .control_tokens
+        .lock()
+        .map_err(|_| fail("registry is unavailable"))?;
+    let file = load_control_tokens(state).map_err(|_| fail("registry is unavailable"))?;
+    let registered = file
+        .tokens
+        .iter()
+        .find(|token| token.id == id && token.agent == agent && token.expires_at == expires_at)
+        .ok_or_else(|| fail("not registered or invalidated by an upgrade"))?;
+    if registered.revoked_at.is_some() {
+        return Err(fail("revoked"));
+    }
+    Ok(event.pubkey)
+}
 
 /// Authenticate a request. `path_and_query` is the exact request target
 /// (e.g. "/api/agents/npub1…/log?tail=50"); `body` is the raw body for
@@ -29,6 +435,22 @@ pub fn check(
     path_and_query: &str,
     body: Option<&[u8]>,
 ) -> Result<Option<PublicKey>, (StatusCode, Json<serde_json::Value>)> {
+    // Only the in-process MCP adapter knows this random capability. It may
+    // forward the already-authenticated signer into the ordinary REST gates;
+    // untrusted callers cannot manufacture this header pair.
+    let internal = headers
+        .get("x-apiary-internal-token")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| constant_time_eq(value, &state.internal_token));
+    if internal {
+        return headers
+            .get("x-apiary-internal-signer")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .map(apiary_core::identity::parse_npub)
+            .transpose()
+            .map_err(|error| crate::err(StatusCode::UNAUTHORIZED, error));
+    }
     // Desktop token gate: when the host carries a per-launch token, every
     // request must present it (header or, for the boot navigation and SSE,
     // query param). This binds the embedded daemon to its own webview —
@@ -44,12 +466,7 @@ pub fn check(
         });
         let presented = from_header.or(from_query).unwrap_or_default();
         // Constant-time-ish compare; the token is 32 random bytes of hex.
-        let ok = presented.len() == expected.len()
-            && presented
-                .bytes()
-                .zip(expected.bytes())
-                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                == 0;
+        let ok = constant_time_eq(&presented, expected);
         if !ok {
             return Err(crate::err(
                 StatusCode::UNAUTHORIZED,
@@ -59,6 +476,17 @@ pub fn check(
     }
     if state.auth == AuthMode::Open {
         return Ok(None);
+    }
+    // A fresh NIP-98 signature always wins over an existing browser cookie;
+    // this lets a user replace an expired session without first clearing it.
+    let has_nip98 = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("Nostr "));
+    if !has_nip98 {
+        if let Some(signer) = check_browser_session(state, headers, true)? {
+            return Ok(Some(signer));
+        }
     }
     let fail = |msg: &str| crate::err(StatusCode::UNAUTHORIZED, format!("nip98: {msg}"));
 
@@ -121,7 +549,10 @@ pub fn authorize_governor(
     signer: Option<PublicKey>,
     suspend_keys: &[PublicKey],
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if state.auth == AuthMode::Open {
+    // A signer-less request in open mode is the trusted local desktop
+    // operator. An explicit signer (notably a signed MCP control token)
+    // always acts as that identity and must never inherit operator access.
+    if state.auth == AuthMode::Open && signer.is_none() {
         return Ok(());
     }
     match signer {
@@ -137,27 +568,181 @@ pub fn authorize_governor(
     }
 }
 
+fn role_for(manifest: &Manifest, signer: &PublicKey) -> Option<ManagerRole> {
+    if manifest
+        .governance
+        .suspend_keys
+        .iter()
+        .filter_map(|value| apiary_core::identity::parse_npub(value).ok())
+        .any(|key| key == *signer)
+    {
+        return Some(ManagerRole::Governor);
+    }
+    manifest.governance.managers.iter().find_map(|manager| {
+        apiary_core::identity::parse_npub(&manager.npub)
+            .ok()
+            .filter(|key| key == signer)
+            .map(|_| manager.role)
+    })
+}
+
+/// Decide whether an identity may enter the private management cockpit.
+/// Host managers can administer the host. Per-agent managers can enter only
+/// so the normal route gates can show and operate the agents assigned to
+/// them. A merely valid Nostr identity learns nothing about this host.
+pub fn authorize_cockpit(
+    state: &AppState,
+    signer: Option<PublicKey>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if authorize_admin(state, signer).is_ok() {
+        return Ok(());
+    }
+    let signer =
+        signer.ok_or_else(|| crate::err(StatusCode::UNAUTHORIZED, "authentication required"))?;
+    let keystore = Keystore::open(&state.home).map_err(|error| {
+        crate::err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("agent registry is unavailable: {error}"),
+        )
+    })?;
+    let agents = keystore.list().map_err(|error| {
+        crate::err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("agent registry is unavailable: {error}"),
+        )
+    })?;
+    for npub in agents {
+        let path = keystore.agent_dir(&npub).join("manifest.yaml");
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(manifest) = Manifest::from_yaml(&raw) else {
+            continue;
+        };
+        if role_for(&manifest, &signer).is_some() {
+            return Ok(());
+        }
+    }
+    Err(crate::err(
+        StatusCode::FORBIDDEN,
+        "this Nostr identity does not have access to this Apiary host",
+    ))
+}
+
+pub fn required_agent_role(method: &str, path_and_query: &str) -> ManagerRole {
+    let path = path_and_query.split('?').next().unwrap_or(path_and_query);
+    if method == "GET" {
+        return if path.ends_with("/control-tokens") {
+            ManagerRole::Governor
+        } else {
+            ManagerRole::Viewer
+        };
+    }
+    let governor_only = path.ends_with("/manifest")
+        || path.contains("/ratify")
+        || path.ends_with("/governors")
+        || path.contains("/control-token")
+        || path.contains("/credential/")
+        || path.ends_with("/export")
+        || path.ends_with("/connectors/oauth");
+    if governor_only {
+        return ManagerRole::Governor;
+    }
+    let operator = path.ends_with("/run")
+        || path.ends_with("/ag-ui")
+        || path.ends_with("/active")
+        || path.ends_with("/log/publish")
+        || path.ends_with("/buzz/post")
+        || path.ends_with("/lease/takeover")
+        || path.ends_with("/listener")
+        || (path.contains("/routines/")
+            && (path.ends_with("/run") || path.ends_with("/pause") || path.ends_with("/resume")));
+    if operator {
+        ManagerRole::Operator
+    } else {
+        ManagerRole::Editor
+    }
+}
+
+/// Authorize one per-agent request at the minimum role required by its route.
+/// Local signer-less desktop calls retain operator trust; explicit identities
+/// are always bound to the target agent's manifest, including in open mode.
+pub fn authorize_agent_request(
+    state: &AppState,
+    signer: Option<PublicKey>,
+    manifest: &Manifest,
+    method: &str,
+    path_and_query: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if state.auth == AuthMode::Open && signer.is_none() {
+        return Ok(());
+    }
+    let required = required_agent_role(method, path_and_query);
+    // A governor may issue a revocable bearer signed by the agent for a
+    // foreign AG-UI surface such as OpenBot. That identity may ask this agent
+    // to run itself, but it never gains editor/governor authority and cannot
+    // use the exception on any other agent.
+    let self_run = required == ManagerRole::Operator
+        && path_and_query
+            .split('?')
+            .next()
+            .is_some_and(|path| path.ends_with("/run") || path.ends_with("/ag-ui"))
+        && signer.as_ref().is_some_and(|signer| {
+            apiary_core::identity::parse_npub(&manifest.identity.npub)
+                .is_ok_and(|agent| agent == *signer)
+        });
+    if self_run {
+        return Ok(());
+    }
+    match signer.and_then(|signer| role_for(manifest, &signer)) {
+        Some(actual) if actual >= required => Ok(()),
+        Some(actual) => Err(crate::err(
+            StatusCode::FORBIDDEN,
+            format!(
+                "agent manager role {actual:?} cannot perform this operation; {required:?} is required"
+            )
+            .to_ascii_lowercase(),
+        )),
+        None if signer.is_some() => Err(crate::err(
+            StatusCode::FORBIDDEN,
+            "signer is not a manager of this agent",
+        )),
+        None => Err(crate::err(
+            StatusCode::UNAUTHORIZED,
+            "authentication required",
+        )),
+    }
+}
+
 /// Host-scoped authorization: in nip98 mode the signer must be a listed
-/// HOST ADMIN — being a valid nostr key (or even some agent's governor)
-/// grants nothing over the host itself. Open mode remains local trust.
+/// HOST MANAGER — being a valid nostr key (or even some agent's governor)
+/// grants nothing over the host itself. The registry combines bootstrap
+/// `--admin` keys with stored managers. Signer-less open-mode requests retain
+/// local trust; an explicit signer remains constrained even on the desktop.
 pub fn authorize_admin(
     state: &AppState,
     signer: Option<PublicKey>,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if state.auth == AuthMode::Open {
+    if state.auth == AuthMode::Open && signer.is_none() {
         return Ok(());
     }
-    if state.admins.is_empty() {
+    let managers = state.managers.read().map_err(|_| {
+        crate::err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "host manager registry is unavailable",
+        )
+    })?;
+    if managers.is_empty() {
         return Err(crate::err(
             StatusCode::FORBIDDEN,
-            "host-scoped operations need a host administrator — start the daemon with --admin <npub>",
+            "host-scoped operations need a host manager — start once with --admin <npub> to bootstrap one",
         ));
     }
     match signer {
-        Some(pk) if state.admins.contains(&pk) => Ok(()),
+        Some(pk) if managers.contains(&pk) => Ok(()),
         Some(_) => Err(crate::err(
             StatusCode::FORBIDDEN,
-            "signer is not a host administrator",
+            "signer is not a host manager",
         )),
         None => Err(crate::err(
             StatusCode::UNAUTHORIZED,
@@ -169,20 +754,37 @@ pub fn authorize_admin(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn state(auth: AuthMode) -> AppState {
+        let home = std::env::temp_dir().join(format!(
+            "apiary-nip98-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
         AppState {
-            home: PathBuf::from("/tmp"),
+            home,
             passphrase: std::sync::RwLock::new(None),
+            remember_passphrase: None,
+            forget_passphrase: None,
+            automatic_unlock: std::sync::atomic::AtomicBool::new(false),
             auth,
             origin: "http://127.0.0.1:7777".into(),
             token: None,
+            browser_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            desktop_token: None,
+            internal_token: "test-internal-token".into(),
+            control_audit: std::sync::Mutex::new(()),
+            control_tokens: std::sync::Mutex::new(()),
             listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
             pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
-            admins: Vec::new(),
+            managers: std::sync::RwLock::new(crate::access::ManagerRegistry::in_memory(Vec::new())),
             supervisor_notes: std::sync::Mutex::new(std::collections::HashMap::new()),
             admitted: std::sync::Mutex::new(std::collections::HashMap::new()),
+            decisions: Default::default(),
         }
     }
 
@@ -275,6 +877,47 @@ mod tests {
     }
 
     #[test]
+    fn browser_session_reuses_one_signed_identity_with_csrf_binding() {
+        let s = state(AuthMode::Nip98);
+        let signer = Keys::generate().public_key();
+        let issued = issue_browser_session(&s, signer).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            format!("other=x; apiary_session={}", issued.token)
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("x-apiary-csrf", issued.csrf.parse().unwrap());
+        assert_eq!(
+            check(&s, &headers, "GET", "/api/agents", None).unwrap(),
+            Some(signer)
+        );
+        headers.remove("x-apiary-csrf");
+        assert_eq!(
+            browser_navigation_signer(&s, &headers).unwrap(),
+            Some(signer)
+        );
+        assert!(check(&s, &headers, "GET", "/api/agents", None).is_err());
+    }
+
+    #[test]
+    fn browser_session_logout_requires_csrf_and_revokes_the_cookie() {
+        let s = state(AuthMode::Nip98);
+        let signer = Keys::generate().public_key();
+        let issued = issue_browser_session(&s, signer).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            format!("apiary_session={}", issued.token).parse().unwrap(),
+        );
+        assert!(revoke_browser_session(&s, &headers).is_err());
+        headers.insert("x-apiary-csrf", issued.csrf.parse().unwrap());
+        assert_eq!(revoke_browser_session(&s, &headers).unwrap(), signer);
+        assert!(browser_navigation_signer(&s, &headers).is_err());
+    }
+
+    #[test]
     fn body_bearing_requests_require_payload_hash() {
         let s = state(AuthMode::Nip98);
         let keys = Keys::generate();
@@ -298,6 +941,190 @@ mod tests {
     }
 
     #[test]
+    fn signed_control_token_authenticates_as_the_agent() {
+        let s = state(AuthMode::Nip98);
+        let keys = Keys::generate();
+        let expected = keys.public_key();
+        let mut custody = apiary_core::custody::Custody::new();
+        let handle = custody.admit(keys);
+        let host_id = apiary_runtime::lease::host_id(&s.home);
+        let (token, record) = issue_control_token(&custody, &handle, &host_id, 3600).unwrap();
+        let token_id = record.id.clone();
+        let agent_npub = record.agent.clone();
+        register_control_token(&s, record).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        assert_eq!(
+            check_control(&s, &headers, "POST", "/mcp", Some(br#"{}"#)).unwrap(),
+            Some(expected)
+        );
+
+        let mut wrong_host = state(AuthMode::Nip98);
+        wrong_host.home =
+            std::env::temp_dir().join(format!("apiary-wrong-control-host-{}", std::process::id()));
+        assert!(check_control(&wrong_host, &headers, "POST", "/mcp", None).is_err());
+        revoke_control_token(&s, &agent_npub, &token_id).unwrap();
+        assert!(check_control(&s, &headers, "POST", "/mcp", None).is_err());
+        let _ = std::fs::remove_dir_all(&s.home);
+    }
+
+    #[test]
+    fn agent_manager_roles_are_hierarchical_and_route_specific() {
+        use apiary_core::manifest::{ManagerGrant, ManagerRole, Manifest};
+
+        let agent = Keys::generate();
+        let governor = Keys::generate();
+        let viewer = Keys::generate();
+        let operator = Keys::generate();
+        let editor = Keys::generate();
+        let mut manifest = Manifest::from_yaml(&format!(
+            "manifest_version: 1\nidentity:\n  npub: {}\nmemory:\n  log: local\ngovernance:\n  suspend_keys:\n    - {}\n",
+            apiary_core::identity::to_npub(&agent.public_key()).unwrap(),
+            apiary_core::identity::to_npub(&governor.public_key()).unwrap(),
+        ))
+        .unwrap();
+        manifest.governance.managers = vec![
+            ManagerGrant {
+                npub: apiary_core::identity::to_npub(&viewer.public_key()).unwrap(),
+                role: ManagerRole::Viewer,
+            },
+            ManagerGrant {
+                npub: apiary_core::identity::to_npub(&operator.public_key()).unwrap(),
+                role: ManagerRole::Operator,
+            },
+            ManagerGrant {
+                npub: apiary_core::identity::to_npub(&editor.public_key()).unwrap(),
+                role: ManagerRole::Editor,
+            },
+        ];
+        manifest.validate().unwrap();
+        let s = state(AuthMode::Open);
+        assert!(authorize_agent_request(
+            &s,
+            Some(agent.public_key()),
+            &manifest,
+            "POST",
+            "/api/agents/x/ag-ui"
+        )
+        .is_ok());
+        assert!(authorize_agent_request(
+            &s,
+            Some(agent.public_key()),
+            &manifest,
+            "POST",
+            "/api/agents/x/harnesses"
+        )
+        .is_err());
+        assert!(authorize_agent_request(
+            &s,
+            Some(viewer.public_key()),
+            &manifest,
+            "GET",
+            "/api/agents/x/manifest"
+        )
+        .is_ok());
+        assert!(authorize_agent_request(
+            &s,
+            Some(viewer.public_key()),
+            &manifest,
+            "POST",
+            "/api/agents/x/run"
+        )
+        .is_err());
+        assert!(authorize_agent_request(
+            &s,
+            Some(operator.public_key()),
+            &manifest,
+            "POST",
+            "/api/agents/x/run"
+        )
+        .is_ok());
+        assert!(authorize_agent_request(
+            &s,
+            Some(operator.public_key()),
+            &manifest,
+            "POST",
+            "/api/agents/x/harnesses"
+        )
+        .is_err());
+        assert!(authorize_agent_request(
+            &s,
+            Some(editor.public_key()),
+            &manifest,
+            "POST",
+            "/api/agents/x/harnesses"
+        )
+        .is_ok());
+        assert!(authorize_agent_request(
+            &s,
+            Some(editor.public_key()),
+            &manifest,
+            "PUT",
+            "/api/agents/x/manifest"
+        )
+        .is_err());
+        assert!(authorize_agent_request(
+            &s,
+            Some(governor.public_key()),
+            &manifest,
+            "PUT",
+            "/api/agents/x/manifest"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn sensitive_agent_routes_require_governor_role() {
+        use apiary_core::manifest::ManagerRole;
+
+        assert_eq!(
+            required_agent_role("GET", "/api/agents/x/manifest"),
+            ManagerRole::Viewer
+        );
+        assert_eq!(
+            required_agent_role("POST", "/api/agents/x/run"),
+            ManagerRole::Operator
+        );
+        assert_eq!(
+            required_agent_role("POST", "/api/agents/x/ag-ui"),
+            ManagerRole::Operator
+        );
+        assert_eq!(
+            required_agent_role("POST", "/api/agents/x/connectors"),
+            ManagerRole::Editor
+        );
+        for (method, path) in [
+            ("PUT", "/api/agents/x/manifest"),
+            ("POST", "/api/agents/x/ratify"),
+            ("POST", "/api/agents/x/credential/seal"),
+            ("POST", "/api/agents/x/control-token"),
+            ("GET", "/api/agents/x/control-tokens"),
+            ("DELETE", "/api/agents/x/control-tokens/deadbeef"),
+        ] {
+            assert_eq!(required_agent_role(method, path), ManagerRole::Governor);
+        }
+    }
+
+    #[test]
+    fn internal_identity_forwarding_requires_process_secret() {
+        let s = state(AuthMode::Nip98);
+        let signer = Keys::generate().public_key();
+        let signer_npub = apiary_core::identity::to_npub(&signer).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-apiary-internal-token", "wrong".parse().unwrap());
+        headers.insert("x-apiary-internal-signer", signer_npub.parse().unwrap());
+        assert!(check(&s, &headers, "GET", "/api/agents", None).is_err());
+        headers.insert(
+            "x-apiary-internal-token",
+            "test-internal-token".parse().unwrap(),
+        );
+        assert_eq!(
+            check(&s, &headers, "GET", "/api/agents", None).unwrap(),
+            Some(signer)
+        );
+    }
+
+    #[test]
     fn governor_binding() {
         let s = state(AuthMode::Nip98);
         let gov = Keys::generate().public_key();
@@ -305,7 +1132,59 @@ mod tests {
         assert!(authorize_governor(&s, Some(gov), &[gov]).is_ok());
         assert!(authorize_governor(&s, Some(stranger), &[gov]).is_err());
         assert!(authorize_governor(&s, None, &[gov]).is_err());
-        // Open mode: local trust, no binding.
-        assert!(authorize_governor(&state(AuthMode::Open), None, &[gov]).is_ok());
+        // Open mode grants local signer-less requests operator trust, but an
+        // authenticated agent identity remains bound to its own grants.
+        let open = state(AuthMode::Open);
+        assert!(authorize_governor(&open, None, &[gov]).is_ok());
+        assert!(authorize_governor(&open, Some(gov), &[gov]).is_ok());
+        assert!(authorize_governor(&open, Some(stranger), &[gov]).is_err());
+    }
+
+    #[test]
+    fn host_manager_registry_binds_admin_authority() {
+        let manager = Keys::generate().public_key();
+        let stranger = Keys::generate().public_key();
+        let mut s = state(AuthMode::Nip98);
+        s.managers =
+            std::sync::RwLock::new(crate::access::ManagerRegistry::in_memory(vec![manager]));
+        assert!(authorize_admin(&s, Some(manager)).is_ok());
+        assert!(authorize_admin(&s, Some(stranger)).is_err());
+        assert!(authorize_admin(&s, None).is_err());
+
+        let mut open = state(AuthMode::Open);
+        open.managers =
+            std::sync::RwLock::new(crate::access::ManagerRegistry::in_memory(vec![manager]));
+        assert!(authorize_admin(&open, None).is_ok());
+        assert!(authorize_admin(&open, Some(manager)).is_ok());
+        assert!(authorize_admin(&open, Some(stranger)).is_err());
+    }
+
+    #[test]
+    fn cockpit_access_requires_a_host_or_agent_assignment() {
+        use apiary_core::manifest::{ManagerGrant, ManagerRole};
+
+        let s = state(AuthMode::Nip98);
+        let agent = Keys::generate();
+        let governor = Keys::generate();
+        let viewer = Keys::generate();
+        let stranger = Keys::generate();
+        let agent_npub = apiary_core::identity::to_npub(&agent.public_key()).unwrap();
+        let governor_npub = apiary_core::identity::to_npub(&governor.public_key()).unwrap();
+        let mut manifest = Manifest::from_yaml(&format!(
+            "manifest_version: 1\nidentity:\n  npub: {agent_npub}\nmemory:\n  log: local\ngovernance:\n  suspend_keys:\n    - {governor_npub}\n"
+        ))
+        .unwrap();
+        manifest.governance.managers.push(ManagerGrant {
+            npub: apiary_core::identity::to_npub(&viewer.public_key()).unwrap(),
+            role: ManagerRole::Viewer,
+        });
+        let directory = s.home.join("agents").join(&agent_npub);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("manifest.yaml"), manifest.to_yaml().unwrap()).unwrap();
+
+        assert!(authorize_cockpit(&s, Some(viewer.public_key())).is_ok());
+        assert!(authorize_cockpit(&s, Some(stranger.public_key())).is_err());
+        assert!(authorize_cockpit(&s, None).is_err());
+        let _ = std::fs::remove_dir_all(&s.home);
     }
 }

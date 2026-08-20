@@ -1,27 +1,41 @@
 # Running Apiary as launchd agents (macOS)
 
-Two user agents keep the host up across logins and restarts:
+Three user agents cover desktop, speech, and headless deployments. Install only
+the services a machine needs:
 
-- `wine.wisco.apiary.desktop` — the desktop app (embedded daemon +
-  supervisor: presence, routines, lease). `KeepAlive` restarts it if it
-  dies. It needs the keystore passphrase to unlock at boot; the plist holds
-  it, so **the plist must be mode 0600** — same trust boundary as the
-  keystore. (Better still: NIP-46 remote signing, on the roadmap.)
+- `wine.wisco.apiary.desktop` is retained only as a migration template and is
+  deliberately **not** `KeepAlive`. Launch Apiary from Applications. Keeping a
+  GUI process alive causes it to reopen after Quit and races a manually opened
+  copy for the same SSH tunnel port. Use the headless host daemon below for
+  always-on agents, presence, routines, and leases.
 - `wine.wisco.apiary.kokoro` — the local TTS server (`services/kokoro`).
+- `wine.wisco.apiary.hostd` — the headless host for SSH remote mode. It binds
+  only `127.0.0.1:7777`; the Desktop app supplies the encrypted tunnel.
 
 Install:
 
 ```bash
-sed "s/YOUR-KEYSTORE-PASSPHRASE/…/; s#\$HOME#$HOME#g" scripts/launchd/wine.wisco.apiary.desktop.plist.template > ~/Library/LaunchAgents/wine.wisco.apiary.desktop.plist
+sed "s#\$HOME#$HOME#g" scripts/launchd/wine.wisco.apiary.desktop.plist.template > ~/Library/LaunchAgents/wine.wisco.apiary.desktop.plist
 sed "s#\$HOME#$HOME#g" scripts/launchd/wine.wisco.apiary.kokoro.plist.template > ~/Library/LaunchAgents/wine.wisco.apiary.kokoro.plist
-chmod 600 ~/Library/LaunchAgents/wine.wisco.apiary.desktop.plist
+sed "s#\$HOME#$HOME#g" scripts/launchd/wine.wisco.apiary.hostd.plist.template > ~/Library/LaunchAgents/wine.wisco.apiary.hostd.plist
+chmod 600 ~/Library/LaunchAgents/wine.wisco.apiary.{desktop,kokoro,hostd}.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/wine.wisco.apiary.kokoro.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/wine.wisco.apiary.desktop.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/wine.wisco.apiary.hostd.plist
 ```
 
-Logs: `~/.apiary/logs/{desktop,kokoro}.log`. Restart after a rebuild:
-`launchctl kickstart -k gui/$(id -u)/wine.wisco.apiary.desktop`.
+Logs: `~/.apiary/logs/{desktop,kokoro,hostd}.log`. Restart a service after a
+rebuild with `launchctl kickstart -k gui/$(id -u)/wine.wisco.apiary.<service>`.
 
-Inference credentials belong sealed in the agent's manifest (Credentials
-tab / `apiary credential seal`), not in this environment — then a
-relaunch needs nothing but the passphrase.
+Inference API keys belong sealed in the agent's manifest (Inference tab /
+`apiary credential seal`), not in the launch environment. Claude Code
+routes use the host's existing `claude auth login` session. Apiary disables
+Claude Code's own tools and dispatches only the connectors granted to the
+agent. A relaunch retrieves the keystore passphrase from macOS Keychain when
+automatic unlock has been enabled in the cockpit.
+
+Build the executable referenced by the launch agent with
+`scripts/build-desktop.sh`. The stable signature prevents macOS Keychain from
+treating every rebuilt executable as an unrelated application. The first
+signed launch may ask once; choose **Always Allow** to retain that signed
+application requirement across later builds.

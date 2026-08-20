@@ -20,6 +20,14 @@ fn modern_era_detected_and_calls_work() {
     let tools = c.tools_list().unwrap();
     assert!(tools.iter().any(|t| t.name == "echo"));
     let echo = tools.iter().find(|t| t.name == "echo").unwrap().clone();
+    assert!(echo.read_only);
+    assert!(
+        !tools
+            .iter()
+            .find(|t| t.name == "forbidden.tool")
+            .unwrap()
+            .read_only
+    );
     let out = c.tools_call(&echo, &json!({"text": "hi"})).unwrap();
     assert!(out.text.contains("hi"), "{}", out.text);
     assert!(!out.is_error);

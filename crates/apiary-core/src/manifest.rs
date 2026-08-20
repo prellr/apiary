@@ -16,6 +16,16 @@ pub const MANIFEST_VERSION: u32 = 1;
 pub struct Manifest {
     pub manifest_version: u32,
     pub identity: Identity,
+    /// The durable, human-ratified description of who this agent is and how
+    /// it should behave. Capabilities remain separate: this can guide use of
+    /// a connector, but can never grant one.
+    #[serde(default, skip_serializing_if = "Constitution::is_empty")]
+    pub constitution: Constitution,
+    /// Ratified procedural knowledge. `SKILL.md` is the interchange format;
+    /// the parsed content lives here so the manifest remains the single,
+    /// portable source of truth.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<Skill>,
     /// Inference is a POOL, not a scalar — each entry is a full connection
     /// ("inference in" is itself a credentialed connection, SPEC §1/§7).
     #[serde(default)]
@@ -26,6 +36,11 @@ pub struct Manifest {
     /// connector = absent capability (default-deny by construction).
     #[serde(default)]
     pub connectors: Vec<Connector>,
+    /// Foreign execution loops are capabilities too. Each entry names one
+    /// complete harness and the profile, tools, and accounting policy this
+    /// agent's governors approved. Absent entry = harness unavailable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub harnesses: Vec<HarnessGrant>,
     pub memory: Memory,
     #[serde(default)]
     pub presence: Presence,
@@ -56,13 +71,400 @@ pub struct Identity {
     pub successor: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessGrant {
+    /// Stable selection name used by API and CLI runs.
+    pub name: String,
+    /// Adapter protocol. ACP is implemented today; additional adapters can
+    /// be added without conflating a harness with an inference provider.
+    #[serde(default = "default_harness_kind")]
+    pub kind: String,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// inference-only | curated | full
+    #[serde(default)]
+    pub access: HarnessAccess,
+    /// isolated | curated | inherit
+    #[serde(default)]
+    pub profile: HarnessProfile,
+    /// none | read-only | no-network | read-only-no-network
+    #[serde(default)]
+    pub sandbox: HarnessSandbox,
+    /// ACP permission-request titles permitted by a curated harness.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_tools: Vec<String>,
+    /// Additional host environment variable names inherited by a curated
+    /// profile. Full `inherit` deliberately receives the complete profile.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inherit_env: Vec<String>,
+    /// unmetered | estimated | strict
+    #[serde(default)]
+    pub metering: HarnessMetering,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_tokens_per_run: Option<u64>,
+    /// Optional ratified working directory. This selects a cwd; it is not an
+    /// OS sandbox, and the cockpit states that distinction explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+}
+
+fn default_harness_kind() -> String {
+    "acp".into()
+}
+
+fn validate_slug(label: &str, value: &str, max: usize) -> Result<(), crate::Error> {
+    let valid = !value.is_empty()
+        && value.len() <= max
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    if valid {
+        Ok(())
+    } else {
+        Err(crate::Error::Manifest(format!(
+            "{label} '{value}' must be 1-{max} lowercase letters, digits, or hyphens"
+        )))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessAccess {
+    /// Deny ACP permission requests; known harness-native modes are also
+    /// pinned to chat/inference-only where an adapter supports that.
+    #[default]
+    InferenceOnly,
+    /// Only permission requests matching `allowed_tools` may be approved.
+    Curated,
+    /// Approve the complete native tool surface exposed by the harness.
+    Full,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessProfile {
+    /// Fresh per-agent HOME and scrubbed environment.
+    #[default]
+    Isolated,
+    /// Fresh per-agent HOME plus explicitly named environment variables.
+    Curated,
+    /// Inherit the host user's complete environment and global profile.
+    Inherit,
+}
+
+/// Optional OS-enforced restrictions applied to the entire harness process
+/// tree. Support is platform-dependent and requested modes fail closed when
+/// the host has no enforcement backend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessSandbox {
+    /// No OS sandbox. Profile and ACP permission policy still apply.
+    #[default]
+    None,
+    /// Deny filesystem writes. Reads and network remain available.
+    ReadOnly,
+    /// Deny network access. Filesystem access remains available.
+    NoNetwork,
+    /// Deny both filesystem writes and network access.
+    ReadOnlyNoNetwork,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessMetering {
+    /// Run even though ACP reports no usage; daily token limits do not bound
+    /// this harness. The signed log calls that out on every run.
+    Unmetered,
+    /// Charge a ratified per-run estimate against the daily ledger.
+    Estimated,
+    /// Refuse when the harness cannot report authoritative usage.
+    #[default]
+    Strict,
+}
+
+impl HarnessGrant {
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        validate_slug("harness name", &self.name, 64)?;
+        if self.kind != "acp" {
+            return Err(crate::Error::Manifest(format!(
+                "harness '{}' kind '{}' is unsupported (available: acp)",
+                self.name, self.kind
+            )));
+        }
+        if self.command.trim().is_empty() || self.command.chars().count() > 1024 {
+            return Err(crate::Error::Manifest(format!(
+                "harness '{}' command must be 1–1024 characters",
+                self.name
+            )));
+        }
+        if self.args.len() > 64 || self.args.iter().any(|arg| arg.len() > 4096) {
+            return Err(crate::Error::Manifest(format!(
+                "harness '{}' has too many or oversized arguments",
+                self.name
+            )));
+        }
+        if self.access == HarnessAccess::Curated && self.allowed_tools.is_empty() {
+            return Err(crate::Error::Manifest(format!(
+                "curated harness '{}' requires allowed_tools",
+                self.name
+            )));
+        }
+        if self.allowed_tools.len() > 256
+            || self
+                .allowed_tools
+                .iter()
+                .any(|tool| tool.trim().is_empty() || tool.len() > 512)
+        {
+            return Err(crate::Error::Manifest(format!(
+                "harness '{}' has an invalid tool allowlist",
+                self.name
+            )));
+        }
+        if self.inherit_env.len() > 128
+            || self.inherit_env.iter().any(|name| {
+                name.is_empty()
+                    || name.len() > 128
+                    || !name
+                        .as_bytes()
+                        .first()
+                        .is_some_and(|byte| *byte == b'_' || byte.is_ascii_alphabetic())
+                    || !name
+                        .bytes()
+                        .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+            })
+        {
+            return Err(crate::Error::Manifest(format!(
+                "harness '{}' has an invalid environment-variable allowlist",
+                self.name
+            )));
+        }
+        if self.workdir.as_ref().is_some_and(|workdir| {
+            workdir.trim().is_empty() || workdir.len() > 4096 || workdir.contains('\0')
+        }) {
+            return Err(crate::Error::Manifest(format!(
+                "harness '{}' has an invalid working directory",
+                self.name
+            )));
+        }
+        match (self.metering, self.estimated_tokens_per_run) {
+            (HarnessMetering::Estimated, Some(1..=64_000)) => {}
+            (HarnessMetering::Estimated, _) => {
+                return Err(crate::Error::Manifest(format!(
+                    "estimated harness '{}' needs estimated_tokens_per_run between 1 and 64000",
+                    self.name
+                )))
+            }
+            (_, Some(_)) => {
+                return Err(crate::Error::Manifest(format!(
+                    "harness '{}' may set estimated_tokens_per_run only with estimated metering",
+                    self.name
+                )))
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// Human-owned operating character. These fields are injected as
+/// authoritative instructions on every run and travel with the agent as part
+/// of the ratified manifest.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Constitution {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub purpose: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub role: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub voice: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub principles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub boundaries: Vec<String>,
+}
+
+impl Constitution {
+    pub fn is_empty(&self) -> bool {
+        self.purpose.is_empty()
+            && self.role.is_empty()
+            && self.voice.is_empty()
+            && self.principles.is_empty()
+            && self.boundaries.is_empty()
+    }
+
+    /// Stable, readable form for the runtime's authoritative system prompt.
+    pub fn prompt_text(&self) -> String {
+        let mut sections = Vec::new();
+        if !self.purpose.is_empty() {
+            sections.push(format!("Purpose: {}", self.purpose));
+        }
+        if !self.role.is_empty() {
+            sections.push(format!("Role: {}", self.role));
+        }
+        if !self.voice.is_empty() {
+            sections.push(format!("Voice: {}", self.voice));
+        }
+        if !self.principles.is_empty() {
+            sections.push(format!(
+                "Operating principles:\n- {}",
+                self.principles.join("\n- ")
+            ));
+        }
+        if !self.boundaries.is_empty() {
+            sections.push(format!(
+                "Behavioral boundaries:\n- {}",
+                self.boundaries.join("\n- ")
+            ));
+        }
+        sections.join("\n")
+    }
+}
+
+/// One portable skill. Requirements describe capabilities the instructions
+/// expect, but never grant them; connectors remain separate amendments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Skill {
+    pub name: String,
+    pub description: String,
+    pub instructions: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires_connectors: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillFrontmatter {
+    name: String,
+    description: String,
+}
+
+impl Skill {
+    pub const MAX_COUNT: usize = 32;
+    pub const MAX_DESCRIPTION_BYTES: usize = 2_048;
+    pub const MAX_INSTRUCTIONS_BYTES: usize = 32_768;
+
+    /// Parse the interoperable SKILL.md shape: YAML frontmatter containing
+    /// only name + description, followed by Markdown instructions.
+    pub fn from_markdown(
+        markdown: &str,
+        requires_connectors: Vec<String>,
+    ) -> Result<Self, crate::Error> {
+        let normalized = markdown.replace("\r\n", "\n");
+        let rest = normalized.strip_prefix("---\n").ok_or_else(|| {
+            crate::Error::Manifest("SKILL.md must start with YAML frontmatter ('---')".into())
+        })?;
+        let (frontmatter, instructions) = rest.split_once("\n---\n").ok_or_else(|| {
+            crate::Error::Manifest("SKILL.md frontmatter needs a closing '---' line".into())
+        })?;
+        let header: SkillFrontmatter = serde_yaml::from_str(frontmatter)?;
+        let mut skill = Self {
+            name: header.name.trim().to_string(),
+            description: header.description.trim().to_string(),
+            instructions: instructions.trim().to_string(),
+            requires_connectors: requires_connectors
+                .into_iter()
+                .map(|kind| kind.trim().to_string())
+                .filter(|kind| !kind.is_empty())
+                .collect(),
+        };
+        skill.requires_connectors.sort();
+        skill.requires_connectors.dedup();
+        skill.validate()?;
+        Ok(skill)
+    }
+
+    pub fn to_markdown(&self) -> Result<String, crate::Error> {
+        let frontmatter = serde_yaml::to_string(&SkillFrontmatter {
+            name: self.name.clone(),
+            description: self.description.clone(),
+        })?;
+        Ok(format!(
+            "---\n{}\n---\n\n{}\n",
+            frontmatter.trim_end(),
+            self.instructions.trim()
+        ))
+    }
+
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        let valid_name = !self.name.is_empty()
+            && self.name.len() <= 64
+            && !self.name.starts_with('-')
+            && !self.name.ends_with('-')
+            && self
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if !valid_name {
+            return Err(crate::Error::Manifest(format!(
+                "skill name '{}' must be 1-64 lowercase letters, digits, or hyphens",
+                self.name
+            )));
+        }
+        if self.description.trim().is_empty()
+            || self.description.len() > Self::MAX_DESCRIPTION_BYTES
+        {
+            return Err(crate::Error::Manifest(format!(
+                "skill '{}': description must be 1-{} bytes",
+                self.name,
+                Self::MAX_DESCRIPTION_BYTES
+            )));
+        }
+        if self.instructions.trim().is_empty()
+            || self.instructions.len() > Self::MAX_INSTRUCTIONS_BYTES
+        {
+            return Err(crate::Error::Manifest(format!(
+                "skill '{}': instructions must be 1-{} bytes",
+                self.name,
+                Self::MAX_INSTRUCTIONS_BYTES
+            )));
+        }
+        if self
+            .requires_connectors
+            .iter()
+            .any(|kind| kind.trim().is_empty())
+        {
+            return Err(crate::Error::Manifest(format!(
+                "skill '{}': connector requirements cannot be empty",
+                self.name
+            )));
+        }
+        let unique = self
+            .requires_connectors
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        if unique.len() != self.requires_connectors.len() {
+            return Err(crate::Error::Manifest(format!(
+                "skill '{}': connector requirements must be unique",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn requirements_met(&self, manifest: &Manifest) -> bool {
+        self.requires_connectors.iter().all(|required| {
+            manifest
+                .connectors
+                .iter()
+                .any(|connector| connector.kind == *required)
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InferenceSlot {
     /// Pool-local name routing rules refer to: "workhorse", "fast", "local", "embed".
     pub name: String,
-    /// "anthropic" | "openai" | "xai" | "ollama" | "mock". The openai and
-    /// xai providers speak the OpenAI-compatible dialect; `requires.
+    /// "claude-code" | "codex" | "anthropic" | "openai" | "xai" | "ollama" | "mock".
+    /// Claude Code and Codex use subscription auth through guarded local CLIs.
+    /// The openai and xai providers speak the OpenAI-compatible dialect; `requires.
     /// base_url` points either at any compatible endpoint (Groq, Together,
     /// llama.cpp, LM Studio, ollama /v1 — keyless when local).
     pub provider: String,
@@ -88,6 +490,11 @@ pub struct Routing {
     pub rules: Vec<RoutingRule>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
+    /// Explicit, human-ratified provider failover. Keys are primary slot
+    /// names and values are tried in order, but only before any text or tool
+    /// action has been emitted. An empty map means fail closed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fallbacks: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,13 +625,39 @@ impl PresenceChannel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Governance {
-    /// Human keys that can halt the agent (SPEC §8). Suspension authority
-    /// must never rest with the agent's own key.
+    /// Independent Nostr identities that can halt and govern the agent
+    /// (SPEC §8). An identity may belong to a person or a separate manager
+    /// agent; suspension authority must never rest with this agent's own key.
     pub suspend_keys: Vec<String>,
+    /// Additional per-agent managers with explicitly bounded authority.
+    /// Existing `suspend_keys` are always governors for backward
+    /// compatibility and remain eligible to ratify constitutional changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub managers: Vec<ManagerGrant>,
     /// Unified spend authority: token budgets and money budgets are one
     /// system of human-owned floors enforced by the host core.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub budgets: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ManagerRole {
+    /// Inspect the agent's non-secret environment and audit-visible state.
+    Viewer,
+    /// Viewer rights plus runs, activation, delivery, and other operations.
+    Operator,
+    /// Operator rights plus proposing configuration amendments.
+    Editor,
+    /// Full per-agent authority, including managers, credentials, and ratification.
+    Governor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagerGrant {
+    pub npub: String,
+    pub role: ManagerRole,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -366,20 +799,79 @@ impl Manifest {
             )));
         }
         let agent_pk = crate::identity::parse_npub(&self.identity.npub)?;
-        if self.governance.suspend_keys.is_empty() {
+        let has_governor = !self.governance.suspend_keys.is_empty()
+            || self
+                .governance
+                .managers
+                .iter()
+                .any(|manager| manager.role == ManagerRole::Governor);
+        if !has_governor {
             return Err(crate::Error::Manifest(
-                "governance.suspend_keys must name at least one human key: \
+                "governance must name at least one independent governor identity: \
                  suspension authority can never rest with the agent's own key"
                     .into(),
             ));
         }
-        // Suspend keys must be valid keys and must not include the agent itself.
+        // Manager identities must be valid, unique, and independent from the
+        // agent itself. Duplicate declarations would make effective authority
+        // ambiguous, so fail closed rather than silently choosing a role.
+        let mut manager_keys = std::collections::BTreeSet::new();
         for k in &self.governance.suspend_keys {
             let pk = crate::identity::parse_npub(k)?;
             if pk == agent_pk {
                 return Err(crate::Error::Manifest(
                     "agent's own key cannot be a suspend key".into(),
                 ));
+            }
+            if !manager_keys.insert(pk) {
+                return Err(crate::Error::Manifest(
+                    "duplicate governance manager identity".into(),
+                ));
+            }
+        }
+        if self.governance.managers.len() > 256 {
+            return Err(crate::Error::Manifest(
+                "governance may declare at most 256 managers".into(),
+            ));
+        }
+        for manager in &self.governance.managers {
+            let pk = crate::identity::parse_npub(&manager.npub)?;
+            if pk == agent_pk {
+                return Err(crate::Error::Manifest(
+                    "agent's own key cannot manage itself".into(),
+                ));
+            }
+            if !manager_keys.insert(pk) {
+                return Err(crate::Error::Manifest(
+                    "duplicate governance manager identity".into(),
+                ));
+            }
+        }
+        if self.skills.len() > Skill::MAX_COUNT {
+            return Err(crate::Error::Manifest(format!(
+                "manifest declares {} skills; at most {} are allowed",
+                self.skills.len(),
+                Skill::MAX_COUNT
+            )));
+        }
+        let mut skill_names = std::collections::BTreeSet::new();
+        for skill in &self.skills {
+            skill.validate()?;
+            if !skill_names.insert(skill.name.as_str()) {
+                return Err(crate::Error::Manifest(format!(
+                    "duplicate skill name '{}'",
+                    skill.name
+                )));
+            }
+        }
+        let mut harness_names = std::collections::BTreeSet::new();
+        for harness in &self.harnesses {
+            harness.validate()?;
+            if !harness_names.insert(harness.name.as_str()) {
+                return Err(crate::Error::Manifest(format!(
+                    "duplicate harness name '{}'",
+                    harness.name
+                )));
             }
         }
         // Routing targets must exist in the inference pool.
@@ -397,6 +889,26 @@ impl Manifest {
                 return Err(crate::Error::Manifest(format!(
                     "routing default targets unknown inference slot '{d}'"
                 )));
+            }
+        }
+        for (primary, fallbacks) in &self.routing.fallbacks {
+            if !slot_names.contains(&primary.as_str()) {
+                return Err(crate::Error::Manifest(format!(
+                    "routing fallback names unknown primary inference slot '{primary}'"
+                )));
+            }
+            let mut seen_fallbacks = std::collections::BTreeSet::new();
+            for fallback in fallbacks {
+                if !slot_names.contains(&fallback.as_str()) {
+                    return Err(crate::Error::Manifest(format!(
+                        "routing fallback targets unknown inference slot '{fallback}'"
+                    )));
+                }
+                if fallback == primary || !seen_fallbacks.insert(fallback) {
+                    return Err(crate::Error::Manifest(format!(
+                        "routing fallback for '{primary}' repeats slot '{fallback}'"
+                    )));
+                }
             }
         }
         // Routines: one schedule spelling, tz where it matters, valid
@@ -488,5 +1000,169 @@ impl Manifest {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity;
+    use nostr::prelude::Keys;
+
+    fn minimal_yaml() -> String {
+        let agent = identity::to_npub(&Keys::generate().public_key()).unwrap();
+        let human = identity::to_npub(&Keys::generate().public_key()).unwrap();
+        format!(
+            "manifest_version: 1\nidentity:\n  npub: {agent}\nmemory:\n  log: local\n\
+             governance:\n  suspend_keys:\n    - {human}\n"
+        )
+    }
+
+    #[test]
+    fn manifests_without_a_constitution_remain_valid() {
+        let manifest = Manifest::from_yaml(&minimal_yaml()).unwrap();
+        assert!(manifest.constitution.is_empty());
+        assert!(!manifest.to_yaml().unwrap().contains("constitution:"));
+    }
+
+    #[test]
+    fn routing_fallbacks_are_explicit_and_validated() {
+        let mut manifest = Manifest::from_yaml(&minimal_yaml()).unwrap();
+        manifest.inference = vec![
+            InferenceSlot {
+                name: "primary".into(),
+                provider: "mock".into(),
+                model: Some("primary-model".into()),
+                credential: None,
+                requires: Default::default(),
+            },
+            InferenceSlot {
+                name: "backup".into(),
+                provider: "mock".into(),
+                model: Some("backup-model".into()),
+                credential: None,
+                requires: Default::default(),
+            },
+        ];
+        manifest.routing.default = Some("primary".into());
+        manifest
+            .routing
+            .fallbacks
+            .insert("primary".into(), vec!["backup".into()]);
+        manifest.validate().unwrap();
+        assert!(manifest.to_yaml().unwrap().contains("fallbacks:"));
+
+        manifest
+            .routing
+            .fallbacks
+            .insert("primary".into(), vec!["missing".into()]);
+        assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn harness_grants_are_portable_and_fail_closed() {
+        let mut manifest = Manifest::from_yaml(&minimal_yaml()).unwrap();
+        manifest.harnesses.push(HarnessGrant {
+            name: "goose-workspace".into(),
+            kind: "acp".into(),
+            command: "goose".into(),
+            args: vec!["acp".into()],
+            access: HarnessAccess::Curated,
+            profile: HarnessProfile::Isolated,
+            sandbox: HarnessSandbox::ReadOnly,
+            allowed_tools: vec!["shell".into(), "write_file".into()],
+            inherit_env: Vec::new(),
+            metering: HarnessMetering::Estimated,
+            estimated_tokens_per_run: Some(8192),
+            workdir: Some("/workspace".into()),
+        });
+        manifest.validate().unwrap();
+        let round_trip = Manifest::from_yaml(&manifest.to_yaml().unwrap()).unwrap();
+        assert_eq!(round_trip.harnesses[0].name, "goose-workspace");
+        assert_eq!(round_trip.harnesses[0].access, HarnessAccess::Curated);
+        assert_eq!(round_trip.harnesses[0].sandbox, HarnessSandbox::ReadOnly);
+
+        let mut bad = round_trip.harnesses[0].clone();
+        bad.allowed_tools.clear();
+        assert!(bad.validate().is_err());
+        bad.access = HarnessAccess::Full;
+        bad.metering = HarnessMetering::Strict;
+        bad.estimated_tokens_per_run = Some(100);
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn scoped_manager_roles_require_an_independent_governor() {
+        let mut manifest = Manifest::from_yaml(&minimal_yaml()).unwrap();
+        let governor = identity::to_npub(&Keys::generate().public_key()).unwrap();
+        let viewer = identity::to_npub(&Keys::generate().public_key()).unwrap();
+        manifest.governance.suspend_keys.clear();
+        manifest.governance.managers = vec![ManagerGrant {
+            npub: viewer,
+            role: ManagerRole::Viewer,
+        }];
+        assert!(manifest.validate().is_err());
+        manifest.governance.managers.push(ManagerGrant {
+            npub: governor.clone(),
+            role: ManagerRole::Governor,
+        });
+        manifest.validate().unwrap();
+
+        manifest.governance.suspend_keys = vec![governor];
+        assert!(manifest.validate().is_err());
+
+        manifest.governance.suspend_keys.clear();
+        manifest.governance.managers[1].npub = manifest.identity.npub.clone();
+        assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn constitution_prompt_text_keeps_each_operating_layer() {
+        let constitution = Constitution {
+            purpose: "Help customers".into(),
+            role: "Support specialist".into(),
+            voice: "Warm and direct".into(),
+            principles: vec!["Verify account details".into()],
+            boundaries: vec!["Do not issue refunds".into()],
+        };
+        let prompt = constitution.prompt_text();
+        assert!(prompt.contains("Purpose: Help customers"));
+        assert!(prompt.contains("Role: Support specialist"));
+        assert!(prompt.contains("Voice: Warm and direct"));
+        assert!(prompt.contains("Operating principles:\n- Verify account details"));
+        assert!(prompt.contains("Behavioral boundaries:\n- Do not issue refunds"));
+    }
+
+    #[test]
+    fn skill_markdown_round_trips_and_normalizes_requirements() {
+        let markdown = "---\r\nname: web-research\r\ndescription: Research current topics with sources.\r\n---\r\n\r\n# Workflow\r\n\r\nSearch, read, and cite.\r\n";
+        let skill = Skill::from_markdown(
+            markdown,
+            vec![
+                " web-fetch ".into(),
+                "web-search".into(),
+                "web-search".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(skill.name, "web-research");
+        assert_eq!(skill.requires_connectors, ["web-fetch", "web-search"]);
+        let round_trip = Skill::from_markdown(
+            &skill.to_markdown().unwrap(),
+            skill.requires_connectors.clone(),
+        )
+        .unwrap();
+        assert_eq!(round_trip.name, skill.name);
+        assert_eq!(round_trip.description, skill.description);
+        assert_eq!(round_trip.instructions, skill.instructions);
+    }
+
+    #[test]
+    fn skill_markdown_rejects_extra_frontmatter_and_bad_names() {
+        let extra =
+            "---\nname: research\ndescription: Research things.\nauthor: stranger\n---\nDo it.";
+        assert!(Skill::from_markdown(extra, vec![]).is_err());
+        let bad_name = "---\nname: Research Skill\ndescription: Research things.\n---\nDo it.";
+        assert!(Skill::from_markdown(bad_name, vec![]).is_err());
     }
 }

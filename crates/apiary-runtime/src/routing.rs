@@ -20,6 +20,18 @@ pub struct TaskContext {
     /// Per-run ceiling within the day's cap (routines set this); None =
     /// the ledger's default reservation.
     pub tokens_per_run: Option<u64>,
+    /// A low-latency caller may explicitly request inference without the
+    /// agent's connector catalog. Capabilities remain ratified; they are
+    /// simply not offered to this run.
+    pub disable_tools: bool,
+    /// Host-selected slot for a connection diagnostic. Ordinary callers do
+    /// not populate this; the target must still exist in the ratified pool.
+    pub route_override: Option<String>,
+    /// Skip memory, skill selection, transcription, and connector binding for
+    /// a low-cost connection diagnostic.
+    pub lightweight: bool,
+    /// Test exactly one route rather than masking it with failover.
+    pub disable_fallback: bool,
 }
 
 fn rule_matches(rule: &RoutingRule, ctx: &TaskContext) -> bool {
@@ -42,6 +54,14 @@ fn rule_matches(rule: &RoutingRule, ctx: &TaskContext) -> bool {
 /// are final; rules follow; then the default; then, as a last resort, the
 /// sole slot if exactly one exists.
 pub fn resolve(manifest: &Manifest, ctx: &TaskContext) -> Result<String, crate::Error> {
+    if let Some(slot) = &ctx.route_override {
+        return manifest
+            .inference
+            .iter()
+            .any(|candidate| candidate.name == *slot)
+            .then(|| slot.clone())
+            .ok_or_else(|| crate::Error::Routing(format!("slot '{slot}' not in pool")));
+    }
     for floor in &manifest.routing.floors {
         if rule_matches(floor, ctx) {
             return Ok(floor.to.clone());
@@ -113,6 +133,8 @@ governance:
                 data_class: Some("sensitive".into()),
                 attachments: Vec::new(),
                 tokens_per_run: None,
+                disable_tools: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -130,6 +152,8 @@ governance:
                     data_class: None,
                     attachments: Vec::new(),
                     tokens_per_run: None,
+                    disable_tools: false,
+                    ..Default::default()
                 }
             )
             .unwrap(),

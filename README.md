@@ -1,255 +1,325 @@
 # Apiary
 
-A host for **portable agents** — durable principals with self-owned cryptographic
-identity (nostr), not sessions welded to a platform.
+**Create AI team members that remember, use your tools, and stay under your
+control.**
 
-An agent is four things, none of which is the model: **identity** (a nostr
-keypair), **skillset** (manifest-declared connectors), **memory** (signed log +
-semantic index), and **permissions** (human-owned floors + encrypted credential
-grants). The model is rented, swappable cognition: *inference in, connections out*.
+Apiary turns an AI chat into an ongoing helper you can actually manage. Give an
+agent a job, a personality, memory, and access to the services it needs. It can
+then help from your computer, a private server, or connected messaging apps
+without starting from scratch each time.
 
-Read the full design: [docs/SPEC.md](docs/SPEC.md).
+You choose the AI model and every tool the agent can use. You can make a
+connection read-only, allow writing when needed, set spending limits, and
+decide who may operate or change the agent. Changing models or moving to
+another machine does not erase the agent's identity, instructions, or history.
 
-## Status
+[![CI](https://github.com/prellr/apiary/actions/workflows/ci.yml/badge.svg)](https://github.com/prellr/apiary/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
-Phases 0–3 are complete and live-proven against production infrastructure
-(public nostr relays, a production Buzz workspace, real MCP servers, live
-model runs). What exists today:
+> Apiary is under active development. Its core desktop, server, connector,
+> memory, skills, remote access, and portability features work today, but setup
+> and configuration may still change before the first stable release.
 
-**The substrate** (`apiary-core`)
+## Why Apiary
 
-- Manifest schema v1 — the agent's constitution: identity, inference pool,
-  routing, connectors, memory, presence, governance, lease
-- Identity: nostr keypair (BIP-340); custody with NIP-44 seal/open,
-  per-agent isolation, JIT decrypt, zeroizing buffers
-- Dev keystore: NIP-49 (ncryptsec) encrypted keys at rest, 0600/0700 modes
-- Signed episodic log: chained nostr events with privacy tiers
-  (public / self / local), tamper detection
-- Founding ceremony: the agent signs its manifest hash, a human suspend-key
-  holder countersigns — both land in the public log. **Unratified agents
-  refuse to run**, and any amendment suspends until re-ratified.
+Most AI assistants are temporary conversations controlled by one provider.
+Apiary is designed for durable agents that belong to you:
 
-**The runtime** (`apiary-runtime`)
+- **They remember.** Each agent can carry useful history and retrieve older
+  context when it is relevant.
+- **They can do real work.** You may connect files, websites, Git repositories,
+  messaging services, MCP tools, or larger agent runtimes.
+- **They are portable.** Models, providers, computers, and runtimes can change
+  without creating a new agent.
+- **Their access is explicit.** An agent only receives tools and permissions
+  that a manager approves, and it cannot grant itself more.
+- **Management can be scoped.** Different people or manager agents can control
+  the whole Apiary host or only the individual agents assigned to them.
 
-- Inference pool: Anthropic (raw Messages API), **OpenAI and xAI** (one
-  OpenAI-compatible implementation with function calling; `requires.
-  base_url` reaches Groq/Together/llama.cpp/LM Studio/ollama-`/v1`,
-  keyless when local), Ollama, mock — slots, not identity; per-slot
-  sealed credentials; routing = floors clamp → rules → default,
-  resolved host-side
-- Spend authority: `tokens_per_day` as a hard ceiling via atomic
-  reservations taken before every model call
-- Governed run loop: budget → route → hydrate memory (semantic index +
-  recency tail) → infer → tool loop → signed checkpoint entries
-- Provenance framing: memory, tool results, and workspace messages are
-  DATA in the working set; instructions come only from the constitution
-  and the operator's task (proven live: a channel mention asking an agent
-  to use its connectors gets a polite refusal)
-- Connectors, default-deny: `nostr-publish` (relay-allowlisted), **`mcp`**
-  (see below), and **`obsidian` / `markdown-vault`** — named markdown
-  knowledge folders (Obsidian vaults, checked-out KB repos, plain note
-  dirs) as search/read tools, write only under an explicit cap, every
-  path jailed to its vault root. Each grant is a ratified manifest
-  amendment with credentials sealed to that agent alone
-- Vaults double as **ambient memory**: `memory.vaults` entries are
-  chunked (heading-aware) and embedded into the semantic index, so
-  retrieval surfaces relevant notes into the working set beside the
-  agent's own log memories — as DATA, per the provenance rule. Vault
-  content is host-local: it neither exports nor publishes; a destination
-  host re-indexes its own copy
-- MCP client: revision 2026-07-28 (stateless, per-request `_meta`,
-  `server/discover` era probe) with automatic fallback to
-  `initialize`-era servers; stdio (scrubbed-env subprocess) and
-  Streamable HTTP (mirror headers, `x-mcp-header`, SSE); OAuth grants
-  (RFC 9728 → RFC 8414 → PKCE → RFC 9207) with tokens sealed to the agent;
-  `caps.allowed_tools` required — the server offers, the manifest decides
-- Foreign harnesses via ACP (proven with claude-code-acp): permission
-  requests decided host-side, default deny, harness attribution in the log
-- Tiered log publication: public entries publish as-is, self-tier publish
-  NIP-44-wrapped to the agent's own key, local never leaves; the remote
-  copy is fetched, verified, and decrypted back — portable memory, proven
-- **Multi-channel presence**: an agent lives on many platforms at once —
-  Buzz (NIP-42, the agent's own key), Telegram (Bot API long poll, sealed
-  token, chat allowlist), Slack (Socket Mode, sealed app+bot tokens), and
-  anything the community builds via the **Channel Plugin Protocol**
-  (`apiary-channel/1`, docs/CHANNEL_PLUGINS.md): plugins are executables
-  speaking newline JSON-RPC on stdio, spawned env-scrubbed, handed their
-  one sealed credential at initialize. Every mention on every platform
-  takes the same governed path (logged, DATA-framed, budgeted); one lease
-  spans all of an agent's channels; the supervisor runs, restarts, and
-  bounces each channel independently. Alongside MCP (tools) and ACP
-  (harnesses), presence plugins complete Apiary's three plugin standards —
-  only the last one is ours, because only it had no industry standard
-- **Lease**: single-host standing presence via agent-signed replaceable
-  relay events; contested starts refuse and name the holder; takeover is
-  `contested-human` — a button a person presses; the loser yields within
-  one heartbeat interval
+## How an Apiary agent works
 
-- **Native portability**: `agent export` packs manifest + NIP-49-locked
-  key + full signed log + semantic index into one verified bundle — ALL
-  of the agent's memory travels, recall included. With
-  `--export-passphrase`, the traveling key is re-encrypted under a
-  disposable handoff secret, so an agent can be GIVEN to someone else:
-  your keystore passphrase never travels, and their host re-encrypts
-  under their own passphrase on arrival (the key lets them act as the
-  agent; amending its constitution still requires a listed suspend key).
-  With `--to <npub>`, the whole bundle is SEALED instead: one kind-4602
-  event signed by the agent's own key and NIP-44-encrypted to the
-  recipient — no secret in flight, tamper- and truncation-evident,
-  local-tier memory confidential in transit, safe to send over any
-  channel. Three modes, none required: plain / passphrase / sealed; `agent import` refuses
-  anything that fails key↔manifest agreement, a signature, the chain, or
-  ratification, and arrivals are INACTIVE (the lease referees the
-  switchover). `agent recover` rebuilds an agent from its relays alone —
-  the manifest publishes as an addressable event (kind 34600) alongside
-  the log, so npub + key + passphrase is enough to resurrect the agent
-  anywhere (local-tier entries stay home by design; gaps are reported).
-  The index is unsigned derived data, so import verifies every row
-  against the signed log — a row whose text disagrees with its signed
-  entry is dropped, never trusted
+Each agent keeps five things separate from whichever AI model it uses:
 
-**The host** (`apiary-hostd`, `apiary-desktop`)
+| Part | In everyday terms |
+| --- | --- |
+| Identity | A stable, portable identity backed by Nostr |
+| Role and rules | Its job, personality, behavior, and boundaries |
+| Memory | Its signed history and locally retrieved context |
+| Tools and AI | The approved models, services, skills, and runtimes it may use |
+| Management | The people or manager agents allowed to operate or change it |
 
-- One router, three faces: headless daemon, REST/AG-UI API, and the Tauri
-  desktop app running it in-process behind a per-launch token
-- Supervisor: ACTIVE agents with declared `presence.buzz` get their
-  listener started, restarted on death, bounced on manifest amendment,
-  stopped on deactivation — and lease-coordinated across hosts
-- NIP-98 signed-request auth for remote use; governor-bound authorization
-  (the signer must be a suspend key of the agent it touches), and a
-  **host administrator allowlist** (`--admin <npub>`) gating host-scoped
-  operations — founding, importing, the connector library, lock/unlock —
-  independently of any agent's governors
+The AI model is the engine, not the agent. You can change the engine without
+replacing the agent, and the engine cannot change its own permissions.
 
-- **Relay pool**: one supervised worker per relay URL shared by the
-  whole process — leases, publication, recovery, and connectors ride
-  persistent connections with capped-backoff reconnect and idle
-  keepalive, instead of a connection per operation. Pool health is in
-  `/api/status`.
+### Technical shape
 
-Remaining roadmap: NIP-46 remote-signer custody, OS sandbox for ACP
-subprocesses, relay delivery of sealed handoffs, log checkpointing.
+```mermaid
+flowchart LR
+    U["People or manager agents"] --> H["Apiary host"]
+    D["Desktop or remote client"] --> H
+    H --> G["One governance gate"]
+    G --> R["Agent runtime"]
+    R --> I["Inference providers"]
+    R --> C["Governed connectors"]
+    R --> P["Presence channels"]
+    R --> A["Optional ACP harnesses"]
+```
+
+Approved changes are kept as signed, portable records. The host reduces those
+records to one fast authorization decision before work begins. Task history,
+health, spending, search indexes, and interface state stay off-chain so normal
+operation remains responsive.
+
+## What works today
+
+- **Desktop and headless operation** — run Apiary locally, on a server, or use
+  the desktop app through an SSH tunnel.
+- **Replaceable inference** — Anthropic, OpenAI-compatible providers, xAI,
+  Ollama, local endpoints, and mock inference with per-agent routing.
+- **Governed tools** — built-in web, files, Git, Markdown vaults, Nostr, and
+  MCP connectors. Write access is explicit and optional.
+- **Portable skills** — standard `SKILL.md` instructions become ratified agent
+  capabilities; missing connector requirements fail closed.
+- **Durable memory** — signed, chained event history with public, self, and
+  local privacy tiers plus semantic retrieval.
+- **Multi-channel presence** — Buzz, Telegram, Slack, and external channel
+  plugins share the same runtime and policy checks.
+- **Per-agent harness policy** — ACP harnesses such as Claude Code, Goose, or
+  Berd may be isolated, curated, fully enabled, sandboxed, metered, or denied
+  for each agent independently.
+- **Scoped management** — multiple Nostr identities can manage the host or
+  individual agents as viewers, operators, editors, or governors.
+- **Portable agents** — export, transfer, import, and relay-based recovery
+  verify identity, signatures, history, and ratification before activation.
+- **Management over MCP** — an outside agent can inspect and manage permitted
+  Apiary environments without bypassing the normal authorization gate.
+- **OpenBot / AG-UI surface** — an Apiary agent can be registered as an
+  [OpenBot](https://github.com/CopilotKit/openbot) coworker through standard
+  AG-UI without importing OpenBot's tools or standing role as authority.
 
 ## Quick start
 
-The fastest path is the desktop app — everything below (and everything the
-CLI can do) is operable from the GUI with inline explanations:
+### Desktop
+
+Requirements: a current Rust toolchain and the platform dependencies required
+by [Tauri 2](https://v2.tauri.app/start/prerequisites/).
 
 ```bash
+git clone https://github.com/prellr/apiary.git
+cd apiary
 cargo run -p apiary-desktop
 ```
 
-Or the CLI:
+On macOS, build the persistent signed executable with:
+
+```bash
+scripts/build-desktop.sh
+```
+
+This produces `target/release/Apiary` with a stable signing identifier so
+macOS Keychain does not treat every rebuild as a different application.
+
+For a distributable macOS app and DMG, install Tauri CLI 2 and run the release
+packager:
+
+```bash
+cargo install tauri-cli --version '^2' --locked
+scripts/package-macos.sh
+```
+
+The release packager requires a Developer ID Application identity and Apple
+notarization credentials. See [docs/RELEASE.md](docs/RELEASE.md) for the
+fail-closed release checklist and the explicit local-test override.
+
+### CLI
 
 ```bash
 cargo build
 
-export APIARY_PASSPHRASE=…   # dev keystore passphrase (NIP-49)
+# Development-only keystore passphrase. The desktop uses macOS Keychain.
+export APIARY_PASSPHRASE='choose-a-passphrase'
 
-# Found an agent (requires a human suspend key — suspension authority
-# never rests with the agent's own key)
-apiary agent new --name scout --suspend-key npub1…
+# Create and ratify an agent.
+target/debug/apiary agent new --name scout --suspend-key npub1…
+target/debug/apiary agent ratify <agent-npub> --as <manager-npub>
 
-apiary agent list
-apiary manifest validate ~/.apiary/agents/<npub>/manifest.yaml
-
-# Ratify the manifest as the human (constitution, then amendments).
-# Nothing runs unratified.
-apiary agent ratify <agent-npub> --as <your-npub>
-
-# Run a task. Routing: floors clamp, then rules, then default.
-apiary run <agent-npub> --task "Summarize your purpose" --class reasoning
-
-# The track record: signed, chained, verifiable.
-apiary log show <agent-npub>
-apiary log verify <agent-npub>
-
-# Seal a connector credential to the agent's key (NIP-44)
-echo -n "$SECRET" | apiary credential seal <npub>
+# Run a governed task and verify its signed history.
+target/debug/apiary run <agent-npub> --task "Summarize your purpose"
+target/debug/apiary log verify <agent-npub>
 ```
 
-To give an agent a real brain, add an inference slot to its `manifest.yaml`
-(provider `anthropic` uses a sealed credential or `ANTHROPIC_API_KEY` /
-`ANTHROPIC_AUTH_TOKEN` from the environment; `ollama` runs locally; `mock`
-echoes for testing):
+State lives in `~/.apiary` unless `APIARY_HOME` is set. Never commit that
+directory.
 
-```yaml
-inference:
-  - name: workhorse
-    provider: anthropic
-    model: claude-opus-5
-routing:
-  default: workhorse
-governance:
-  budgets:
-    tokens_per_day: 200000
+## Local and remote backends
+
+The desktop normally embeds a loopback-only Apiary host. To keep agents and
+credentials on a server, start the daemon there:
+
+```bash
+apiary-hostd --bind 127.0.0.1:7777 --auth open
 ```
 
-State lives in `~/.apiary` (`APIARY_HOME` to override). Never commit it.
+In the desktop app, open **Host status**, add the SSH server, and select
+**Switch**. Apiary creates a noninteractive loopback tunnel; inference,
+credentials, files, channels, and agent state remain on the server.
 
-## Desktop app (Tauri)
+Keep an `open` daemon bound to server loopback. Use `--auth nip98` whenever a
+host is reachable beyond a trusted SSH boundary.
 
-The desktop app runs the full `apiary-hostd` router in-process on a loopback
-port and opens the cockpit in a native window. Tabs, each with inline
-explanations:
+For a browser-facing NIP-98 host, the cockpit asks a NIP-07 signer once and
+opens an eight-hour, in-memory session. The session is only an authentication
+cache: the signer still sees only agents where its Nostr ID has a ratified
+role, and host-wide operations still require host-manager status.
 
-- **Overview** — identity (with rename), activation switch, governance
-  (suspend keys, budget with a live spend meter), inference pool & routing,
-  connectors, memory tiers & relays, **live lease state with the
-  TAKE OVER button**, listener status that explains itself
-- **Run** — governed one-shot tasks with routing class / data class,
-  streamed as AG-UI events; every model call lands as a signed checkpoint
-- **Log** — chain verification, publish to relays, fetch-and-verify the
-  remote copy
-- **Manifest** — YAML editor with a field guide, the amend → auto-suspend →
-  re-ratify cycle, and external ratification (export the unsigned event,
-  sign with your own nostr tooling, import)
-- **Buzz** — profile, channel discovery/read/post/join, and the supervised
-  mention listener
-- **Connectors** — this agent's grants and revokes; definitions live in the
-  **host connector library** (sidebar, host-scoped, shows which agents hold
-  each entry), including MCP servers and OAuth-granted remotes
-- **Credentials** — NIP-44 seal/open against the agent's key
-- **Header** — host status chips, keystore lock/unlock (passphrase lives in
-  memory only), npub⇄hex key tool
+## Governance in practice
 
-Runtime governance is supervised, not scripted: activate an agent whose
-manifest declares `presence.buzz` and the host starts its listener, restarts
-it if it dies, bounces it the moment the manifest changes (returning only
-once re-ratified), stops it on deactivation, and coordinates with other
-hosts through the lease — contested starts refuse and name the holder;
-taking over a live agent is always a human act.
+- New agents do not run until a manager ratifies their manifest.
+- Constitutional or capability changes suspend the agent until ratified again.
+- Host managers control installation-wide operations; agent managers are
+  scoped to named agents.
+- An agent can be a manager of another agent, but cannot govern itself.
+- Connectors and harnesses are default-deny. A model request cannot expand a
+  ratified grant.
+- Credentials are encrypted to the receiving agent and opened only when used.
+- Memory, tool results, files, and channel messages are treated as data, not
+  trusted instructions.
+- Daily model budgets reserve tokens before inference. Harnesses with unknown
+  usage must be explicitly estimated or intentionally marked unmetered.
 
-Security posture: the embedded daemon binds `127.0.0.1` on an ephemeral port
-and requires a per-launch random token that only the app's own webview
-receives — other local processes can't drive it. The keystore starts locked
-unless `APIARY_PASSPHRASE` is set. `ANTHROPIC_API_KEY` in the app's
-environment enables anthropic-routed runs and model-drafted foundings.
+## Connectors, skills, and harnesses
 
-The plain daemon (`apiary-hostd`) serves the same cockpit at `--bind` for
-headless hosts; add `--auth nip98` beyond localhost.
+These are deliberately separate:
 
-## Layout
+| Mechanism | Purpose | Authority |
+| --- | --- | --- |
+| Connector | Gives an agent access to a service or local resource | Named, ratified grant with read/write limits |
+| Skill | Teaches a repeatable workflow | Ratified `SKILL.md`; grants no tools itself |
+| Harness | Supplies a complete external agent runtime | Per-agent access, profile, sandbox, and metering policy |
 
+Harness policy can expose only inference, a curated tool set, or the harness's
+full native surface. Its profile can be isolated from global credentials and
+extensions or intentionally inherited. File and network sandboxing are
+separate controls and fail closed when a requested sandbox is unavailable.
+
+## Latency model
+
+Interactive and voice runs perform only bounded local preparation before
+inference: authorization from the current decision, budget reservation, the
+recent signed-log tail, and instant lexical recall from a warm memory snapshot.
+Requests that explicitly need older context add a synchronous local semantic
+lookup. Log/vault discovery and embedding refresh in the background; relay
+publication is never part of the response path. Each run reports admission,
+memory, first-text, engine, tool, and checkpoint timings in its live checkpoint.
+
+## Apiary control MCP
+
+Every host exposes a stateless MCP endpoint at `POST /mcp`. It supports:
+
+- `apiary_describe`
+- `apiary_list_agents`
+- `apiary_get_agent_environment`
+- `apiary_request`
+
+Human callers authenticate with NIP-98. A hosted manager agent can create a
+time-limited `apiary_…` bearer token from its agent page. Tokens identify the
+caller but grant no additional authority: each operation re-enters the same
+host and per-agent authorization checks used by the desktop and REST API.
+
+Credential plaintext, host unlock, key export, and other sensitive local
+operations are intentionally unavailable through control MCP.
+
+## OpenBot and standard AG-UI clients
+
+Every agent exposes a standard AG-UI endpoint:
+
+```text
+https://your-apiary-host/api/agents/<agent-npub>/ag-ui
 ```
-crates/apiary-core      manifest, identity, custody, keystore, log, ceremony — the substrate
-crates/apiary-runtime   inference providers, routing, spend authority, run loop
-crates/apiary-cli       `apiary` — the host's JSON front door
-crates/apiary-hostd     lib + daemon: REST + AG-UI SSE + NIP-98 auth + cockpit at /
-crates/apiary-desktop   Tauri app: the hostd router in-process, cockpit in a native window
-docs/SPEC.md            the design: architecture, governance, failure modes, phases
+
+In the agent's **Agent access and integrations** panel, create a time-bounded
+access token. Register the endpoint as an OpenBot coworker and store this
+write-only header in OpenBot:
+
+```text
+Authorization: Bearer apiary_…
 ```
+
+The credential is signed by the agent, revocable, limited to 90 days, and may
+run only that same agent. It cannot edit or ratify the agent. OpenBot's standing
+system role does not replace the ratified Apiary constitution, and tools
+advertised by the AG-UI caller are refused rather than inherited. Grant tools
+through Apiary connectors or its governed MCP gateway instead; OpenBot remains
+an optional conversation surface, not a second authority store. Its browser,
+files, and other computer tools remain unavailable to the Apiary agent until
+they are exposed through a separately ratified governed bridge.
+
+## Security model
+
+Apiary is designed around narrow authority and explicit transitions:
+
+- Nostr/BIP-340 agent identity with encrypted key custody
+- signed manifests, ratification, and tamper-evident logs
+- per-agent encrypted credentials and default-deny capability grants
+- DNS and redirect checks for public web access
+- jailed roots for file, Git, and vault connectors
+- scrubbed environments for connector and harness subprocesses
+- authenticated remote control with a local management audit chain
+- single-host presence leases with human-controlled takeover
+
+See [docs/SPEC.md](docs/SPEC.md) for architecture, failure modes, schemas, and
+protocol details. Apiary is security-sensitive software and has not yet had an
+independent security audit.
+
+## Repository layout
+
+```text
+crates/apiary-core      identity, manifests, custody, logs, and ratification
+crates/apiary-runtime   inference, routing, budgets, memory, tools, and runs
+crates/apiary-cli       command-line interface
+crates/apiary-hostd     daemon, REST/AG-UI, MCP control, auth, and web cockpit
+crates/apiary-desktop   Tauri desktop app and remote-backend switcher
+docs                    design and plugin specifications
+```
+
+Useful references:
+
+- [System specification](docs/SPEC.md)
+- [Channel plugin protocol](docs/CHANNEL_PLUGINS.md)
+- [Presence plugin scope](docs/SCOPE_presence-plugins.md)
+- [Routines scope](docs/SCOPE_routines.md)
+- [Sealed handoffs scope](docs/SCOPE_sealed-handoffs.md)
+- [Voice and modalities scope](docs/SCOPE_voice-and-modalities.md)
+- [Release checklist](docs/RELEASE.md)
+- [Backup and recovery runbook](docs/RECOVERY.md)
+- [Security policy](SECURITY.md)
+
+## Development
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Please keep security boundaries visible in code and documentation. New tools
+should enter through a governed connector or harness grant rather than an
+implicit environment capability.
+
+## Roadmap
+
+- NIP-46 remote-signer custody
+- OS sandbox coverage for additional ACP environments
+- relay delivery for sealed handoffs
+- signed-log checkpointing and compaction
+- independent security review
+
+## Companion: apiary-voice
+
+[apiary-voice](https://github.com/prellr/apiary-voice) is an optional macOS
+voice companion. It performs local transcription and speech, while tasks still
+enter through Apiary's governed run endpoint.
 
 ## License
 
 Apache-2.0
-
-## Companion: apiary-voice
-
-[prellr/apiary-voice](https://github.com/prellr/apiary-voice) is the voice
-companion for Apiary agents — a menu-bar Mac app: hold a key (or just talk;
-Silero VAD decides turns), your words are transcribed on-device, sent to the
-agent through the host's governed run endpoint, and the reply comes back
-spoken (system voice or a local Kokoro server) with the text in a small HUD.
-Routines that deliver to `companion` are spoken through it. Voice never
-crosses the wire.

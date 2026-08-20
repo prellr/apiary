@@ -26,9 +26,9 @@ struct Args {
     /// (default: http://<bind>). Must match what clients see exactly.
     #[arg(long)]
     origin: Option<String>,
-    /// Host administrator npubs (nip98 mode): required for host-scoped
-    /// operations — founding, importing, connector library, lock/unlock.
-    /// Repeatable. Without any, those operations refuse in nip98 mode.
+    /// Bootstrap host-manager npubs (nip98 mode). Repeatable. Managers added
+    /// later in People & access persist, so this flag is only required for
+    /// first setup or recovery.
     #[arg(long = "admin")]
     admins: Vec<String>,
 }
@@ -64,20 +64,47 @@ async fn main() {
             eprintln!("error: --admin: {e}");
             std::process::exit(2);
         });
+    let managers =
+        apiary_hostd::access::ManagerRegistry::load(&args.home, admins).unwrap_or_else(|error| {
+            eprintln!("error: host manager registry: {error}");
+            std::process::exit(2);
+        });
+    let desktop_token = apiary_core::identity::generate()
+        .secret_key()
+        .to_secret_hex();
     let state = Arc::new(AppState {
         home: args.home.clone(),
         passphrase: std::sync::RwLock::new(args.passphrase.clone()),
+        remember_passphrase: None,
+        forget_passphrase: None,
+        automatic_unlock: std::sync::atomic::AtomicBool::new(false),
         auth,
         origin: args
             .origin
             .clone()
             .unwrap_or_else(|| format!("http://{}", args.bind)),
         token: None,
+        browser_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+        desktop_token: Some(desktop_token),
+        internal_token: apiary_core::identity::generate()
+            .secret_key()
+            .to_secret_hex(),
+        control_audit: std::sync::Mutex::new(()),
+        control_tokens: std::sync::Mutex::new(()),
         listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
         pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
         supervisor_notes: std::sync::Mutex::new(std::collections::HashMap::new()),
         admitted: std::sync::Mutex::new(std::collections::HashMap::new()),
-        admins,
+        decisions: Default::default(),
+        managers: std::sync::RwLock::new(managers),
+    });
+    apiary_hostd::write_control_discovery(&state).unwrap_or_else(|error| {
+        eprintln!("error: control-plane discovery: {error}");
+        std::process::exit(2);
+    });
+    apiary_hostd::write_desktop_access(&state).unwrap_or_else(|error| {
+        eprintln!("error: desktop access discovery: {error}");
+        std::process::exit(2);
     });
     apiary_hostd::ops::spawn_supervisor(state.clone());
     let app = build_router(state);

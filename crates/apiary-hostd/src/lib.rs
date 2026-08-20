@@ -8,18 +8,26 @@
 //! the Tauri desktop app build the same router — the GUI is a client
 //! (SPEC §2), never a second implementation.
 
+pub mod access;
 pub mod agui;
+pub mod control_mcp;
+pub mod decision_gate;
 pub mod events;
 pub mod nip98;
 pub mod ops;
 pub mod routines;
 
 use apiary_core::{
-    ceremony, custody::Custody, keystore::Keystore, log::EpisodicLog, manifest::Manifest,
+    ceremony,
+    custody::Custody,
+    keystore::Keystore,
+    log::EpisodicLog,
+    manifest::{Constitution, Manifest},
 };
 use axum::{
     extract::{OriginalUri, Path as AxPath, Query, State},
     http::StatusCode,
+    middleware,
     response::{Html, IntoResponse},
     routing::{get, post},
     Json, Router,
@@ -29,26 +37,53 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub type RememberPassphrase = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync + 'static>;
+pub type ForgetPassphrase = Arc<dyn Fn() -> Result<(), String> + Send + Sync + 'static>;
+
 pub struct AppState {
     pub home: PathBuf,
     /// Unlockable at runtime (GUI unlock screen) — None means locked:
     /// reads work, anything needing key material refuses.
     pub passphrase: std::sync::RwLock<Option<String>>,
+    /// Desktop-only Keychain writer. The daemon remains portable and keeps
+    /// its existing explicit-unlock behavior when this is absent.
+    pub remember_passphrase: Option<RememberPassphrase>,
+    pub forget_passphrase: Option<ForgetPassphrase>,
+    pub automatic_unlock: std::sync::atomic::AtomicBool,
     pub auth: AuthMode,
     /// Canonical origin for exact NIP-98 URL matching.
     pub origin: String,
-    /// HOST administrators (nip98 mode): only these keys may perform
+    /// HOST managers (nip98 mode): only these keys may perform
     /// host-scoped operations — founding/importing agents, editing the
     /// connector library, locking/unlocking. Per-agent operations stay
     /// governor-bound to that agent's suspend keys; this list is the
     /// authority over the HOST itself (its keystore slots, its inference
-    /// credentials, its configuration). Empty in nip98 mode = host-scoped
+    /// credentials, its configuration). CLI `--admin` entries bootstrap the
+    /// persistent manager registry. Empty in nip98 mode = host-scoped
     /// operations refuse, loudly.
-    pub admins: Vec<nostr::prelude::PublicKey>,
+    pub managers: std::sync::RwLock<access::ManagerRegistry>,
     /// Per-launch bearer token (desktop mode). When set, EVERY request must
     /// present it — the desktop webview gets it in its boot URL, so other
     /// local processes cannot drive the embedded daemon.
     pub token: Option<String>,
+    /// Short-lived browser sessions created by one NIP-98 signature. The
+    /// cookie is only authentication; every route still applies the ordinary
+    /// host-manager or per-agent authorization gate to the bound signer.
+    pub browser_sessions:
+        std::sync::Mutex<std::collections::HashMap<String, nip98::BrowserSession>>,
+    /// Per-process credential published only into the host's 0600 state
+    /// directory. A desktop client that already authenticated over SSH may
+    /// exchange it for an ordinary manager-bound browser session. It is
+    /// replaced on every daemon launch and is never accepted as API auth.
+    pub desktop_token: Option<String>,
+    /// Process-private capability used only when the MCP control adapter
+    /// dispatches into the existing REST router. This preserves one set of
+    /// authorization gates without trusting caller-supplied identity headers.
+    pub internal_token: String,
+    /// Serializes the hash-chained MCP control audit file.
+    pub control_audit: std::sync::Mutex<()>,
+    /// Serializes the persistent control-token registry and revocation checks.
+    pub control_tokens: std::sync::Mutex<()>,
     /// Managed Buzz mention listeners, one per agent.
     pub listeners: std::sync::Mutex<std::collections::HashMap<String, ops::AgentPresence>>,
     /// In-flight OAuth grants, keyed by the `state` parameter.
@@ -61,12 +96,54 @@ pub struct AppState {
     /// posture as holding the passphrase, which derives exactly these;
     /// cleared on lock. Keyed by npub.
     pub admitted: std::sync::Mutex<std::collections::HashMap<String, nostr::prelude::Keys>>,
+    /// Off-chain projection of signed governance decisions. It never grants
+    /// authority of its own: configuration changes select a new cache key
+    /// and signed history is re-evaluated before the answer can become true.
+    pub decisions: decision_gate::DecisionGate,
 }
 
 impl AppState {
     pub fn passphrase_clone(&self) -> Option<String> {
         self.passphrase.read().ok().and_then(|g| g.clone())
     }
+}
+
+/// Publish the current control-plane address for local agents. The file is
+/// only discovery metadata—never a bearer token—and lets portable manifests
+/// use `apiary://local/mcp` across desktop port changes and headless hosts.
+pub fn write_control_discovery(state: &AppState) -> Result<(), std::io::Error> {
+    std::fs::create_dir_all(&state.home)?;
+    let path = state.home.join("control.json");
+    let body = serde_json::to_vec_pretty(&json!({
+        "url": format!("{}/mcp", state.origin.trim_end_matches('/')),
+        "host_id": apiary_runtime::lease::host_id(&state.home),
+    }))?;
+    std::fs::write(&path, body)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// Publish the ephemeral SSH-to-desktop session credential. Reading this
+/// file requires the same OS account that can administer the headless host;
+/// public HTTP clients never receive it.
+pub fn write_desktop_access(state: &AppState) -> Result<(), std::io::Error> {
+    let Some(token) = state.desktop_token.as_deref() else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(&state.home)?;
+    let path = state.home.join("desktop-access.json");
+    let body = serde_json::to_vec(&json!({ "version": 1, "token": token }))?;
+    std::fs::write(&path, body)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -81,10 +158,28 @@ pub type App = Arc<AppState>;
 pub fn build_router(state: App) -> Router {
     Router::new()
         .route("/", get(cockpit))
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/app.js", get(cockpit_js))
+        .route("/signin.js", get(signin_js))
         .route("/api/status", get(ops::status))
+        .route(
+            "/api/session",
+            post(ops::browser_session_create).delete(ops::browser_session_delete),
+        )
+        .route("/api/desktop/session", post(ops::desktop_session_create))
         .route("/api/unlock", post(ops::unlock))
+        .route("/api/unlock/forget", post(ops::forget_automatic_unlock))
         .route("/api/lock", post(ops::lock))
+        .route("/api/owners", get(ops::owners_get).post(ops::owners_create))
+        .route(
+            "/api/managers",
+            get(ops::managers_get).post(ops::managers_upsert),
+        )
+        .route(
+            "/api/managers/{npub}",
+            axum::routing::delete(ops::managers_remove),
+        )
         .route("/api/key", get(ops::key_normalize))
         .route(
             "/api/connectors",
@@ -93,6 +188,9 @@ pub fn build_router(state: App) -> Router {
         .route("/api/connectors/discover", post(ops::connectors_discover))
         .route("/api/host/pick-folder", post(ops::pick_folder))
         .route("/api/events", get(events::events))
+        .route("/api/control/audit", get(ops::control_audit_get))
+        .route("/api/control/tokens", get(ops::control_tokens_all_get))
+        .route("/mcp", post(control_mcp::handle))
         .route(
             "/api/agents/{npub}/connectors/{name}/discover",
             post(ops::agent_connector_discover),
@@ -114,13 +212,70 @@ pub fn build_router(state: App) -> Router {
             get(get_manifest).put(put_manifest),
         )
         .route("/api/agents/{npub}/ratify", post(ratify_agent))
+        .route(
+            "/api/agents/{npub}/control-token",
+            post(ops::control_token_issue),
+        )
+        .route(
+            "/api/agents/{npub}/control-tokens",
+            get(ops::control_tokens_get),
+        )
+        .route(
+            "/api/agents/{npub}/control-tokens/{id}",
+            axum::routing::delete(ops::control_token_revoke),
+        )
+        .route(
+            "/api/agents/{npub}/constitution",
+            post(ops::constitution_set),
+        )
+        .route(
+            "/api/agents/{npub}/skills",
+            get(ops::skills_get).post(ops::skill_upsert),
+        )
+        .route(
+            "/api/agents/{npub}/skills/{name}",
+            axum::routing::delete(ops::skill_delete),
+        )
+        .route(
+            "/api/agents/{npub}/harnesses",
+            get(ops::harnesses_get).post(ops::harness_upsert),
+        )
+        .route(
+            "/api/agents/{npub}/harnesses/discover",
+            get(ops::harnesses_discover),
+        )
+        .route(
+            "/api/agents/{npub}/harnesses/{name}",
+            axum::routing::delete(ops::harness_delete),
+        )
         .route("/api/agents/{npub}/ratify/export", post(ops::ratify_export))
         .route("/api/agents/{npub}/ratify/import", post(ops::ratify_import))
         .route("/api/agents/{npub}/log", get(get_log))
         .route("/api/agents/{npub}/log/publish", post(ops::log_publish))
         .route("/api/agents/{npub}/log/remote", get(ops::log_remote))
         .route("/api/agents/{npub}/run", post(agui::run_stream))
+        .route("/api/agents/{npub}/ag-ui", post(agui::run_stream))
         .route("/api/agents/{npub}/spend", get(ops::spend_status))
+        .route(
+            "/api/agents/{npub}/inference",
+            get(ops::inference_status).post(ops::inference_upsert),
+        )
+        .route(
+            "/api/agents/{npub}/inference/default",
+            post(ops::inference_set_default),
+        )
+        .route(
+            "/api/agents/{npub}/inference/fallback",
+            post(ops::inference_set_fallback),
+        )
+        .route(
+            "/api/agents/{npub}/inference/{name}/test",
+            post(ops::inference_test),
+        )
+        .route(
+            "/api/agents/{npub}/inference/{name}",
+            axum::routing::delete(ops::inference_delete),
+        )
         .route(
             "/api/agents/{npub}/credential/seal",
             post(ops::credential_seal),
@@ -135,6 +290,7 @@ pub fn build_router(state: App) -> Router {
         .route("/api/agents/{npub}/buzz/profile", post(ops::buzz_profile))
         .route("/api/agents/{npub}/buzz/join", post(ops::buzz_join))
         .route("/api/agents/{npub}/active", post(ops::set_active))
+        .route("/api/agents/{npub}/governors", post(ops::governors_set))
         .route("/api/agents/{npub}/connectors", post(ops::connector_grant))
         .route(
             "/api/agents/{npub}/connectors/oauth",
@@ -175,6 +331,45 @@ pub fn build_router(state: App) -> Router {
             get(ops::listener_status).delete(ops::listener_stop),
         )
         .with_state(state)
+        .layer(middleware::map_response(no_store))
+}
+
+/// Apiary's cockpit and APIs are private control-plane material. Apply the
+/// cache boundary centrally so a newly added route cannot accidentally be
+/// cached by a browser, reverse proxy, or CDN.
+async fn no_store(mut response: axum::response::Response) -> axum::response::Response {
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// Minimal liveness probe. It intentionally exposes no version, state path,
+/// agent roster, or authentication configuration.
+async fn healthz() -> impl IntoResponse {
+    Json(json!({ "ok": true }))
+}
+
+/// A NIP-98 host without a manager is unreachable by design and therefore not
+/// ready for public traffic. Open mode is ready because its trust boundary is
+/// the loopback/SSH listener itself.
+async fn readyz(State(state): State<App>) -> axum::response::Response {
+    let ready = state.auth == AuthMode::Open
+        || state
+            .managers
+            .read()
+            .map(|managers| !managers.is_empty())
+            .unwrap_or(false);
+    if ready {
+        Json(json!({ "ok": true })).into_response()
+    } else {
+        err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "host manager is not configured",
+        )
+        .into_response()
+    }
 }
 
 /// Restrictive CSP: no inline script, no external anything. Rendering uses
@@ -182,20 +377,60 @@ pub fn build_router(state: App) -> Router {
 const CSP: &str =
     "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'";
 
-async fn cockpit() -> impl IntoResponse {
+async fn cockpit(
+    State(state): State<App>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let authorized = cockpit_navigation_authorized(&state, &headers);
+    let document = if authorized {
+        include_str!("cockpit.html")
+    } else {
+        include_str!("signin.html")
+    };
     (
-        [("content-security-policy", CSP)],
-        Html(include_str!("cockpit.html")),
+        [
+            ("content-security-policy", CSP),
+            ("cache-control", "no-store"),
+        ],
+        Html(document),
     )
+        .into_response()
 }
 
-async fn cockpit_js() -> impl IntoResponse {
+fn cockpit_navigation_authorized(state: &AppState, headers: &axum::http::HeaderMap) -> bool {
+    state.auth == AuthMode::Open
+        || nip98::browser_navigation_signer(state, headers)
+            .ok()
+            .flatten()
+            .is_some_and(|signer| nip98::authorize_cockpit(state, Some(signer)).is_ok())
+}
+
+async fn cockpit_js(
+    State(state): State<App>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if !cockpit_navigation_authorized(&state, &headers) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     (
         [
             ("content-type", "application/javascript; charset=utf-8"),
             ("content-security-policy", CSP),
+            ("cache-control", "no-store"),
         ],
         include_str!("cockpit.js"),
+    )
+        .into_response()
+}
+
+async fn signin_js() -> impl IntoResponse {
+    (
+        [
+            ("content-type", "application/javascript; charset=utf-8"),
+            ("content-security-policy", CSP),
+            ("cache-control", "no-store"),
+        ],
+        include_str!("signin.js"),
     )
 }
 
@@ -235,26 +470,47 @@ pub fn load_manifest(
     Ok((raw, m))
 }
 
+fn snapshot_approved_manifest(dir: &std::path::Path, raw: &str) -> std::io::Result<()> {
+    let path = dir.join("manifest.approved.yaml");
+    std::fs::write(&path, raw)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 pub fn suspend_pks(manifest: &Manifest) -> Vec<PublicKey> {
-    manifest
+    let mut keys = manifest
         .governance
         .suspend_keys
         .iter()
         .filter_map(|k| apiary_core::identity::parse_npub(k).ok())
-        .collect()
+        .collect::<Vec<_>>();
+    keys.extend(
+        manifest
+            .governance
+            .managers
+            .iter()
+            .filter(|manager| manager.role == apiary_core::manifest::ManagerRole::Governor)
+            .filter_map(|manager| apiary_core::identity::parse_npub(&manager.npub).ok()),
+    );
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
-fn ratified(dir: &std::path::Path, npub: &str, raw: &str, manifest: &Manifest) -> bool {
-    let Ok(agent_pk) = apiary_core::identity::parse_npub(npub) else {
-        return false;
-    };
-    ceremony::is_ratified(
-        &EpisodicLog::open(dir),
-        raw,
-        &agent_pk,
-        &suspend_pks(manifest),
-    )
-    .unwrap_or(false)
+pub fn agent_decision(
+    state: &AppState,
+    dir: &std::path::Path,
+    npub: &str,
+    raw: &str,
+    manifest: &Manifest,
+) -> decision_gate::AgentDecision {
+    state
+        .decisions
+        .evaluate(dir, npub, raw, &suspend_pks(manifest))
 }
 
 fn path_and_query(uri: &axum::http::Uri) -> String {
@@ -284,18 +540,16 @@ async fn list_agents(
             continue;
         };
         // In nip98 mode the roster shows only agents the signer governs.
-        if nip98::authorize_governor(&state, signer, &suspend_pks(&m)).is_err() {
+        if nip98::authorize_agent_request(&state, signer, &m, "GET", &path_and_query(&uri)).is_err()
+        {
             continue;
         }
-        let entries = EpisodicLog::open(&dir)
-            .read_all()
-            .map(|v| v.len())
-            .unwrap_or(0);
+        let decision = agent_decision(&state, &dir, &npub, &raw, &m);
         agents.push(json!({
             "npub": npub,
             "name": name,
-            "ratified": ratified(&dir, &npub, &raw, &m),
-            "log_entries": entries,
+            "ratified": decision.ratified,
+            "log_entries": decision.log_entries,
             "active": ops::is_active(&dir),
             "declared_channels": m.presence.channels.keys().cloned().collect::<Vec<_>>(),
         }));
@@ -319,16 +573,20 @@ async fn get_manifest(
     };
     match load_manifest(&dir) {
         Ok((raw, m)) => {
-            if let Err(e) = nip98::authorize_governor(&state, signer, &suspend_pks(&m)) {
+            if let Err(e) =
+                nip98::authorize_agent_request(&state, signer, &m, "GET", &path_and_query(&uri))
+            {
                 return e.into_response();
             }
+            let decision = agent_decision(&state, &dir, &npub, &raw, &m);
             Json(json!({
                 "ok": true,
                 "npub": npub,
                 "yaml": raw,
+                "approved_yaml": std::fs::read_to_string(dir.join("manifest.approved.yaml")).ok(),
                 "manifest": serde_json::to_value(&m).unwrap_or_default(),
-                "ratified": ratified(&dir, &npub, &raw, &m),
-                "manifest_sha256": ceremony::manifest_hash(&raw),
+                "ratified": decision.ratified,
+                "manifest_sha256": decision.manifest_sha256,
             }))
             .into_response()
         }
@@ -362,7 +620,9 @@ async fn get_log(
     };
     match load_manifest(&dir) {
         Ok((_, m)) => {
-            if let Err(e) = nip98::authorize_governor(&state, signer, &suspend_pks(&m)) {
+            if let Err(e) =
+                nip98::authorize_agent_request(&state, signer, &m, "GET", &path_and_query(&uri))
+            {
                 return e.into_response();
             }
         }
@@ -428,7 +688,13 @@ async fn put_manifest(
     // writing a manifest that names them.
     match load_manifest(&dir) {
         Ok((_, current)) => {
-            if let Err(e) = nip98::authorize_governor(&state, signer, &suspend_pks(&current)) {
+            if let Err(e) = nip98::authorize_agent_request(
+                &state,
+                signer,
+                &current,
+                "PUT",
+                &path_and_query(&uri),
+            ) {
                 return e.into_response();
             }
         }
@@ -465,7 +731,7 @@ async fn put_manifest(
 
 #[derive(serde::Deserialize)]
 struct RatifyBody {
-    /// Ratifying human's key (npub or hex) — keystore-held, listed in suspend_keys.
+    /// Ratifying governor's key (npub or hex) — keystore-held, listed in suspend_keys.
     r#as: String,
 }
 
@@ -498,6 +764,11 @@ async fn ratify_agent(
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
+    if let Err(e) =
+        nip98::authorize_agent_request(&state, signer, &manifest, "POST", &path_and_query(&uri))
+    {
+        return e.into_response();
+    }
     let as_key = match normalize(&body.r#as) {
         Ok(k) => k,
         Err(e) => return e.into_response(),
@@ -514,10 +785,10 @@ async fn ratify_agent(
         }
         Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
     };
-    // A host-held human key signs ONLY for the person who proved possession
+    // A host-held governor key signs ONLY for the identity that proved possession
     // of that same key: in nip98 mode the request signer must BE the
     // ratifier. (Open mode is local trust — same as holding the keystore.)
-    if state.auth == AuthMode::Nip98 && signer != Some(ratifier_pk) {
+    if signer.is_some() && signer != Some(ratifier_pk) {
         return err(
             StatusCode::FORBIDDEN,
             "ratification must be signed by the ratifying key itself (as == request signer)",
@@ -545,14 +816,23 @@ async fn ratify_agent(
     let result = ceremony::sign_manifest(&custody, &agent_handle, &log, &raw)
         .and_then(|s| ceremony::ratify(&custody, &human_handle, &log, &npub, &raw).map(|r| (s, r)));
     match result {
-        Ok((signed, ratified)) => Json(json!({
-            "ok": true,
-            "npub": npub,
-            "ratified_by": as_key,
-            "manifest_sha256": ceremony::manifest_hash(&raw),
-            "events": {"signed": signed.id.to_hex(), "ratified": ratified.id.to_hex()},
-        }))
-        .into_response(),
+        Ok((signed, ratified)) => {
+            // The signatures are authoritative. A failed review snapshot
+            // must not report the already-completed ceremony as failed.
+            let snapshot_warning = snapshot_approved_manifest(&dir, &raw)
+                .err()
+                .map(|e| e.to_string());
+            state.decisions.invalidate(&npub);
+            Json(json!({
+                "ok": true,
+                "npub": npub,
+                "ratified_by": as_key,
+                "manifest_sha256": ceremony::manifest_hash(&raw),
+                "events": {"signed": signed.id.to_hex(), "ratified": ratified.id.to_hex()},
+                "snapshot_warning": snapshot_warning,
+            }))
+            .into_response()
+        }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -598,10 +878,13 @@ async fn found_agent(
         Ok(b) => b,
         Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
     };
+    if body.purpose.trim().is_empty() {
+        return err(StatusCode::BAD_REQUEST, "agent purpose is required").into_response();
+    }
     if body.suspend_keys.is_empty() {
         return err(
             StatusCode::BAD_REQUEST,
-            "at least one human suspend key is required",
+            "at least one independent governor identity is required",
         )
         .into_response();
     }
@@ -648,8 +931,9 @@ async fn found_agent(
         return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
 
-    let template = template_manifest(&npub, &suspend);
-    let (yaml, drafted_by) = if body.draft_with.as_deref() == Some("anthropic") {
+    let purpose = body.purpose.trim().to_string();
+    let template = template_manifest(&npub, &suspend, &purpose);
+    let (draft, drafted_by) = if body.draft_with.as_deref() == Some("anthropic") {
         match draft_manifest_with_model(&npub, &body.purpose, &suspend, &template).await {
             Ok(y) => (y, "anthropic"),
             Err(e) => {
@@ -662,10 +946,20 @@ async fn found_agent(
     };
     // Whatever drafted it, it must parse and pass invariants — or we fall
     // back to the template rather than storing an invalid constitution.
-    let (yaml, drafted_by) = match Manifest::from_yaml(&yaml) {
-        Ok(_) => (yaml, drafted_by),
-        Err(_) => (template, "template (model draft invalid)"),
+    let (mut manifest, drafted_by) = match Manifest::from_yaml(&draft) {
+        Ok(manifest) => (manifest, drafted_by),
+        Err(_) => (
+            Manifest::from_yaml(&template).expect("founding template must be valid"),
+            "template (model draft invalid)",
+        ),
     };
+    // The user's purpose is authoritative input, not something the drafting
+    // model may paraphrase away. Model-authored role/voice details remain a
+    // reviewable proposal around that fixed purpose.
+    manifest.constitution.purpose = purpose;
+    let yaml = manifest
+        .to_yaml()
+        .expect("validated founding manifest must serialize");
     let dir = ks.agent_dir(&npub);
     if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml)
         .and_then(|_| std::fs::write(dir.join("name"), &body.name))
@@ -684,11 +978,21 @@ async fn found_agent(
     .into_response()
 }
 
-fn template_manifest(npub: &str, suspend: &[String]) -> String {
+fn template_manifest(npub: &str, suspend: &[String], purpose: &str) -> String {
     let keys: String = suspend.iter().map(|k| format!("    - {k}\n")).collect();
+    let constitution = serde_yaml::to_string(&Constitution {
+        purpose: purpose.to_string(),
+        ..Default::default()
+    })
+    .expect("constitution must serialize");
+    let constitution = constitution
+        .lines()
+        .map(|line| format!("  {line}\n"))
+        .collect::<String>();
     format!(
         "manifest_version: 1\n\
          identity:\n  npub: {npub}\n\
+         constitution:\n{constitution}\
          inference:\n\
          - name: workhorse\n  provider: anthropic\n  model: claude-opus-5\n\
          routing:\n  default: workhorse\n\
@@ -719,7 +1023,9 @@ async fn draft_manifest_with_model(
                       no fences, no commentary. Constraints: manifest_version 1; identity.npub \
                       exactly as given; suspend_keys exactly as given; connectors only from: \
                       nostr-publish (needs caps.relays list). Budgets conservative. The routing \
-                      pool may use providers: anthropic, ollama. Follow the template's shape.";
+                      pool may use providers: anthropic, ollama. Preserve constitution.purpose \
+                      exactly; add a concise role, voice, principles, and boundaries that fit it. \
+                      Follow the template's shape.";
         let prompt = format!(
             "Template:\n{template}\nAgent npub: {npub}\nSuspend keys: {suspend:?}\n\
              Purpose of this agent: {purpose}\n\nDraft the manifest YAML."
@@ -753,22 +1059,210 @@ pub fn admit_agent(
     let pass = state
         .passphrase_clone()
         .ok_or("keystore is locked — unlock with the passphrase first")?;
-    let cached = state
-        .admitted
-        .lock()
-        .ok()
-        .and_then(|m| m.get(npub).cloned());
-    let keys = match cached {
-        Some(k) => k,
-        None => {
-            let k = ks.load(npub, &pass).map_err(|e| e.to_string())?;
-            if let Ok(mut m) = state.admitted.lock() {
-                m.insert(npub.to_string(), k.clone());
-            }
-            k
+    // Hold the small admission lock across the deliberately expensive load.
+    // Without this, Buzz, Telegram, the lease keeper, and a concurrent task
+    // can all miss the cache together and perform the same NIP-49 KDF. Key
+    // admission is rare; serializing it is substantially cheaper and avoids
+    // a CPU spike while channels appear stuck in "Starting".
+    let keys = {
+        let mut admitted = state
+            .admitted
+            .lock()
+            .map_err(|_| "agent admission cache is unavailable".to_string())?;
+        if let Some(keys) = admitted.get(npub) {
+            keys.clone()
+        } else {
+            let keys = ks.load(npub, &pass).map_err(|e| e.to_string())?;
+            admitted.insert(npub.to_string(), keys.clone());
+            keys
         }
     };
     let mut custody = Custody::new();
     let handle = custody.admit(keys);
     Ok((custody, handle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::access::ManagerRegistry;
+    use apiary_core::identity;
+    use axum::{body::Body, http::Request};
+    use nostr::prelude::Keys;
+    use tower::ServiceExt;
+
+    fn test_state(auth: AuthMode) -> App {
+        test_state_with(auth, Vec::new(), None)
+    }
+
+    fn test_state_with(
+        auth: AuthMode,
+        managers: Vec<nostr::prelude::PublicKey>,
+        desktop_token: Option<&str>,
+    ) -> App {
+        let home = std::env::temp_dir().join(format!(
+            "apiary-hostd-router-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        Arc::new(AppState {
+            home,
+            passphrase: std::sync::RwLock::new(None),
+            remember_passphrase: None,
+            forget_passphrase: None,
+            automatic_unlock: std::sync::atomic::AtomicBool::new(false),
+            auth,
+            origin: "https://apiary.example".into(),
+            managers: std::sync::RwLock::new(ManagerRegistry::in_memory(managers)),
+            token: None,
+            browser_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            desktop_token: desktop_token.map(str::to_string),
+            internal_token: "router-test-internal".into(),
+            control_audit: std::sync::Mutex::new(()),
+            control_tokens: std::sync::Mutex::new(()),
+            listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
+            pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
+            supervisor_notes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            admitted: std::sync::Mutex::new(std::collections::HashMap::new()),
+            decisions: Default::default(),
+        })
+    }
+
+    #[test]
+    fn founding_template_persists_the_exact_purpose() {
+        let agent = identity::to_npub(&Keys::generate().public_key()).unwrap();
+        let human = identity::to_npub(&Keys::generate().public_key()).unwrap();
+        let purpose = "Research markets: distinguish facts from inference\nand cite sources.";
+        let yaml = template_manifest(&agent, &[human], purpose);
+        let manifest = Manifest::from_yaml(&yaml).unwrap();
+        assert_eq!(manifest.constitution.purpose, purpose);
+    }
+
+    #[test]
+    fn public_sign_in_page_does_not_disclose_the_cockpit() {
+        let page = include_str!("signin.html");
+        assert!(page.contains("Authentication required"));
+        assert!(page.contains("Sign in with Nostr"));
+        for private_label in ["New agent", "People &amp; access", "Host status", "Agents"] {
+            assert!(!page.contains(private_label));
+        }
+        assert!(!page.contains("/app.js"));
+    }
+
+    #[tokio::test]
+    async fn every_control_plane_response_is_marked_no_store() {
+        let app = build_router(test_state(AuthMode::Nip98));
+        for path in ["/", "/app.js", "/api/status"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.headers().get(axum::http::header::CACHE_CONTROL),
+                Some(&axum::http::HeaderValue::from_static("no-store")),
+                "missing private cache boundary on {path}"
+            );
+            if path == "/app.js" {
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn health_is_public_but_nip98_readiness_requires_a_manager() {
+        let app = build_router(test_state(AuthMode::Nip98));
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        let readiness = app
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let open = build_router(test_state(AuthMode::Open))
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(open.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ssh_desktop_credential_opens_only_a_manager_bound_session() {
+        let manager = Keys::generate().public_key();
+        let token = "11".repeat(32);
+        let app = build_router(test_state_with(
+            AuthMode::Nip98,
+            vec![manager],
+            Some(&token),
+        ));
+        let request = |authorization: Option<String>| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/api/desktop/session")
+                .header("content-type", "application/json");
+            if let Some(authorization) = authorization {
+                request = request.header("authorization", authorization);
+            }
+            request.body(Body::from("{}")).unwrap()
+        };
+
+        let refused = app.clone().oneshot(request(None)).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+
+        let accepted = app
+            .clone()
+            .oneshot(request(Some(format!("Bearer {token}"))))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let cookie = accepted
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(cookie.starts_with("apiary_session="));
+        assert!(!cookie.contains("Secure"));
+        let cookie = cookie.split(';').next().unwrap();
+
+        let cockpit = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cockpit.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(cockpit.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("New agent"));
+    }
 }
