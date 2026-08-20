@@ -97,11 +97,91 @@ pub struct EpisodicLog {
     path: PathBuf,
 }
 
+/// Rebuildable operational metadata for the append-only log. It is never
+/// consulted for signature or chain verification; it exists so UI/status
+/// reads do not rescan years of history just to display a count.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LogProjection {
+    version: u8,
+    byte_len: u64,
+    entry_count: usize,
+    tip: Option<String>,
+}
+
+const LOG_PROJECTION_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogSummary {
+    pub byte_len: u64,
+    pub entry_count: usize,
+    pub tip: Option<String>,
+}
+
 impl EpisodicLog {
     pub fn open(agent_dir: &std::path::Path) -> Self {
         Self {
             path: agent_dir.join("log.jsonl"),
         }
+    }
+
+    fn projection_path(&self) -> PathBuf {
+        self.path.with_file_name("log.meta.json")
+    }
+
+    fn write_projection(&self, projection: &LogProjection) -> Result<(), crate::Error> {
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(self.projection_path())?;
+        serde_json::to_writer(&mut file, projection)?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        Ok(())
+    }
+
+    /// Load the tiny projection when it matches the append-only file length;
+    /// otherwise rebuild it once. A torn or deleted projection only costs one
+    /// scan and can never change the signed log's authority.
+    fn projection_locked(&self) -> Result<LogProjection, crate::Error> {
+        let byte_len = self.path.metadata().map(|m| m.len()).unwrap_or(0);
+        if let Ok(raw) = fs::read_to_string(self.projection_path()) {
+            if let Ok(projection) = serde_json::from_str::<LogProjection>(&raw) {
+                if projection.version == LOG_PROJECTION_VERSION && projection.byte_len == byte_len {
+                    return Ok(projection);
+                }
+            }
+        }
+
+        let mut entry_count = 0;
+        let mut last_line = None;
+        if self.path.exists() {
+            for line in BufReader::new(fs::File::open(&self.path)?).lines() {
+                let line = line?;
+                if !line.trim().is_empty() {
+                    entry_count += 1;
+                    last_line = Some(line);
+                }
+            }
+        }
+        let tip = last_line
+            .map(|line| {
+                Event::from_json(&line)
+                    .map(|event| event.id.to_hex())
+                    .map_err(|e| crate::Error::Manifest(format!("corrupt log tail: {e}")))
+            })
+            .transpose()?;
+        let projection = LogProjection {
+            version: LOG_PROJECTION_VERSION,
+            byte_len,
+            entry_count,
+            tip,
+        };
+        self.write_projection(&projection)?;
+        Ok(projection)
     }
 
     /// Append an entry: signed by the agent (or, for ratification, by the
@@ -155,6 +235,7 @@ impl EpisodicLog {
         body: &EntryBody,
         extra_tags: Vec<Tag>,
     ) -> Result<Event, crate::Error> {
+        let projection = self.projection_locked()?;
         // The chain only needs the current tip. Reading the complete history
         // here made every append O(history): a busy agent became slower for
         // no governance benefit. Tail reading is bounded from the end.
@@ -179,6 +260,13 @@ impl EpisodicLog {
         }
         let mut file = opts.open(&self.path)?;
         writeln!(file, "{}", event.as_json())?;
+        file.flush()?;
+        self.write_projection(&LogProjection {
+            version: LOG_PROJECTION_VERSION,
+            byte_len: file.metadata()?.len(),
+            entry_count: projection.entry_count + 1,
+            tip: Some(event.id.to_hex()),
+        })?;
         Ok(event)
     }
 
@@ -204,6 +292,7 @@ impl EpisodicLog {
         let lock = lock_options.open(lock_path)?;
         fs2::FileExt::lock_exclusive(&lock)
             .map_err(|e| crate::Error::Log(format!("log lock: {e}")))?;
+        let projection = self.projection_locked()?;
         let mut opts = OpenOptions::new();
         opts.create(true).append(true);
         #[cfg(unix)]
@@ -212,7 +301,17 @@ impl EpisodicLog {
             opts.mode(0o600);
         }
         let mut file = opts.open(&self.path)?;
-        let result = writeln!(file, "{}", event.as_json()).map_err(crate::Error::from);
+        let result = (|| -> Result<(), crate::Error> {
+            writeln!(file, "{}", event.as_json())?;
+            file.flush()?;
+            self.write_projection(&LogProjection {
+                version: LOG_PROJECTION_VERSION,
+                byte_len: file.metadata()?.len(),
+                entry_count: projection.entry_count + 1,
+                tip: Some(event.id.to_hex()),
+            })?;
+            Ok(())
+        })();
         let _ = fs2::FileExt::unlock(&lock);
         result
     }
@@ -238,18 +337,29 @@ impl EpisodicLog {
 
     /// Number of stored records without parsing or verifying them. Counts are
     /// operational UI metadata; admission continues to use signed events.
+    pub fn derived_summary(&self) -> Result<LogSummary, crate::Error> {
+        let lock_path = self.path.with_extension("lock");
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let lock = options.open(lock_path)?;
+        fs2::FileExt::lock_exclusive(&lock)
+            .map_err(|e| crate::Error::Log(format!("log lock: {e}")))?;
+        let result = self.projection_locked().map(|projection| LogSummary {
+            byte_len: projection.byte_len,
+            entry_count: projection.entry_count,
+            tip: projection.tip,
+        });
+        let _ = fs2::FileExt::unlock(&lock);
+        result
+    }
+
     pub fn entry_count(&self) -> Result<usize, crate::Error> {
-        if !self.path.exists() {
-            return Ok(0);
-        }
-        let reader = BufReader::new(fs::File::open(&self.path)?);
-        let mut count = 0;
-        for line in reader.lines() {
-            if !line?.trim().is_empty() {
-                count += 1;
-            }
-        }
-        Ok(count)
+        self.derived_summary().map(|summary| summary.entry_count)
     }
 
     fn tail_lines(&self, n: usize) -> Result<Vec<String>, crate::Error> {
@@ -373,6 +483,14 @@ mod tests {
         assert!(tail
             .iter()
             .all(|event| { EpisodicLog::parse_body(event).unwrap().action == "run.task" }));
+        let projection = dir.join("log.meta.json");
+        assert!(projection.is_file());
+        fs::write(&projection, "not valid json").unwrap();
+        assert_eq!(log.entry_count().unwrap(), 3);
+        let rebuilt: LogProjection =
+            serde_json::from_str(&fs::read_to_string(projection).unwrap()).unwrap();
+        assert_eq!(rebuilt.entry_count, 3);
+        assert_eq!(rebuilt.tip, tail.last().map(|event| event.id.to_hex()));
         fs::remove_dir_all(&dir).ok();
     }
 

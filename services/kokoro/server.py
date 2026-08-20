@@ -37,6 +37,7 @@ DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 LANG = {"a": "American English", "b": "British English"}
 _pipelines = {}
 _lock = threading.Lock()
+_synthesis_lock = threading.Lock()
 
 # Kokoro v1.0 voice ids (prefix: a=American, b=British; f/m = female/male).
 VOICES = [
@@ -57,14 +58,18 @@ def pipeline(lang_code):
 
 
 def synthesize(text, voice, speed):
-    lang = voice[0] if voice[:1] in LANG else "a"
-    pipe = pipeline(lang)
-    chunks = []
-    for _, _, audio in pipe(text, voice=voice, speed=speed):
-        chunks.append(audio.detach().cpu().numpy() if hasattr(audio, "detach") else np.asarray(audio))
-    if not chunks:
-        return np.zeros(0, dtype=np.float32)
-    return np.concatenate(chunks).astype(np.float32)
+    # MPS forward passes contend rather than parallelize. Serialize them so
+    # a cancelled warm-up or a later sentence cannot multiply first-audio
+    # latency for the sentence the user is actually waiting to hear.
+    with _synthesis_lock:
+        lang = voice[0] if voice[:1] in LANG else "a"
+        pipe = pipeline(lang)
+        chunks = []
+        for _, _, audio in pipe(text, voice=voice, speed=speed):
+            chunks.append(audio.detach().cpu().numpy() if hasattr(audio, "detach") else np.asarray(audio))
+        if not chunks:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(chunks).astype(np.float32)
 
 
 def to_wav(pcm):

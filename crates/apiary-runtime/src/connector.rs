@@ -769,6 +769,47 @@ fn bounded_text(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
+const MAX_WEB_FETCH_OUTPUT_CHARS: usize = 32_768;
+
+fn compact_web_text(value: &str) -> String {
+    let mut out = String::with_capacity(value.len().min(MAX_WEB_FETCH_OUTPUT_CHARS));
+    let mut previous_blank = false;
+    for line in value.lines() {
+        let line = line.trim_end();
+        let blank = line.trim().is_empty();
+        if blank && previous_blank {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(line);
+        previous_blank = blank;
+    }
+    out.trim().to_string()
+}
+
+fn readable_web_body(
+    content_type: &str,
+    bytes: &[u8],
+    max_chars: usize,
+) -> Result<(String, bool), crate::Error> {
+    let raw = if matches!(content_type, "text/html" | "application/xhtml+xml") {
+        html2text::from_read(bytes, 100)
+            .map_err(|error| crate::Error::Provider(format!("render HTML: {error}")))?
+    } else if content_type == "application/json" {
+        serde_json::from_slice::<Value>(bytes)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|_| String::from_utf8_lossy(bytes).into_owned())
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    let compact = compact_web_text(&raw);
+    let limit = max_chars.min(MAX_WEB_FETCH_OUTPUT_CHARS);
+    let truncated = compact.chars().count() > limit;
+    Ok((bounded_text(&compact, limit), truncated))
+}
+
 fn normalize_brave_results(query: &str, offset: u64, max_results: usize, payload: &Value) -> Value {
     let results = payload
         .pointer("/web/results")
@@ -884,7 +925,8 @@ impl Connector for WebFetch {
         ToolDef {
             name: "web_fetch".into(),
             description: format!(
-                "Read a text, HTML, JSON, or XML page over HTTPS from {access}. \
+                "Read a text, HTML, JSON, or XML page over HTTPS from {access}. HTML is \
+                 converted to compact readable text and model-visible output is bounded. \
                  Private networks, credentials in URLs, unapproved redirects, \
                  binary bodies, and responses above the configured limit are refused.",
             ),
@@ -974,12 +1016,14 @@ impl Connector for WebFetch {
                 .map_err(|e| crate::Error::Provider(format!("read response: {e}")))?;
             let truncated = bytes.len() > self.max_bytes;
             bytes.truncate(self.max_bytes);
+            let (body, output_truncated) =
+                readable_web_body(&content_type, &bytes, self.max_bytes)?;
             return Ok(json!({
                 "url": url.as_str(),
                 "status": status.as_u16(),
                 "content_type": content_type,
-                "truncated": truncated,
-                "body": String::from_utf8_lossy(&bytes),
+                "truncated": truncated || output_truncated,
+                "body": body,
             })
             .to_string());
         }
@@ -2288,6 +2332,35 @@ mod connector_security_tests {
         assert!(public_ip(IpAddr::V6(
             "2606:4700:4700::1111".parse().unwrap()
         )));
+    }
+
+    #[test]
+    fn web_fetch_html_is_readable_and_model_bounded() {
+        let html = format!(
+            "<html><head><title>Apiary docs</title><script>{}</script></head>\
+             <body><main><h1>Codex CLI</h1><p>{}</p></main></body></html>",
+            "ignored-script".repeat(10_000),
+            "useful documentation ".repeat(10_000)
+        );
+        let (body, truncated) = readable_web_body("text/html", html.as_bytes(), 4_096).unwrap();
+        assert!(body.contains("Codex CLI"));
+        assert!(body.contains("useful documentation"));
+        assert!(!body.contains("ignored-script"));
+        assert!(!body.contains("<main>"));
+        assert!(truncated);
+        assert!(body.chars().count() <= 4_096);
+    }
+
+    #[test]
+    fn web_fetch_json_is_minified_and_bounded() {
+        let (body, truncated) = readable_web_body(
+            "application/json",
+            br#"{ "answer": 42, "items": [1, 2, 3] }"#,
+            1_024,
+        )
+        .unwrap();
+        assert_eq!(body, r#"{"answer":42,"items":[1,2,3]}"#);
+        assert!(!truncated);
     }
 
     #[test]

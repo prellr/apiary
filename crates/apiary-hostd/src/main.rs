@@ -81,6 +81,7 @@ async fn main() {
             .clone()
             .unwrap_or_else(|| format!("http://{}", args.bind)),
         token: None,
+        browser_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
         internal_token: apiary_core::identity::generate()
             .secret_key()
             .to_secret_hex(),

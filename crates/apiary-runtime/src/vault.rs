@@ -28,6 +28,16 @@ pub struct NoteRef {
     pub title: String,
 }
 
+/// A cheap inventory used by the derived-memory refresher. Directories are
+/// retained so later checks can notice added/deleted notes without walking the
+/// tree again; note contents are intentionally not read here.
+#[derive(Debug, Clone)]
+pub struct VaultInventory {
+    pub notes: Vec<NoteRef>,
+    /// Relative directory paths; the vault root is the empty string.
+    pub directories: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub rel: String,
@@ -71,8 +81,9 @@ pub fn resolve(root: &Path, rel: &str) -> Result<PathBuf, crate::Error> {
 
 /// Walk the vault for markdown notes, skipping Obsidian metadata, trash,
 /// and hidden directories.
-pub fn walk(root: &Path) -> Result<Vec<NoteRef>, crate::Error> {
+pub fn inventory(root: &Path) -> Result<VaultInventory, crate::Error> {
     let mut out = Vec::new();
+    let mut directories = vec![String::new()];
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = std::fs::read_dir(&dir)
@@ -84,7 +95,21 @@ pub fn walk(root: &Path) -> Result<Vec<NoteRef>, crate::Error> {
                 continue; // .obsidian, .trash, .git, hidden anything
             }
             if path.is_dir() {
-                stack.push(path);
+                // Do not follow a directory symlink outside the jail while
+                // discovering ambient memory.
+                let Ok(canonical) = path.canonicalize() else {
+                    continue;
+                };
+                if !canonical.starts_with(root) {
+                    continue;
+                }
+                let relative = canonical
+                    .strip_prefix(root)
+                    .unwrap_or(&canonical)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                directories.push(relative);
+                stack.push(canonical);
             } else if name.ends_with(".md") {
                 if out.len() >= MAX_NOTES {
                     return Err(crate::Error::Provider(format!(
@@ -104,7 +129,16 @@ pub fn walk(root: &Path) -> Result<Vec<NoteRef>, crate::Error> {
         }
     }
     out.sort_by(|a, b| a.rel.cmp(&b.rel));
-    Ok(out)
+    directories.sort();
+    directories.dedup();
+    Ok(VaultInventory {
+        notes: out,
+        directories,
+    })
+}
+
+pub fn walk(root: &Path) -> Result<Vec<NoteRef>, crate::Error> {
+    Ok(inventory(root)?.notes)
 }
 
 pub fn read_note(root: &Path, rel: &str) -> Result<String, crate::Error> {

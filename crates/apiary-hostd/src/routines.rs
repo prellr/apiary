@@ -264,6 +264,9 @@ fn fire(
         slot.to_rfc3339()
     );
     let result = apiary_runtime::runner::run_task(manifest, dir, &custody, &handle, &task, &ctx);
+    if result.is_ok() {
+        apiary_runtime::index::schedule_refresh(manifest.clone(), dir.to_path_buf());
+    }
     let (outcome, text, run_event) = match &result {
         Ok(out) => (
             out.completion.outcome.clone(),

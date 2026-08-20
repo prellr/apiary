@@ -242,6 +242,76 @@ fn admit(
 
 // ---------------------------------------------------------------- status
 
+/// Exchange one fresh NIP-98 signature for an in-memory browser session.
+/// The cookie is HttpOnly and the returned request token is required in a
+/// custom header, so same-site form posts cannot exercise the session.
+pub async fn browser_session_create(
+    State(state): State<App>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let signed = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("Nostr "));
+    if state.auth != crate::AuthMode::Nip98 || !signed {
+        return err(
+            StatusCode::UNAUTHORIZED,
+            "a fresh NIP-98 signature is required to open a browser session",
+        )
+        .into_response();
+    }
+    let pq = uri
+        .path_and_query()
+        .map(|path| path.to_string())
+        .unwrap_or_else(|| uri.path().to_string());
+    let signer = match nip98::check(&state, &headers, "POST", &pq, None) {
+        Ok(Some(signer)) => signer,
+        Ok(None) => {
+            return err(StatusCode::UNAUTHORIZED, "NIP-98 signer is missing").into_response()
+        }
+        Err(error) => return error.into_response(),
+    };
+    // Do not require host-manager status here. The session proves only the
+    // Nostr identity; each subsequent route decides whether that identity is
+    // a host manager, governor, editor, operator, or viewer for its target.
+    let session = match nip98::issue_browser_session(&state, signer) {
+        Ok(session) => session,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    let npub = match apiary_core::identity::to_npub(&signer) {
+        Ok(npub) => npub,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    let secure = if state.origin.starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie = format!(
+        "apiary_session={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
+        session.token,
+        session.expires_at.saturating_sub(now_secs()),
+        secure,
+    );
+    let mut response = Json(json!({
+        "ok": true,
+        "npub": npub,
+        "csrf": session.csrf,
+        "expires_at": session.expires_at,
+    }))
+    .into_response();
+    response.headers_mut().insert(
+        axum::http::header::SET_COOKIE,
+        cookie.parse().expect("session cookie is valid"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
 pub async fn status(
     State(state): State<App>,
     OriginalUri(uri): OriginalUri,
@@ -1318,7 +1388,14 @@ fn valid_inference_provider(role: &str, provider: &str) -> bool {
         "speech" => matches!(provider, "apple-speech" | "macos-say" | "openai" | "mock"),
         _ => matches!(
             provider,
-            "claude-code" | "anthropic" | "openai" | "xai" | "ollama" | "mock" | "mock-tool"
+            "claude-code"
+                | "codex"
+                | "anthropic"
+                | "openai"
+                | "xai"
+                | "ollama"
+                | "mock"
+                | "mock-tool"
         ),
     }
 }
@@ -1338,6 +1415,9 @@ fn nonempty_env(name: &str) -> bool {
 fn credential_source(slot: &apiary_core::manifest::InferenceSlot) -> String {
     if slot.provider == "claude-code" {
         return "local Claude Code sign-in".into();
+    }
+    if slot.provider == "codex" {
+        return "local ChatGPT sign-in".into();
     }
     if slot.credential.is_some() {
         return "sealed API key".into();
@@ -1459,6 +1539,22 @@ fn probe_inference_slot(slot: &apiary_core::manifest::InferenceSlot) -> serde_js
                 }
             }
         }
+        "codex" => {
+            if !apiary_runtime::inference::codex_is_installed() {
+                result("unavailable", "Codex CLI is not installed".into())
+            } else {
+                match apiary_runtime::inference::codex_auth_status() {
+                    Ok(account) => result(
+                        "ready",
+                        format!("Codex is signed in on this Mac ({account})"),
+                    ),
+                    Err(apiary_runtime::Error::Provider(detail)) => {
+                        result("unavailable", detail)
+                    }
+                    Err(error) => result("unavailable", error.to_string()),
+                }
+            }
+        }
         "anthropic"
             if slot.requires.get("auth").and_then(|value| value.as_str()) == Some("oauth") =>
         {
@@ -1527,6 +1623,10 @@ fn inference_probe_key(slot: &apiary_core::manifest::InferenceSlot) -> String {
         // All Claude Code routes share one local account and executable.
         return "claude-code-account".into();
     }
+    if slot.provider == "codex" {
+        // All Codex routes share one local ChatGPT account and executable.
+        return "codex-chatgpt-account".into();
+    }
     serde_json::to_string(&json!({
         "provider": slot.provider,
         "role": inference_role(&slot.name),
@@ -1587,6 +1687,7 @@ pub async fn inference_status(
     let default = manifest.routing.default.clone();
     let rules = manifest.routing.rules.clone();
     let floors = manifest.routing.floors.clone();
+    let fallbacks = manifest.routing.fallbacks.clone();
     let configuration = ceremony::manifest_hash(&raw);
     let state_for_probe = state.clone();
     let npub_for_probe = npub.clone();
@@ -1604,9 +1705,163 @@ pub async fn inference_status(
         "npub": npub,
         "ratified": ratified,
         "slots": probed,
-        "routing": {"default": default, "rules": rules, "floors": floors},
+        "routing": {"default": default, "rules": rules, "floors": floors, "fallbacks": fallbacks},
     }))
     .into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct InferenceFallbackBody {
+    primary: String,
+    #[serde(default)]
+    fallback: Option<String>,
+}
+
+/// Set one explicit failover route. This is routing authority, so it amends
+/// the manifest and pauses the agent until a governor ratifies it.
+pub async fn inference_set_fallback(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, mut manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    let body: InferenceFallbackBody = match serde_json::from_slice(&raw_body) {
+        Ok(body) => body,
+        Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let is_language = |name: &str| {
+        manifest
+            .inference
+            .iter()
+            .any(|slot| slot.name == name && inference_role(&slot.name) == "language")
+    };
+    if !is_language(&body.primary) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("'{}' is not a task-model route", body.primary),
+        )
+        .into_response();
+    }
+    match body.fallback.as_deref().filter(|name| !name.is_empty()) {
+        Some(fallback) if fallback == body.primary => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "a route cannot fall back to itself",
+            )
+            .into_response()
+        }
+        Some(fallback) if !is_language(fallback) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!("'{fallback}' is not a task-model route"),
+            )
+            .into_response()
+        }
+        Some(fallback) => {
+            manifest
+                .routing
+                .fallbacks
+                .insert(body.primary.clone(), vec![fallback.to_string()]);
+        }
+        None => {
+            manifest.routing.fallbacks.remove(&body.primary);
+        }
+    }
+    let yaml = match manifest.to_yaml() {
+        Ok(yaml) => yaml,
+        Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    if let Err(error) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
+    state.decisions.invalidate(&npub);
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "primary": body.primary,
+        "fallback": body.fallback,
+        "note": "fallback saved — review and approve before the agent runs",
+    }))
+    .into_response()
+}
+
+/// Make one tiny, governed call through an exact approved route. The test
+/// consumes the agent's token budget and lands as a signed run checkpoint;
+/// it skips memory and connectors and never masks failure with fallback.
+pub async fn inference_test(
+    State(state): State<App>,
+    AxPath((npub, name)): AxPath<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let (ks, npub, dir, raw, manifest) = match gate(&state, &headers, "POST", &uri, None, &npub) {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    if !crate::agent_decision(&state, &dir, &npub, &raw, &manifest).ratified {
+        return err(
+            StatusCode::CONFLICT,
+            "approve the current configuration before testing inference",
+        )
+        .into_response();
+    }
+    if !manifest
+        .inference
+        .iter()
+        .any(|slot| slot.name == name && inference_role(&slot.name) == "language")
+    {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("no task-model route '{name}'"),
+        )
+        .into_response();
+    }
+    let passphrase = match require_pass(&state) {
+        Ok(passphrase) => passphrase,
+        Err(error) => return error.into_response(),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let (custody, handle) = admit(&ks, &npub, &passphrase)?;
+        let context = apiary_runtime::routing::TaskContext {
+            tokens_per_run: Some(4_096),
+            disable_tools: true,
+            route_override: Some(name),
+            lightweight: true,
+            disable_fallback: true,
+            ..Default::default()
+        };
+        apiary_runtime::runner::run_task(
+            &manifest,
+            &dir,
+            &custody,
+            &handle,
+            "Connection check. Reply exactly OK.",
+            &context,
+        )
+        .map_err(|error| err(StatusCode::BAD_GATEWAY, error))
+    })
+    .await
+    .unwrap_or_else(|error| Err(err(StatusCode::INTERNAL_SERVER_ERROR, error)));
+    match result {
+        Ok(outcome) => Json(json!({
+            "ok": true,
+            "slot": outcome.slot,
+            "model": outcome.completion.model,
+            "response": outcome.completion.text,
+            "input_tokens": outcome.completion.input_tokens,
+            "output_tokens": outcome.completion.output_tokens,
+            "elapsed_ms": outcome.timings.total_ms,
+            "log_event": outcome.log_event_id,
+        }))
+        .into_response(),
+        Err(error) => error.into_response(),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -1687,7 +1942,7 @@ pub async fn inference_upsert(
         )
         .into_response();
     }
-    if provider == "claude-code"
+    if matches!(provider.as_str(), "claude-code" | "codex")
         && body
             .credential
             .as_deref()
@@ -1695,7 +1950,10 @@ pub async fn inference_upsert(
     {
         return err(
             StatusCode::BAD_REQUEST,
-            "Claude Code uses the account signed in on this Mac; it does not accept a per-route credential",
+            format!(
+                "{} uses the account signed in on this Mac; it does not accept a per-route credential",
+                if provider == "codex" { "Codex" } else { "Claude Code" }
+            ),
         )
         .into_response();
     }
@@ -1723,35 +1981,36 @@ pub async fn inference_upsert(
         .credential
         .filter(|secret| !secret.trim().is_empty())
         .map(|secret| Zeroizing::new(secret.trim().to_string()));
-    let credential = if provider == "claude-code" || body.clear_credential {
-        None
-    } else if let Some(secret) = supplied_secret {
-        let pass = match require_pass(&state) {
-            Ok(p) => p,
-            Err(e) => return e.into_response(),
+    let credential =
+        if matches!(provider.as_str(), "claude-code" | "codex") || body.clear_credential {
+            None
+        } else if let Some(secret) = supplied_secret {
+            let pass = match require_pass(&state) {
+                Ok(p) => p,
+                Err(e) => return e.into_response(),
+            };
+            let npub2 = npub.clone();
+            match tokio::task::spawn_blocking(move || {
+                let (custody, handle) = admit(&ks, &npub2, &pass)?;
+                custody
+                    .seal(&handle, secret.as_str())
+                    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+            })
+            .await
+            .unwrap_or_else(|e| Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)))
+            {
+                Ok(blob) => Some(blob),
+                Err(e) => return e.into_response(),
+            }
+        } else {
+            let auth_unchanged = existing.as_ref().is_none_or(|slot| {
+                slot.requires.get("auth").and_then(|value| value.as_str()) == auth
+            });
+            existing
+                .as_ref()
+                .filter(|slot| slot.provider == provider && auth_unchanged)
+                .and_then(|s| s.credential.clone())
         };
-        let npub2 = npub.clone();
-        match tokio::task::spawn_blocking(move || {
-            let (custody, handle) = admit(&ks, &npub2, &pass)?;
-            custody
-                .seal(&handle, secret.as_str())
-                .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
-        })
-        .await
-        .unwrap_or_else(|e| Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)))
-        {
-            Ok(blob) => Some(blob),
-            Err(e) => return e.into_response(),
-        }
-    } else {
-        let auth_unchanged = existing
-            .as_ref()
-            .is_none_or(|slot| slot.requires.get("auth").and_then(|value| value.as_str()) == auth);
-        existing
-            .as_ref()
-            .filter(|slot| slot.provider == provider && auth_unchanged)
-            .and_then(|s| s.credential.clone())
-    };
     let slot = apiary_core::manifest::InferenceSlot {
         name: name.clone(),
         provider,
@@ -1910,6 +2169,7 @@ mod inference_setup_tests {
     #[test]
     fn provider_matrix_rejects_cross_role_bindings() {
         assert!(valid_inference_provider("language", "claude-code"));
+        assert!(valid_inference_provider("language", "codex"));
         assert!(valid_inference_provider("language", "anthropic"));
         assert!(valid_inference_provider("embedding", "ollama"));
         assert!(valid_inference_provider("transcription", "apple-speech"));
@@ -2207,9 +2467,10 @@ fn default_control_token_ttl() -> u64 {
 }
 
 /// Issue a bearer credential signed by this agent's own Nostr identity.
-/// A governor authorizes issuance, but the resulting MCP caller acts as the
-/// agent—not as that human. It can therefore manage only agents which list
-/// this agent's npub (or the host, if explicitly made a host manager).
+/// A governor authorizes issuance, but the resulting protocol client acts as
+/// the agent—not as that human. It may run that same agent through AG-UI and
+/// manage only agents which list this agent's npub (or the host, if explicitly
+/// made a host manager).
 pub async fn control_token_issue(
     State(state): State<App>,
     AxPath(npub): AxPath<String>,
@@ -4537,11 +4798,12 @@ fn spawn_channel(
                         .str_config("trigger")
                         .map(String::from)
                         .unwrap_or_else(|| format!("@{name}"));
-                    Box::new(apiary_runtime::buzz::BuzzAdapter::connect(
+                    Box::new(apiary_runtime::buzz::BuzzAdapter::connect_with_cursor(
                         &relay,
                         &custody,
                         &agent_handle,
                         trigger,
+                        Some(dir.join("presence").join("buzz-recent.json")),
                     )?)
                 }
                 "telegram" => {
@@ -4663,9 +4925,9 @@ pub fn spawn_supervisor(state: App) {
     tokio::spawn(async move {
         let mut backoff: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             reconcile(&state, &mut backoff);
             crate::routines::reconcile_routines(&state);
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
     });
 }
@@ -4690,6 +4952,11 @@ fn reconcile(state: &App, backoff: &mut std::collections::HashMap<String, u64>) 
         let raw = std::fs::read_to_string(dir.join("manifest.yaml")).unwrap_or_default();
         let disk_sha = ceremony::manifest_hash(&raw);
         let manifest = apiary_core::manifest::Manifest::from_yaml(&raw).ok();
+        if active {
+            if let Some(manifest) = manifest.clone() {
+                apiary_runtime::index::schedule_refresh(manifest, dir.clone());
+            }
+        }
         let mut map = state.listeners.lock().unwrap_or_else(|e| e.into_inner());
         let presence = map.entry(npub.clone()).or_default();
         presence

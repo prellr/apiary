@@ -457,6 +457,7 @@ mod tests {
             origin: "http://127.0.0.1:7777".into(),
             managers: std::sync::RwLock::new(ManagerRegistry::in_memory(Vec::new())),
             token: None,
+            browser_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
             internal_token: "control-mcp-test-internal".into(),
             control_audit: std::sync::Mutex::new(()),
             control_tokens: std::sync::Mutex::new(()),

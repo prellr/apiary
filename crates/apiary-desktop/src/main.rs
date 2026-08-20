@@ -236,6 +236,7 @@ fn run_local(home: PathBuf, bootstrap: DesktopBootstrap) {
         auth: AuthMode::Open,
         origin: format!("http://127.0.0.1:{port}"),
         token: Some(token.clone()),
+        browser_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
         internal_token: apiary_core::identity::generate()
             .secret_key()
             .to_secret_hex(),

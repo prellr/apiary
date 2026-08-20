@@ -13,6 +13,9 @@ let manifestRequest = null;
 // echoes it back in a header. Without a token this is a no-op.
 const TOKEN = new URLSearchParams(location.search).get('token');
 const REMOTE = new URLSearchParams(location.search).get('remote');
+let SESSION_CSRF = null;
+let SESSION_NPUB = null;
+let SESSION_CONNECTING = null;
 let DESKTOP = null;
 try {
   const encoded = new URLSearchParams(location.hash.slice(1)).get('desktop');
@@ -23,12 +26,76 @@ try {
 function hdrs(extra) {
   const h = Object.assign({}, extra);
   if (TOKEN) h['x-apiary-token'] = TOKEN;
+  if (SESSION_CSRF) h['x-apiary-csrf'] = SESSION_CSRF;
   return h;
 }
-async function j(url, opts) {
-  opts = opts || {};
+function bytesBase64(bytes) {
+  let binary = '';
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return btoa(binary);
+}
+async function sha256Hex(value) {
+  const bytes = new TextEncoder().encode(value);
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  return [...digest].map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+async function nip98Authorization(url, opts) {
+  if (!window.nostr || typeof window.nostr.signEvent !== 'function') {
+    throw new Error('This Apiary host requires a Nostr signer. Enable a NIP-07 browser signer, then reload.');
+  }
+  const method = String((opts && opts.method) || 'GET').toUpperCase();
+  const target = new URL(url, location.href);
+  const tags = [['u', target.href], ['method', method]];
+  if (opts && opts.body !== undefined && opts.body !== null) {
+    tags.push(['payload', await sha256Hex(String(opts.body))]);
+  }
+  const signed = await window.nostr.signEvent({
+    kind: 27235,
+    created_at: Math.floor(Date.now() / 1000),
+    tags,
+    content: '',
+  });
+  return 'Nostr ' + bytesBase64(new TextEncoder().encode(JSON.stringify(signed)));
+}
+async function establishBrowserSession() {
+  if (SESSION_CONNECTING) return SESSION_CONNECTING;
+  SESSION_CONNECTING = (async () => {
+    const opts = { method: 'POST' };
+    const authorization = await nip98Authorization('/api/session', opts);
+    const response = await fetch('/api/session', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: hdrs({ authorization }),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.ok) {
+      throw new Error(result.error || `Nostr sign-in was refused (${response.status}).`);
+    }
+    SESSION_CSRF = result.csrf;
+    SESSION_NPUB = result.npub;
+    return result;
+  })();
+  try {
+    return await SESSION_CONNECTING;
+  } finally {
+    SESSION_CONNECTING = null;
+  }
+}
+async function apiaryFetch(url, opts, retried) {
+  opts = Object.assign({}, opts || {});
+  opts.credentials = 'same-origin';
   opts.headers = hdrs(opts.headers);
-  const r = await fetch(url, opts);
+  const response = await fetch(url, opts);
+  if (response.status === 401 && !retried && !TOKEN) {
+    await establishBrowserSession();
+    return apiaryFetch(url, opts, true);
+  }
+  return response;
+}
+async function j(url, opts) {
+  const r = await apiaryFetch(url, opts);
   return r.json();
 }
 
@@ -916,18 +983,20 @@ async function renderOverview(c) {
   harnessSection.append(harnessList, harnessForm);
   c.append(harnessSection);
 
-  const control = section('Agent management access',
-    'Create a time-bounded MCP credential signed by this agent. If another agent names this one as a manager, this credential lets it use Apiary’s control MCP server as its own identity. It never inherits a human manager’s authority.');
+  const control = section('Agent access and integrations',
+    'Create a time-bounded credential signed by this agent. It can connect an AG-UI surface such as OpenBot or let this agent use Apiary’s control MCP server. It never inherits a human manager’s authority.');
   const ttl = el('select');
   for (const [seconds, label] of [[3600, '1 hour'], [86400, '24 hours'], [604800, '7 days'], [2592000, '30 days'], [7776000, '90 days']]) {
     const option = el('option', null, label); option.value = String(seconds); if (seconds === 86400) option.selected = true; ttl.append(option);
   }
   const tokenLabel = el('input'); tokenLabel.placeholder = 'e.g. Scout manager loop'; tokenLabel.maxLength = 80;
-  const createToken = el('button', 'btn', 'Create MCP access token');
+  const createToken = el('button', 'btn', 'Create agent access token');
   const tokenStatus = el('span', 'meta', '');
   const tokenOutput = el('textarea', 'address-list'); tokenOutput.rows = 4; tokenOutput.readOnly = true;
   tokenOutput.placeholder = 'The token is shown here once created.';
   const tokenUrl = el('input'); tokenUrl.readOnly = true; tokenUrl.placeholder = 'MCP URL';
+  const openBotUrl = el('input'); openBotUrl.readOnly = true;
+  openBotUrl.value = `${location.origin}${api('/ag-ui')}`;
   const tokenList = el('div');
   const drawTokens = tokens => {
     tokenList.replaceChildren();
@@ -965,13 +1034,15 @@ async function renderOverview(c) {
     createToken.disabled = false;
     if (!result.ok) { tokenStatus.textContent = 'Could not create token: ' + result.error; return; }
     tokenOutput.value = result.token; tokenUrl.value = result.mcp_url;
-    tokenStatus.textContent = 'Created. Copy it now and store it only as this agent’s sealed MCP credential.';
+    tokenStatus.textContent = 'Created. Copy it now; OpenBot stores it as the coworker’s write-only Authorization header.';
     const refreshed = await j(api('/control-tokens'));
     drawTokens(refreshed.ok ? (refreshed.tokens || []) : []);
   };
   const tokenRow = el('div', 'row'); tokenRow.append(ttl, createToken, tokenStatus);
-  control.append(field('Label', tokenLabel), tokenRow, field('MCP URL', tokenUrl), field('Bearer credential', tokenOutput),
-    help('The bearer is shown only when created. It can be revoked below before expiry; removing this agent from a target’s manager list also removes that relationship immediately.'),
+  control.append(field('Label', tokenLabel), tokenRow,
+    field('OpenBot AG-UI endpoint', openBotUrl, 'In OpenBot, create a coworker with this endpoint and Authorization: Bearer <credential>.'),
+    field('Apiary control MCP URL', tokenUrl), field('Bearer credential', tokenOutput),
+    help('OpenBot may provide tools in an AG-UI run, but Apiary does not inherit them. This agent can use only its separately approved Apiary connectors, skills, and harness policy. The bearer is shown only when created and can be revoked below before expiry.'),
     el('h4', null, 'Token history'), tokenList);
   c.append(control);
 
@@ -1107,7 +1178,7 @@ function inferenceRoleForName(name) {
 }
 
 const inferenceProviders = {
-  language: [['claude-code', 'Claude Code (subscription)'], ['anthropic', 'Anthropic API'], ['openai', 'OpenAI compatible'], ['xai', 'xAI'], ['ollama', 'Ollama (local)']],
+  language: [['claude-code', 'Claude Code (subscription)'], ['codex', 'ChatGPT subscription (Codex)'], ['anthropic', 'Anthropic API'], ['openai', 'OpenAI compatible'], ['xai', 'xAI'], ['ollama', 'Ollama (local)']],
   embedding: [['ollama', 'Ollama (local)'], ['hash', 'Built-in lexical index']],
   transcription: [['apple-speech', 'Apple Speech (local)'], ['whisper-cpp', 'whisper.cpp (local)'], ['openai', 'OpenAI compatible']],
   speech: [['openai', 'OpenAI compatible / Kokoro'], ['apple-speech', 'Apple Speech (local)'], ['macos-say', 'macOS voices']],
@@ -1123,6 +1194,13 @@ const inferenceModels = {
       ['claude-opus-5', 'Claude Opus 5 · complex work'],
       ['claude-haiku-4-5-20251001', 'Claude Haiku 4.5 · fastest'],
       ['claude-fable-5', 'Claude Fable 5 · highest capability'],
+    ],
+    codex: [
+      ['gpt-5.6-terra', 'GPT-5.6 Terra · balanced (recommended)'],
+      ['gpt-5.6-luna', 'GPT-5.6 Luna · fastest'],
+      ['gpt-5.6-sol', 'GPT-5.6 Sol · complex work'],
+      ['gpt-5.5', 'GPT-5.5'],
+      ['gpt-5.4-mini', 'GPT-5.4 Mini'],
     ],
     anthropic: [
       ['claude-sonnet-5', 'Claude Sonnet 5 · balanced (recommended)'],
@@ -1162,6 +1240,7 @@ function inferenceEndpoint(slot) {
   const configured = ((slot.requires || {}).base_url || '').replace(/\/$/, '');
   if (configured) return configured;
   if (slot.provider === 'claude-code') return 'local Claude Code runtime';
+  if (slot.provider === 'codex') return 'local Codex runtime';
   if (slot.provider === 'anthropic') return 'api.anthropic.com';
   if (slot.provider === 'xai') return 'api.x.ai';
   if (slot.provider === 'openai') return 'api.openai.com';
@@ -1236,8 +1315,8 @@ function inferenceForm(slot, afterSave) {
   const refreshAuth = () => {
     const anthropic = role.value === 'language' && provider.value === 'anthropic';
     auth.closest('.field').style.display = anthropic ? '' : 'none';
-    const claude = role.value === 'language' && provider.value === 'claude-code';
-    credential.closest('.field').style.display = claude ? 'none' : '';
+    const subscription = role.value === 'language' && ['claude-code', 'codex'].includes(provider.value);
+    credential.closest('.field').style.display = subscription ? 'none' : '';
     credential.placeholder = slot && slot.credential_source === 'sealed API key'
       ? 'Leave blank to keep current API key'
       : 'API key, if required';
@@ -1265,7 +1344,7 @@ function inferenceForm(slot, afterSave) {
   form.append(field('Role', role), field('Connection name', name, 'Routing refers to this stable name.'),
     field('Provider', provider), field('Model', modelControls),
     field('Base URL', endpoint, 'Provider defaults are prefilled. OpenAI-compatible and local endpoints remain editable.'),
-    field('Authentication', auth, 'Anthropic API connections use API billing. Claude Code uses the account already signed in to the Claude CLI on this Mac.'),
+    field('Authentication', auth, 'Subscription routes use the account already signed in to the official Claude Code or Codex CLI on this host. API connections use agent-sealed keys.'),
     field('Credential', credential, 'API keys are encrypted to this agent before they are written.'),
     field('Voice', voice), field('Locale', locale));
   const flags = el('div', 'wide row'); flags.append(makeDefaultLabel);
@@ -1306,7 +1385,7 @@ function inferenceForm(slot, afterSave) {
       requires.auth = 'api-key';
       delete requires.oauth_profile;
     } else { delete requires.auth; delete requires.oauth_profile; }
-    if (provider.value === 'claude-code') delete requires.base_url;
+    if (['claude-code', 'codex'].includes(provider.value)) delete requires.base_url;
     if (voice.value.trim()) requires.voice = voice.value.trim(); else delete requires.voice;
     if (locale.value.trim()) requires.locale = locale.value.trim(); else delete requires.locale;
     save.disabled = true;
@@ -1328,7 +1407,7 @@ function inferenceForm(slot, afterSave) {
   return form;
 }
 
-function inferenceSource(slot, routing, rerender) {
+function inferenceSource(slot, routing, rerender, ratified) {
   const item = el('article', 'source-item');
   const head = el('div', 'source-head');
   const identity = el('div');
@@ -1342,6 +1421,21 @@ function inferenceSource(slot, routing, rerender) {
   state.append(el('span', 'state ' + stateName, stateName === 'ready' ? 'Verified locally' : stateName));
   state.append(el('div', 'source-detail', (slot.status && slot.status.detail) || 'No diagnostic available'));
   head.append(identity, detail, state); item.append(head);
+  if (slot.role === 'language') {
+    const actions = el('div', 'connection-actions');
+    const test = el('button', 'btn', 'Test connection');
+    const testStatus = el('span', 'meta', ratified ? '' : 'Approve the configuration before testing.');
+    test.disabled = !ratified;
+    test.onclick = async () => {
+      test.disabled = true; testStatus.textContent = 'Running a small governed test…';
+      const result = await j(api('/inference/' + encodeURIComponent(slot.name) + '/test'), { method: 'POST' });
+      test.disabled = !ratified;
+      testStatus.textContent = result.ok
+        ? `Passed · ${Math.round(result.elapsed_ms)}ms · ${result.input_tokens}in/${result.output_tokens}out`
+        : 'Failed · ' + result.error;
+    };
+    actions.append(test, testStatus); item.append(actions);
+  }
   const edit = el('details'); edit.append(el('summary', null, 'Edit route'), inferenceForm(slot, rerender));
   item.append(edit);
   return item;
@@ -1352,7 +1446,7 @@ async function renderInference(c) {
   const head = el('div', 'page-head');
   head.append(el('div', 'eyebrow', 'Model routing'),
     el('h2', 'page-title', 'Inference'),
-    el('p', 'page-lede', 'Choose which models this agent uses to think, remember, hear, and speak. Claude Code routes share the account signed in on this Mac; API providers keep agent-sealed credentials.'));
+    el('p', 'page-lede', 'Choose which models this agent uses to think, remember, hear, and speak. Subscription routes share the official CLI account signed in on this host; API providers keep agent-sealed credentials.'));
   c.append(head);
   if (!d.ok) { c.append(el('div', 'ev err', 'Could not load inference setup: ' + d.error)); return; }
   const slots = d.slots || [], routing = d.routing || {};
@@ -1369,11 +1463,19 @@ async function renderInference(c) {
       kv('Used by', claudeRoutes.map(s => s.name).join(', ')));
     c.append(account);
   }
+  const codexRoutes = language.filter(s => s.provider === 'codex');
+  if (codexRoutes.length) {
+    const account = section('ChatGPT subscription on this host', 'One official Codex sign-in serves every ChatGPT subscription route. Apiary never copies the OAuth credential into an agent.');
+    const status = codexRoutes.find(s => s.status && s.status.state === 'ready') || codexRoutes[0];
+    account.append(kv('Account', (status.status && status.status.detail) || 'Codex ChatGPT sign-in is unavailable'),
+      kv('Used by', codexRoutes.map(s => s.name).join(', ')));
+    c.append(account);
+  }
 
   const rerender = () => setTimeout(render, 350);
   const task = section('Task models', 'Language models receive prompts and may call granted capabilities. “Configured” means a credential is present; Apiary avoids a billable probe.');
   const taskList = el('div', 'source-list');
-  for (const slot of language) taskList.append(inferenceSource(slot, routing, rerender));
+  for (const slot of language) taskList.append(inferenceSource(slot, routing, rerender, d.ratified));
   if (!language.length) taskList.append(el('div', 'none', 'No task model is configured.'));
   task.append(taskList);
   if (language.length) {
@@ -1394,7 +1496,7 @@ async function renderInference(c) {
 
   const equipment = section('Memory and voice', 'Supporting engines have reserved roles: embed builds semantic memory, transcribe hears audio, and speak renders voice replies.');
   const supportList = el('div', 'source-list');
-  for (const slot of support) supportList.append(inferenceSource(slot, routing, rerender));
+  for (const slot of support) supportList.append(inferenceSource(slot, routing, rerender, d.ratified));
   if (!support.length) supportList.append(el('div', 'none', 'No supporting engines are configured.'));
   equipment.append(supportList); c.append(equipment);
 
@@ -1402,6 +1504,29 @@ async function renderInference(c) {
   if (!(routing.floors || []).length && !(routing.rules || []).length) policy.append(el('div', 'none', 'No conditional routes. Every task uses the default model.'));
   for (const rule of routing.floors || []) policy.append(kv('Required floor', `${rule.when} → ${rule.to}`));
   for (const rule of routing.rules || []) policy.append(kv('Task rule', `${rule.when} → ${rule.to}`));
+  if (language.length > 1 && routing.default) {
+    const fallback = el('select');
+    const none = el('option', null, 'No automatic fallback'); none.value = ''; fallback.append(none);
+    for (const slot of language.filter(slot => slot.name !== routing.default)) {
+      const option = el('option', null, slot.name); option.value = slot.name; fallback.append(option);
+    }
+    fallback.value = (((routing.fallbacks || {})[routing.default] || [])[0]) || '';
+    const saveFallback = el('button', 'btn', 'Save fallback');
+    const fallbackStatus = el('span', 'meta', 'Only used before text or a tool action begins.');
+    const fallbackLine = el('div', 'route-line'); fallbackLine.append(fallback, saveFallback, fallbackStatus);
+    saveFallback.onclick = async () => {
+      saveFallback.disabled = true;
+      const result = await j(api('/inference/fallback'), {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ primary: routing.default, fallback: fallback.value || null }),
+      });
+      saveFallback.disabled = false;
+      fallbackStatus.textContent = result.ok ? 'Saved. Approval required.' : 'Could not save: ' + result.error;
+      if (result.ok) { await loadRoster(); rerender(); }
+    };
+    policy.append(field(`Fallback when ${routing.default} is unavailable`, fallbackLine,
+      'Fallback routes are part of the approved policy. Apiary never retries after emitting text or starting a tool call.'));
+  }
   const advanced = el('button', 'btn', 'Edit advanced routing'); advanced.onclick = () => openTab('manifest');
   policy.append(advanced); c.append(policy);
 }
@@ -1446,9 +1571,9 @@ async function runTask(ta, go, events, cls, dcls, harness) {
   go.disabled = true;
   events.replaceChildren();
   try {
-    const resp = await fetch(api('/run'), {
+    const resp = await apiaryFetch(api('/run'), {
       method: 'POST',
-      headers: hdrs({ 'content-type': 'application/json' }),
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ task, class: cls, data_class: dcls, harness }),
     });
     if (!resp.ok) {
@@ -1505,7 +1630,19 @@ async function runTask(ta, go, events, cls, dcls, harness) {
           case 'CUSTOM':
             if (e.name === 'apiary.checkpoint') {
               const v = e.value;
-              ev(events, 'meta', `✓ signed checkpoint ${v.log_event} · ${v.model} · ${v.input_tokens}in/${v.output_tokens}out`);
+              const timing = v.timings_ms || {};
+              const prep = ['admission_ms', 'budget_ms', 'route_ms', 'memory_ms', 'connectors_ms']
+                .reduce((sum, key) => sum + (Number(timing[key]) || 0), 0);
+              const speed = timing.first_token_ms == null ? ''
+                : ` · first text ${Math.round(timing.first_token_ms)}ms · Apiary prep ${prep.toFixed(1)}ms`;
+              const model = v.model ? ` · ${v.model}` : '';
+              const tokens = v.input_tokens == null ? '' : ` · ${v.input_tokens}in/${v.output_tokens}out`;
+              ev(events, 'meta', `✓ signed checkpoint ${v.log_event}${model}${tokens}${speed}`);
+            } else if (e.name === 'apiary.inference_attempt_failed') {
+              const v = e.value || {};
+              ev(events, v.fallback ? 'step' : 'err', v.fallback
+                ? `inference ${v.slot} unavailable · falling back to ${v.fallback}`
+                : `inference ${v.slot} failed · ${v.detail || 'unknown error'}`);
             }
             break;
           case 'RUN_FINISHED': ev(events, 'meta', 'run finished'); loadRoster(); break;
@@ -1522,8 +1659,24 @@ async function runTask(ta, go, events, cls, dcls, harness) {
 // ------------------------------------------------------------ log
 
 async function renderLog(c) {
-  const d = await j(api('/log?tail=100'));
+  const [d, initialListener] = await Promise.all([j(api('/log?tail=100')), j(api('/listener'))]);
   if (!d.ok) { c.append(el('div', 'ev err', 'error: ' + d.error)); return; }
+  const live = section('Live message lifecycle', 'Fast, host-local presence status. Durable received, run, and reply checkpoints remain in the signed log below.');
+  const liveBody = el('div'); live.append(liveBody); c.append(live);
+  const drawLive = listener => {
+    liveBody.replaceChildren();
+    if (!listener.ok) { liveBody.append(el('div', 'none', 'Live presence is unavailable: ' + listener.error)); return; }
+    let count = 0;
+    for (const [kind, channel] of Object.entries(listener.channels || {})) {
+      for (const line of (channel.lines || []).slice(-12).reverse()) {
+        if (!/(received|inference|reply)/i.test(line)) continue;
+        liveBody.append(entryLine(kind, line)); count += 1;
+      }
+    }
+    if (!count) liveBody.append(el('div', 'none', 'No recent message lifecycle events.'));
+  };
+  drawLive(initialListener);
+  listenerPoll = setInterval(async () => drawLive(await j(api('/listener'))), 3000);
   const chain = d.chain.valid ? `chain valid · ${d.chain.entries} entries` : `CHAIN BROKEN: ${d.chain.error}`;
   c.append(entryLine('signed log', chain));
   c.append(help('Every entry is a signed nostr event chained to the previous one — the agent’s tamper-evident memory and audit trail in one. "chain valid" means every signature verifies and no entry was removed or reordered.'));
@@ -1568,7 +1721,9 @@ async function renderLog(c) {
       new Date(e.at * 1000).toLocaleString()
         + (b.model ? ' · ' + b.model : '')
         + (b.harness ? ' · ' + b.harness : '')
-        + (b.cost ? ` · ${b.cost.input_tokens}in/${b.cost.output_tokens}out` : ''),
+        + (b.cost ? ` · ${b.cost.input_tokens}in/${b.cost.output_tokens}out` : '')
+        + (b.detail?.timings_ms?.first_token_ms == null ? ''
+          : ` · first text ${Math.round(b.detail.timings_ms.first_token_ms)}ms`),
       e.id,
     ];
     c.append(entryLine(b.action || '?', '→ ' + (b.outcome || '?'), meta));
@@ -3030,5 +3185,20 @@ function renderImport(c) {
   };
 }
 
-loadStatus().then(() => Promise.all([loadOwners(), loadManagers()])).then(loadRoster).then(render);
-setInterval(loadStatus, 15000);
+function renderStartupError(error) {
+  const root = document.getElementById('content');
+  root.replaceChildren();
+  const card = section('Sign in to Apiary', error && error.message ? error.message : String(error));
+  const retry = el('button', 'btn solid', 'Try Nostr sign-in again');
+  retry.onclick = () => location.reload();
+  card.append(retry, help('Apiary asks your signer once, opens an eight-hour off-chain session, and still enforces your role separately for every agent.'));
+  root.append(card);
+  document.getElementById('roster').replaceChildren(el('div', 'empty', 'Authentication required'));
+}
+
+loadStatus()
+  .then(() => Promise.all([loadOwners(), loadManagers()]))
+  .then(loadRoster)
+  .then(render)
+  .then(() => { setInterval(loadStatus, 15000); })
+  .catch(renderStartupError);

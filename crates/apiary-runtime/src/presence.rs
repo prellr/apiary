@@ -173,7 +173,7 @@ pub fn run_presence(
             Err(e) => return Err(e),
         };
         sink(format!(
-            "{kind}: mention from {} in {}: {}",
+            "{kind}: received · {} in {}: {}",
             mention.author,
             mention.channel,
             mention.text.chars().take(80).collect::<String>()
@@ -218,9 +218,29 @@ pub fn run_presence(
             attachments: mention.attachments.clone(),
             ..Default::default()
         };
+        let routed_slot = crate::routing::resolve(manifest, &ctx).ok();
+        sink(format!(
+            "{kind}: inference started{}",
+            routed_slot
+                .as_deref()
+                .map(|slot| format!(" · {slot}"))
+                .unwrap_or_default()
+        ));
         let outcome = crate::runner::run_task(manifest, agent_dir, custody, handle, &task, &ctx);
+        if outcome.is_ok() {
+            crate::index::schedule_refresh(manifest.clone(), agent_dir.to_path_buf());
+        }
         match outcome {
             Ok(out) if !out.completion.text.trim().is_empty() => {
+                sink(format!(
+                    "{kind}: inference completed · {}{}",
+                    out.slot,
+                    routed_slot
+                        .as_deref()
+                        .filter(|primary| **primary != out.slot)
+                        .map(|primary| format!(" (fallback from {primary})"))
+                        .unwrap_or_default()
+                ));
                 let text: String = out.completion.text.trim().chars().take(4000).collect();
                 let heard_audio = mention
                     .attachments
@@ -238,14 +258,58 @@ pub fn run_presence(
                     None
                 };
                 let reply = Reply { text, audio };
+                sink(format!("{kind}: reply sending"));
                 match adapter.reply(&mention, &reply) {
-                    Ok(id) => sink(format!("{kind}: replied {id}")),
-                    Err(e) => sink(format!("{kind}: reply failed: {e}")),
+                    Ok(id) => {
+                        sink(format!("{kind}: reply sent · {id}"));
+                        if let Err(error) = log.append(
+                            custody,
+                            handle,
+                            apiary_core::log::Tier::Self_,
+                            &apiary_core::log::EntryBody {
+                                action: format!("{kind}.reply"),
+                                model: Some(out.completion.model),
+                                cost: None,
+                                harness: None,
+                                outcome: "sent".into(),
+                                detail: Some(json!({
+                                    "channel": mention.channel,
+                                    "mention_ref": mention.reply_ref,
+                                    "reply_ref": id,
+                                })),
+                            },
+                        ) {
+                            sink(format!("{kind}: reply checkpoint failed: {error}"));
+                        }
+                    }
+                    Err(error) => {
+                        sink(format!("{kind}: reply failed · {error}"));
+                        let _ = log.append(
+                            custody,
+                            handle,
+                            apiary_core::log::Tier::Self_,
+                            &apiary_core::log::EntryBody {
+                                action: format!("{kind}.reply"),
+                                model: Some(out.completion.model),
+                                cost: None,
+                                harness: None,
+                                outcome: "error".into(),
+                                detail: Some(json!({
+                                    "channel": mention.channel,
+                                    "mention_ref": mention.reply_ref,
+                                    "error": error.to_string(),
+                                })),
+                            },
+                        );
+                    }
                 }
             }
-            Ok(_) => sink(format!("{kind}: run produced no text; staying silent")),
+            Ok(out) => sink(format!(
+                "{kind}: inference completed · {} · no text; staying silent",
+                out.slot
+            )),
             Err(e) => sink(format!(
-                "{kind}: run refused: {e} (mention logged, no reply)"
+                "{kind}: inference failed · {e} (mention logged, no reply)"
             )),
         }
     }

@@ -69,6 +69,9 @@ indexes, and UI state remain ordinary off-chain projections.
   verify identity, signatures, history, and ratification before activation.
 - **Management over MCP** — an outside agent can inspect and manage permitted
   Apiary environments without bypassing the normal authorization gate.
+- **OpenBot / AG-UI surface** — an Apiary agent can be registered as an
+  [OpenBot](https://github.com/CopilotKit/openbot) coworker through standard
+  AG-UI without importing OpenBot's tools or standing role as authority.
 
 ## Quick start
 
@@ -128,6 +131,11 @@ credentials, files, channels, and agent state remain on the server.
 Keep an `open` daemon bound to server loopback. Use `--auth nip98` whenever a
 host is reachable beyond a trusted SSH boundary.
 
+For a browser-facing NIP-98 host, the cockpit asks a NIP-07 signer once and
+opens an eight-hour, in-memory session. The session is only an authentication
+cache: the signer still sees only agents where its Nostr ID has a ratified
+role, and host-wide operations still require host-manager status.
+
 ## Governance in practice
 
 - New agents do not run until a manager ratifies their manifest.
@@ -158,6 +166,16 @@ full native surface. Its profile can be isolated from global credentials and
 extensions or intentionally inherited. File and network sandboxing are
 separate controls and fail closed when a requested sandbox is unavailable.
 
+## Latency model
+
+Interactive and voice runs perform only bounded local preparation before
+inference: authorization from the current decision, budget reservation, the
+recent signed-log tail, and instant lexical recall from a warm memory snapshot.
+Requests that explicitly need older context add a synchronous local semantic
+lookup. Log/vault discovery and embedding refresh in the background; relay
+publication is never part of the response path. Each run reports admission,
+memory, first-text, engine, tool, and checkpoint timings in its live checkpoint.
+
 ## Apiary control MCP
 
 Every host exposes a stateless MCP endpoint at `POST /mcp`. It supports:
@@ -174,6 +192,31 @@ host and per-agent authorization checks used by the desktop and REST API.
 
 Credential plaintext, host unlock, key export, and other sensitive local
 operations are intentionally unavailable through control MCP.
+
+## OpenBot and standard AG-UI clients
+
+Every agent exposes a standard AG-UI endpoint:
+
+```text
+https://your-apiary-host/api/agents/<agent-npub>/ag-ui
+```
+
+In the agent's **Agent access and integrations** panel, create a time-bounded
+access token. Register the endpoint as an OpenBot coworker and store this
+write-only header in OpenBot:
+
+```text
+Authorization: Bearer apiary_…
+```
+
+The credential is signed by the agent, revocable, limited to 90 days, and may
+run only that same agent. It cannot edit or ratify the agent. OpenBot's standing
+system role does not replace the ratified Apiary constitution, and tools
+advertised by the AG-UI caller are refused rather than inherited. Grant tools
+through Apiary connectors or its governed MCP gateway instead; OpenBot remains
+an optional conversation surface, not a second authority store. Its browser,
+files, and other computer tools remain unavailable to the Apiary agent until
+they are exposed through a separately ratified governed bridge.
 
 ## Security model
 

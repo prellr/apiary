@@ -20,8 +20,98 @@ use sha2::{Digest, Sha256};
 const NIP98_KIND: u16 = 27235;
 const CONTROL_TOKEN_KIND: u16 = 27236;
 const FRESHNESS_SECS: u64 = 60;
+const BROWSER_SESSION_SECS: u64 = 8 * 60 * 60;
 const MAX_CONTROL_TOKEN_SECS: u64 = 90 * 24 * 60 * 60;
 const CONTROL_TOKEN_REGISTRY: &str = "control-tokens.json";
+
+#[derive(Clone, Debug)]
+pub struct BrowserSession {
+    pub signer: PublicKey,
+    pub csrf: String,
+    pub expires_at: u64,
+}
+
+pub struct NewBrowserSession {
+    pub token: String,
+    pub csrf: String,
+    pub expires_at: u64,
+}
+
+pub fn issue_browser_session(
+    state: &AppState,
+    signer: PublicKey,
+) -> Result<NewBrowserSession, String> {
+    let token = apiary_core::identity::generate()
+        .secret_key()
+        .to_secret_hex();
+    let csrf = apiary_core::identity::generate()
+        .secret_key()
+        .to_secret_hex();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let expires_at = now.saturating_add(BROWSER_SESSION_SECS);
+    let mut sessions = state
+        .browser_sessions
+        .lock()
+        .map_err(|_| "browser session registry is unavailable".to_string())?;
+    sessions.retain(|_, session| session.expires_at > now);
+    sessions.insert(
+        token.clone(),
+        BrowserSession {
+            signer,
+            csrf: csrf.clone(),
+            expires_at,
+        },
+    );
+    Ok(NewBrowserSession {
+        token,
+        csrf,
+        expires_at,
+    })
+}
+
+fn check_browser_session(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<PublicKey>, (StatusCode, Json<serde_json::Value>)> {
+    let token = headers
+        .get("cookie")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|cookie| {
+                let (name, value) = cookie.trim().split_once('=')?;
+                (name == "apiary_session").then(|| value.to_string())
+            })
+        });
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut sessions = state
+        .browser_sessions
+        .lock()
+        .map_err(|_| crate::err(StatusCode::UNAUTHORIZED, "apiary session is unavailable"))?;
+    sessions.retain(|_, session| session.expires_at > now);
+    let session = sessions
+        .get(&token)
+        .ok_or_else(|| crate::err(StatusCode::UNAUTHORIZED, "apiary session expired"))?;
+    let csrf = headers
+        .get("x-apiary-csrf")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !constant_time_eq(csrf, &session.csrf) {
+        return Err(crate::err(
+            StatusCode::UNAUTHORIZED,
+            "apiary session is missing its request token",
+        ));
+    }
+    Ok(Some(session.signer))
+}
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -153,10 +243,10 @@ fn constant_time_eq(presented: &str, expected: &str) -> bool {
             == 0
 }
 
-/// Authenticate the MCP control endpoint. In addition to ordinary NIP-98,
-/// it accepts a time-bounded token signed by an Apiary agent's own Nostr key.
-/// The bearer proves only identity; every called REST operation still checks
-/// that identity against the target agent or host-manager allowlist.
+/// Authenticate a long-lived protocol client (control MCP or AG-UI). In
+/// addition to ordinary NIP-98, it accepts a time-bounded token signed by an
+/// Apiary agent's own Nostr key. The bearer proves only identity; every called
+/// operation still checks that identity against the route's authorization.
 pub fn check_control(
     state: &AppState,
     headers: &HeaderMap,
@@ -326,6 +416,17 @@ pub fn check(
     if state.auth == AuthMode::Open {
         return Ok(None);
     }
+    // A fresh NIP-98 signature always wins over an existing browser cookie;
+    // this lets a user replace an expired session without first clearing it.
+    let has_nip98 = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("Nostr "));
+    if !has_nip98 {
+        if let Some(signer) = check_browser_session(state, headers)? {
+            return Ok(Some(signer));
+        }
+    }
     let fail = |msg: &str| crate::err(StatusCode::UNAUTHORIZED, format!("nip98: {msg}"));
 
     let header = headers
@@ -444,6 +545,7 @@ pub fn required_agent_role(method: &str, path_and_query: &str) -> ManagerRole {
         return ManagerRole::Governor;
     }
     let operator = path.ends_with("/run")
+        || path.ends_with("/ag-ui")
         || path.ends_with("/active")
         || path.ends_with("/log/publish")
         || path.ends_with("/buzz/post")
@@ -472,6 +574,22 @@ pub fn authorize_agent_request(
         return Ok(());
     }
     let required = required_agent_role(method, path_and_query);
+    // A governor may issue a revocable bearer signed by the agent for a
+    // foreign AG-UI surface such as OpenBot. That identity may ask this agent
+    // to run itself, but it never gains editor/governor authority and cannot
+    // use the exception on any other agent.
+    let self_run = required == ManagerRole::Operator
+        && path_and_query
+            .split('?')
+            .next()
+            .is_some_and(|path| path.ends_with("/run") || path.ends_with("/ag-ui"))
+        && signer.as_ref().is_some_and(|signer| {
+            apiary_core::identity::parse_npub(&manifest.identity.npub)
+                .is_ok_and(|agent| agent == *signer)
+        });
+    if self_run {
+        return Ok(());
+    }
     match signer.and_then(|signer| role_for(manifest, &signer)) {
         Some(actual) if actual >= required => Ok(()),
         Some(actual) => Err(crate::err(
@@ -552,6 +670,7 @@ mod tests {
             auth,
             origin: "http://127.0.0.1:7777".into(),
             token: None,
+            browser_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
             internal_token: "test-internal-token".into(),
             control_audit: std::sync::Mutex::new(()),
             control_tokens: std::sync::Mutex::new(()),
@@ -653,6 +772,27 @@ mod tests {
     }
 
     #[test]
+    fn browser_session_reuses_one_signed_identity_with_csrf_binding() {
+        let s = state(AuthMode::Nip98);
+        let signer = Keys::generate().public_key();
+        let issued = issue_browser_session(&s, signer).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            format!("other=x; apiary_session={}", issued.token)
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("x-apiary-csrf", issued.csrf.parse().unwrap());
+        assert_eq!(
+            check(&s, &headers, "GET", "/api/agents", None).unwrap(),
+            Some(signer)
+        );
+        headers.remove("x-apiary-csrf");
+        assert!(check(&s, &headers, "GET", "/api/agents", None).is_err());
+    }
+
+    #[test]
     fn body_bearing_requests_require_payload_hash() {
         let s = state(AuthMode::Nip98);
         let keys = Keys::generate();
@@ -736,6 +876,22 @@ mod tests {
         let s = state(AuthMode::Open);
         assert!(authorize_agent_request(
             &s,
+            Some(agent.public_key()),
+            &manifest,
+            "POST",
+            "/api/agents/x/ag-ui"
+        )
+        .is_ok());
+        assert!(authorize_agent_request(
+            &s,
+            Some(agent.public_key()),
+            &manifest,
+            "POST",
+            "/api/agents/x/harnesses"
+        )
+        .is_err());
+        assert!(authorize_agent_request(
+            &s,
             Some(viewer.public_key()),
             &manifest,
             "GET",
@@ -802,6 +958,10 @@ mod tests {
         );
         assert_eq!(
             required_agent_role("POST", "/api/agents/x/run"),
+            ManagerRole::Operator
+        );
+        assert_eq!(
+            required_agent_role("POST", "/api/agents/x/ag-ui"),
             ManagerRole::Operator
         );
         assert_eq!(

@@ -65,6 +65,11 @@ pub struct AppState {
     /// present it — the desktop webview gets it in its boot URL, so other
     /// local processes cannot drive the embedded daemon.
     pub token: Option<String>,
+    /// Short-lived browser sessions created by one NIP-98 signature. The
+    /// cookie is only authentication; every route still applies the ordinary
+    /// host-manager or per-agent authorization gate to the bound signer.
+    pub browser_sessions:
+        std::sync::Mutex<std::collections::HashMap<String, nip98::BrowserSession>>,
     /// Process-private capability used only when the MCP control adapter
     /// dispatches into the existing REST router. This preserves one set of
     /// authorization gates without trusting caller-supplied identity headers.
@@ -130,6 +135,7 @@ pub fn build_router(state: App) -> Router {
         .route("/", get(cockpit))
         .route("/app.js", get(cockpit_js))
         .route("/api/status", get(ops::status))
+        .route("/api/session", post(ops::browser_session_create))
         .route("/api/unlock", post(ops::unlock))
         .route("/api/unlock/forget", post(ops::forget_automatic_unlock))
         .route("/api/lock", post(ops::lock))
@@ -216,6 +222,7 @@ pub fn build_router(state: App) -> Router {
         .route("/api/agents/{npub}/log/publish", post(ops::log_publish))
         .route("/api/agents/{npub}/log/remote", get(ops::log_remote))
         .route("/api/agents/{npub}/run", post(agui::run_stream))
+        .route("/api/agents/{npub}/ag-ui", post(agui::run_stream))
         .route("/api/agents/{npub}/spend", get(ops::spend_status))
         .route(
             "/api/agents/{npub}/inference",
@@ -224,6 +231,14 @@ pub fn build_router(state: App) -> Router {
         .route(
             "/api/agents/{npub}/inference/default",
             post(ops::inference_set_default),
+        )
+        .route(
+            "/api/agents/{npub}/inference/fallback",
+            post(ops::inference_set_fallback),
+        )
+        .route(
+            "/api/agents/{npub}/inference/{name}/test",
+            post(ops::inference_test),
         )
         .route(
             "/api/agents/{npub}/inference/{name}",

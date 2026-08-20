@@ -462,9 +462,9 @@ impl Skill {
 pub struct InferenceSlot {
     /// Pool-local name routing rules refer to: "workhorse", "fast", "local", "embed".
     pub name: String,
-    /// "claude-code" | "anthropic" | "openai" | "xai" | "ollama" | "mock".
-    /// Claude Code uses subscription auth through the guarded local CLI. The
-    /// openai and xai providers speak the OpenAI-compatible dialect; `requires.
+    /// "claude-code" | "codex" | "anthropic" | "openai" | "xai" | "ollama" | "mock".
+    /// Claude Code and Codex use subscription auth through guarded local CLIs.
+    /// The openai and xai providers speak the OpenAI-compatible dialect; `requires.
     /// base_url` points either at any compatible endpoint (Groq, Together,
     /// llama.cpp, LM Studio, ollama /v1 — keyless when local).
     pub provider: String,
@@ -490,6 +490,11 @@ pub struct Routing {
     pub rules: Vec<RoutingRule>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
+    /// Explicit, human-ratified provider failover. Keys are primary slot
+    /// names and values are tried in order, but only before any text or tool
+    /// action has been emitted. An empty map means fail closed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fallbacks: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -886,6 +891,26 @@ impl Manifest {
                 )));
             }
         }
+        for (primary, fallbacks) in &self.routing.fallbacks {
+            if !slot_names.contains(&primary.as_str()) {
+                return Err(crate::Error::Manifest(format!(
+                    "routing fallback names unknown primary inference slot '{primary}'"
+                )));
+            }
+            let mut seen_fallbacks = std::collections::BTreeSet::new();
+            for fallback in fallbacks {
+                if !slot_names.contains(&fallback.as_str()) {
+                    return Err(crate::Error::Manifest(format!(
+                        "routing fallback targets unknown inference slot '{fallback}'"
+                    )));
+                }
+                if fallback == primary || !seen_fallbacks.insert(fallback) {
+                    return Err(crate::Error::Manifest(format!(
+                        "routing fallback for '{primary}' repeats slot '{fallback}'"
+                    )));
+                }
+            }
+        }
         // Routines: one schedule spelling, tz where it matters, valid
         // delivery targets, unique names.
         let mut rnames = std::collections::BTreeSet::new();
@@ -998,6 +1023,40 @@ mod tests {
         let manifest = Manifest::from_yaml(&minimal_yaml()).unwrap();
         assert!(manifest.constitution.is_empty());
         assert!(!manifest.to_yaml().unwrap().contains("constitution:"));
+    }
+
+    #[test]
+    fn routing_fallbacks_are_explicit_and_validated() {
+        let mut manifest = Manifest::from_yaml(&minimal_yaml()).unwrap();
+        manifest.inference = vec![
+            InferenceSlot {
+                name: "primary".into(),
+                provider: "mock".into(),
+                model: Some("primary-model".into()),
+                credential: None,
+                requires: Default::default(),
+            },
+            InferenceSlot {
+                name: "backup".into(),
+                provider: "mock".into(),
+                model: Some("backup-model".into()),
+                credential: None,
+                requires: Default::default(),
+            },
+        ];
+        manifest.routing.default = Some("primary".into());
+        manifest
+            .routing
+            .fallbacks
+            .insert("primary".into(), vec!["backup".into()]);
+        manifest.validate().unwrap();
+        assert!(manifest.to_yaml().unwrap().contains("fallbacks:"));
+
+        manifest
+            .routing
+            .fallbacks
+            .insert("primary".into(), vec!["missing".into()]);
+        assert!(manifest.validate().is_err());
     }
 
     #[test]
