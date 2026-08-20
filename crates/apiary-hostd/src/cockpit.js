@@ -13,8 +13,8 @@ let manifestRequest = null;
 // echoes it back in a header. Without a token this is a no-op.
 const TOKEN = new URLSearchParams(location.search).get('token');
 const REMOTE = new URLSearchParams(location.search).get('remote');
-let SESSION_CSRF = null;
-let SESSION_NPUB = null;
+let SESSION_CSRF = sessionStorage.getItem('apiary.csrf');
+let SESSION_NPUB = sessionStorage.getItem('apiary.npub');
 let SESSION_CONNECTING = null;
 let DESKTOP = null;
 try {
@@ -75,6 +75,8 @@ async function establishBrowserSession() {
     }
     SESSION_CSRF = result.csrf;
     SESSION_NPUB = result.npub;
+    sessionStorage.setItem('apiary.csrf', result.csrf);
+    sessionStorage.setItem('apiary.npub', result.npub);
     return result;
   })();
   try {
@@ -328,7 +330,8 @@ renderBackendSwitcher();
 // ------------------------------------------------------------ host status
 
 async function loadStatus() {
-  try { hostStatus = await j('/api/status'); } catch { hostStatus = {}; }
+  hostStatus = await j('/api/status');
+  if (!hostStatus.ok) throw new Error(hostStatus.error || 'Could not load this Apiary host.');
   const set = (id, text, cls) => {
     const n = document.getElementById(id);
     n.textContent = text;

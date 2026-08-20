@@ -10,7 +10,10 @@
 //! caller must bind it to the operation (governorship) — see `authorize`.
 
 use crate::{AppState, AuthMode};
-use apiary_core::manifest::{ManagerRole, Manifest};
+use apiary_core::{
+    keystore::Keystore,
+    manifest::{ManagerRole, Manifest},
+};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use base64::Engine;
@@ -75,6 +78,7 @@ pub fn issue_browser_session(
 fn check_browser_session(
     state: &AppState,
     headers: &HeaderMap,
+    require_csrf: bool,
 ) -> Result<Option<PublicKey>, (StatusCode, Json<serde_json::Value>)> {
     let token = headers
         .get("cookie")
@@ -100,17 +104,30 @@ fn check_browser_session(
     let session = sessions
         .get(&token)
         .ok_or_else(|| crate::err(StatusCode::UNAUTHORIZED, "apiary session expired"))?;
-    let csrf = headers
-        .get("x-apiary-csrf")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    if !constant_time_eq(csrf, &session.csrf) {
-        return Err(crate::err(
-            StatusCode::UNAUTHORIZED,
-            "apiary session is missing its request token",
-        ));
+    if require_csrf {
+        let csrf = headers
+            .get("x-apiary-csrf")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if !constant_time_eq(csrf, &session.csrf) {
+            return Err(crate::err(
+                StatusCode::UNAUTHORIZED,
+                "apiary session is missing its request token",
+            ));
+        }
     }
     Ok(Some(session.signer))
+}
+
+/// Resolve the HttpOnly browser cookie for a top-level cockpit navigation.
+/// Navigations cannot attach Apiary's CSRF header, so this only proves the
+/// session identity. The cockpit access check still binds that identity to a
+/// host or agent role before any private HTML is returned.
+pub fn browser_navigation_signer(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<PublicKey>, (StatusCode, Json<serde_json::Value>)> {
+    check_browser_session(state, headers, false)
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -423,7 +440,7 @@ pub fn check(
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with("Nostr "));
     if !has_nip98 {
-        if let Some(signer) = check_browser_session(state, headers)? {
+        if let Some(signer) = check_browser_session(state, headers, true)? {
             return Ok(Some(signer));
         }
     }
@@ -523,6 +540,49 @@ fn role_for(manifest: &Manifest, signer: &PublicKey) -> Option<ManagerRole> {
             .filter(|key| key == signer)
             .map(|_| manager.role)
     })
+}
+
+/// Decide whether an identity may enter the private management cockpit.
+/// Host managers can administer the host. Per-agent managers can enter only
+/// so the normal route gates can show and operate the agents assigned to
+/// them. A merely valid Nostr identity learns nothing about this host.
+pub fn authorize_cockpit(
+    state: &AppState,
+    signer: Option<PublicKey>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if authorize_admin(state, signer).is_ok() {
+        return Ok(());
+    }
+    let signer =
+        signer.ok_or_else(|| crate::err(StatusCode::UNAUTHORIZED, "authentication required"))?;
+    let keystore = Keystore::open(&state.home).map_err(|error| {
+        crate::err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("agent registry is unavailable: {error}"),
+        )
+    })?;
+    let agents = keystore.list().map_err(|error| {
+        crate::err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("agent registry is unavailable: {error}"),
+        )
+    })?;
+    for npub in agents {
+        let path = keystore.agent_dir(&npub).join("manifest.yaml");
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(manifest) = Manifest::from_yaml(&raw) else {
+            continue;
+        };
+        if role_for(&manifest, &signer).is_some() {
+            return Ok(());
+        }
+    }
+    Err(crate::err(
+        StatusCode::FORBIDDEN,
+        "this Nostr identity does not have access to this Apiary host",
+    ))
 }
 
 pub fn required_agent_role(method: &str, path_and_query: &str) -> ManagerRole {
@@ -789,6 +849,10 @@ mod tests {
             Some(signer)
         );
         headers.remove("x-apiary-csrf");
+        assert_eq!(
+            browser_navigation_signer(&s, &headers).unwrap(),
+            Some(signer)
+        );
         assert!(check(&s, &headers, "GET", "/api/agents", None).is_err());
     }
 
@@ -1032,5 +1096,34 @@ mod tests {
         assert!(authorize_admin(&open, None).is_ok());
         assert!(authorize_admin(&open, Some(manager)).is_ok());
         assert!(authorize_admin(&open, Some(stranger)).is_err());
+    }
+
+    #[test]
+    fn cockpit_access_requires_a_host_or_agent_assignment() {
+        use apiary_core::manifest::{ManagerGrant, ManagerRole};
+
+        let s = state(AuthMode::Nip98);
+        let agent = Keys::generate();
+        let governor = Keys::generate();
+        let viewer = Keys::generate();
+        let stranger = Keys::generate();
+        let agent_npub = apiary_core::identity::to_npub(&agent.public_key()).unwrap();
+        let governor_npub = apiary_core::identity::to_npub(&governor.public_key()).unwrap();
+        let mut manifest = Manifest::from_yaml(&format!(
+            "manifest_version: 1\nidentity:\n  npub: {agent_npub}\nmemory:\n  log: local\ngovernance:\n  suspend_keys:\n    - {governor_npub}\n"
+        ))
+        .unwrap();
+        manifest.governance.managers.push(ManagerGrant {
+            npub: apiary_core::identity::to_npub(&viewer.public_key()).unwrap(),
+            role: ManagerRole::Viewer,
+        });
+        let directory = s.home.join("agents").join(&agent_npub);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("manifest.yaml"), manifest.to_yaml().unwrap()).unwrap();
+
+        assert!(authorize_cockpit(&s, Some(viewer.public_key())).is_ok());
+        assert!(authorize_cockpit(&s, Some(stranger.public_key())).is_err());
+        assert!(authorize_cockpit(&s, None).is_err());
+        let _ = std::fs::remove_dir_all(&s.home);
     }
 }

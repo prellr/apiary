@@ -134,6 +134,7 @@ pub fn build_router(state: App) -> Router {
     Router::new()
         .route("/", get(cockpit))
         .route("/app.js", get(cockpit_js))
+        .route("/signin.js", get(signin_js))
         .route("/api/status", get(ops::status))
         .route("/api/session", post(ops::browser_session_create))
         .route("/api/unlock", post(ops::unlock))
@@ -306,20 +307,60 @@ pub fn build_router(state: App) -> Router {
 const CSP: &str =
     "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'";
 
-async fn cockpit() -> impl IntoResponse {
+async fn cockpit(
+    State(state): State<App>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let authorized = cockpit_navigation_authorized(&state, &headers);
+    let document = if authorized {
+        include_str!("cockpit.html")
+    } else {
+        include_str!("signin.html")
+    };
     (
-        [("content-security-policy", CSP)],
-        Html(include_str!("cockpit.html")),
+        [
+            ("content-security-policy", CSP),
+            ("cache-control", "no-store"),
+        ],
+        Html(document),
     )
+        .into_response()
 }
 
-async fn cockpit_js() -> impl IntoResponse {
+fn cockpit_navigation_authorized(state: &AppState, headers: &axum::http::HeaderMap) -> bool {
+    state.auth == AuthMode::Open
+        || nip98::browser_navigation_signer(state, headers)
+            .ok()
+            .flatten()
+            .is_some_and(|signer| nip98::authorize_cockpit(state, Some(signer)).is_ok())
+}
+
+async fn cockpit_js(
+    State(state): State<App>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if !cockpit_navigation_authorized(&state, &headers) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     (
         [
             ("content-type", "application/javascript; charset=utf-8"),
             ("content-security-policy", CSP),
+            ("cache-control", "no-store"),
         ],
         include_str!("cockpit.js"),
+    )
+        .into_response()
+}
+
+async fn signin_js() -> impl IntoResponse {
+    (
+        [
+            ("content-type", "application/javascript; charset=utf-8"),
+            ("content-security-policy", CSP),
+            ("cache-control", "no-store"),
+        ],
+        include_str!("signin.js"),
     )
 }
 
@@ -985,5 +1026,16 @@ mod tests {
         let yaml = template_manifest(&agent, &[human], purpose);
         let manifest = Manifest::from_yaml(&yaml).unwrap();
         assert_eq!(manifest.constitution.purpose, purpose);
+    }
+
+    #[test]
+    fn public_sign_in_page_does_not_disclose_the_cockpit() {
+        let page = include_str!("signin.html");
+        assert!(page.contains("Authentication required"));
+        assert!(page.contains("Sign in with Nostr"));
+        for private_label in ["New agent", "People &amp; access", "Host status", "Agents"] {
+            assert!(!page.contains(private_label));
+        }
+        assert!(!page.contains("/app.js"));
     }
 }

@@ -272,9 +272,12 @@ pub async fn browser_session_create(
         }
         Err(error) => return error.into_response(),
     };
-    // Do not require host-manager status here. The session proves only the
-    // Nostr identity; each subsequent route decides whether that identity is
-    // a host manager, governor, editor, operator, or viewer for its target.
+    // Do not issue a reusable browser session to an arbitrary valid Nostr
+    // identity. Host managers and people assigned to at least one agent may
+    // enter; individual routes still enforce their narrower role.
+    if let Err(error) = nip98::authorize_cockpit(&state, Some(signer)) {
+        return error.into_response();
+    }
     let session = match nip98::issue_browser_session(&state, signer) {
         Ok(session) => session,
         Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
@@ -321,8 +324,12 @@ pub async fn status(
         .path_and_query()
         .map(|p| p.to_string())
         .unwrap_or_else(|| uri.path().to_string());
-    if let Err(e) = nip98::check(&state, &headers, "GET", &pq, None) {
-        return e.into_response();
+    let signer = match nip98::check(&state, &headers, "GET", &pq, None) {
+        Ok(signer) => signer,
+        Err(error) => return error.into_response(),
+    };
+    if let Err(error) = nip98::authorize_cockpit(&state, signer) {
+        return error.into_response();
     }
     let unlocked = state
         .passphrase
