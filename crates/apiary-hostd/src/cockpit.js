@@ -766,6 +766,13 @@ function quick(title, description, target) {
   return button;
 }
 
+function quickAction(title, description, action) {
+  const button = el('button', 'quick'); button.type = 'button';
+  button.append(el('b', null, title), el('span', null, description));
+  button.onclick = action;
+  return button;
+}
+
 async function renderOverview(c) {
   const proposal = proposalBanner(c);
   const [d, spend, listener, controlTokens] = await Promise.all([
@@ -802,7 +809,14 @@ async function renderOverview(c) {
   const shortcuts = el('div', 'quick-grid');
   shortcuts.append(quick('Start a task', 'Give this agent a one-time job.', 'run'),
     quick('Manage capabilities', 'Choose what it can read or change.', 'connectors'),
-    quick('Manage skills', 'Add approved workflows and expertise.', 'skills'));
+    quick('Manage skills', 'Add approved workflows and expertise.', 'skills'),
+    quickAction('Export or transfer', 'Create a portable agent bundle.', () => {
+      const portability = document.getElementById('agent-portability');
+      if (!portability) return;
+      portability.open = true;
+      portability.scrollIntoView({behavior: 'smooth', block: 'start'});
+      setTimeout(() => portability.querySelector('input')?.focus(), 320);
+    }));
   c.append(shortcuts);
 
   const constitution = m.constitution || {};
@@ -1150,7 +1164,8 @@ async function renderOverview(c) {
   c.append(current);
 
   const advanced = el('details', 'section technical');
-  advanced.append(el('summary', null, 'Identity, portability, and host coordination'));
+  advanced.id = 'agent-portability';
+  advanced.append(el('summary', null, 'Export, identity, and host coordination'));
   const body = el('div');
   const publicIdentity = kv('Public identity', shortNostrId(sel));
   publicIdentity.querySelector('.v').title = sel;
@@ -3185,6 +3200,8 @@ function renderImport(c) {
   const paste = el('details', 'technical'); paste.append(el('summary', null, 'Or paste bundle JSON'), bundle);
   const go = el('button', 'btn solid', 'Verify and import');
   const st = el('div', 'meta', '');
+  st.setAttribute('role', 'status');
+  st.setAttribute('aria-live', 'polite');
   const row = el('div', 'row'); row.append(pass, go);
   sec.append(field('Export bundle', file), paste, field('Handoff passphrase', pass), row, st,
     help('Sealed recipient bundles do not need a handoff passphrase. The imported private key is re-encrypted for this workspace.'));
@@ -3200,17 +3217,23 @@ function renderImport(c) {
     try { parsed = JSON.parse(bundle.value); }
     catch { st.textContent = 'The selected bundle is not valid JSON.'; return; }
     go.disabled = true; st.textContent = 'Verifying identity, signatures, and history…';
-    const r = await j('/api/agents/import', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ bundle: parsed, bundle_passphrase: pass.value || null }),
-    });
-    go.disabled = false;
-    st.textContent = r.ok
-      ? `Imported ${r.name || shortNostrId(r.npub)} with ${r.log_entries} signed history entries. It is inactive on this host.`
-      : 'Could not import: ' + r.error;
-    if (r.ok) {
-      bundle.value = ''; file.value = ''; hostView = null; sel = r.npub; tab = 'overview';
-      await loadRoster(); openTab('overview');
+    try {
+      const r = await j('/api/agents/import', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ bundle: parsed, bundle_passphrase: pass.value || null }),
+      });
+      st.textContent = r.ok
+        ? `Imported ${r.name || shortNostrId(r.npub)} with ${r.log_entries} signed history entries. It is inactive on this host.`
+        : 'Could not import: ' + (r.error || 'The host refused the bundle.');
+      if (r.ok) {
+        bundle.value = ''; file.value = ''; hostView = null; sel = r.npub; tab = 'overview';
+        await loadRoster(); openTab('overview');
+      }
+    } catch (error) {
+      const message = error && error.message ? error.message : String(error);
+      st.textContent = 'Could not import: ' + message + ' Sign in to this workspace, then try again.';
+    } finally {
+      go.disabled = false;
     }
   };
 }

@@ -320,9 +320,18 @@ fn run_local(home: PathBuf, bootstrap: DesktopBootstrap) {
     let _ = std::fs::remove_file(discovery_for_exit);
 }
 
-fn run_remote(home: PathBuf, remote: RemoteConfig, mut bootstrap: DesktopBootstrap) {
+fn run_remote(home: PathBuf, mut remote: RemoteConfig, mut bootstrap: DesktopBootstrap) {
     validate_remote(&remote)
         .unwrap_or_else(|error| startup_error("Remote configuration error", error, 2));
+    let preferred_port = remote.local_port;
+    remote.local_port = choose_local_tunnel_port(preferred_port)
+        .unwrap_or_else(|error| startup_error("Could not prepare remote Apiary", error, 1));
+    if remote.local_port != preferred_port {
+        eprintln!(
+            "Apiary: local port {preferred_port} is busy; using {} for this remote session",
+            remote.local_port
+        );
+    }
     let mut tunnel = start_ssh_tunnel(&remote).unwrap_or_else(|error| {
         startup_error(
             "Could not connect to remote Apiary",
@@ -956,10 +965,35 @@ fn read_remote_desktop_access(remote: &RemoteConfig) -> Result<Option<String>, S
     Ok(Some(access.token))
 }
 
+fn choose_local_tunnel_port(preferred: u16) -> Result<u16, String> {
+    match TcpListener::bind(("127.0.0.1", preferred)) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(preferred)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            let listener = TcpListener::bind("127.0.0.1:0").map_err(|fallback| {
+                format!("could not allocate a local SSH tunnel port: {fallback}")
+            })?;
+            let port = listener
+                .local_addr()
+                .map_err(|fallback| {
+                    format!("could not inspect the local SSH tunnel port: {fallback}")
+                })?
+                .port();
+            drop(listener);
+            Ok(port)
+        }
+        Err(error) => Err(format!(
+            "could not inspect local SSH tunnel port {preferred}: {error}"
+        )),
+    }
+}
+
 fn start_ssh_tunnel(remote: &RemoteConfig) -> Result<SshTunnel, String> {
     TcpListener::bind(("127.0.0.1", remote.local_port)).map_err(|error| {
         format!(
-            "local port {} is unavailable ({error}); stop the local Apiary host or choose another local_port",
+            "local tunnel port {} became unavailable before SSH could start ({error}); reconnect to select another port",
             remote.local_port
         )
     })?;
@@ -1096,6 +1130,23 @@ mod tests {
             .iter()
             .any(|arg| arg == "127.0.0.1:7777:127.0.0.1:7777"));
         assert_eq!(args.last().map(String::as_str), Some("apiary@example.com"));
+    }
+
+    #[test]
+    fn busy_default_port_falls_back_to_a_free_loopback_port() {
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let preferred = occupied.local_addr().unwrap().port();
+        let selected = choose_local_tunnel_port(preferred).unwrap();
+        assert_ne!(selected, preferred);
+        assert_ne!(selected, 0);
+    }
+
+    #[test]
+    fn available_custom_port_is_preserved() {
+        let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+        let preferred = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        assert_eq!(choose_local_tunnel_port(preferred).unwrap(), preferred);
     }
 
     #[test]
