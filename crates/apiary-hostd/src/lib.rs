@@ -27,6 +27,7 @@ use apiary_core::{
 use axum::{
     extract::{OriginalUri, Path as AxPath, Query, State},
     http::StatusCode,
+    middleware,
     response::{Html, IntoResponse},
     routing::{get, post},
     Json, Router,
@@ -70,6 +71,11 @@ pub struct AppState {
     /// host-manager or per-agent authorization gate to the bound signer.
     pub browser_sessions:
         std::sync::Mutex<std::collections::HashMap<String, nip98::BrowserSession>>,
+    /// Per-process credential published only into the host's 0600 state
+    /// directory. A desktop client that already authenticated over SSH may
+    /// exchange it for an ordinary manager-bound browser session. It is
+    /// replaced on every daemon launch and is never accepted as API auth.
+    pub desktop_token: Option<String>,
     /// Process-private capability used only when the MCP control adapter
     /// dispatches into the existing REST router. This preserves one set of
     /// authorization gates without trusting caller-supplied identity headers.
@@ -121,6 +127,25 @@ pub fn write_control_discovery(state: &AppState) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// Publish the ephemeral SSH-to-desktop session credential. Reading this
+/// file requires the same OS account that can administer the headless host;
+/// public HTTP clients never receive it.
+pub fn write_desktop_access(state: &AppState) -> Result<(), std::io::Error> {
+    let Some(token) = state.desktop_token.as_deref() else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(&state.home)?;
+    let path = state.home.join("desktop-access.json");
+    let body = serde_json::to_vec(&json!({ "version": 1, "token": token }))?;
+    std::fs::write(&path, body)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum AuthMode {
     Open,
@@ -133,10 +158,16 @@ pub type App = Arc<AppState>;
 pub fn build_router(state: App) -> Router {
     Router::new()
         .route("/", get(cockpit))
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/app.js", get(cockpit_js))
         .route("/signin.js", get(signin_js))
         .route("/api/status", get(ops::status))
-        .route("/api/session", post(ops::browser_session_create))
+        .route(
+            "/api/session",
+            post(ops::browser_session_create).delete(ops::browser_session_delete),
+        )
+        .route("/api/desktop/session", post(ops::desktop_session_create))
         .route("/api/unlock", post(ops::unlock))
         .route("/api/unlock/forget", post(ops::forget_automatic_unlock))
         .route("/api/lock", post(ops::lock))
@@ -300,6 +331,45 @@ pub fn build_router(state: App) -> Router {
             get(ops::listener_status).delete(ops::listener_stop),
         )
         .with_state(state)
+        .layer(middleware::map_response(no_store))
+}
+
+/// Apiary's cockpit and APIs are private control-plane material. Apply the
+/// cache boundary centrally so a newly added route cannot accidentally be
+/// cached by a browser, reverse proxy, or CDN.
+async fn no_store(mut response: axum::response::Response) -> axum::response::Response {
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// Minimal liveness probe. It intentionally exposes no version, state path,
+/// agent roster, or authentication configuration.
+async fn healthz() -> impl IntoResponse {
+    Json(json!({ "ok": true }))
+}
+
+/// A NIP-98 host without a manager is unreachable by design and therefore not
+/// ready for public traffic. Open mode is ready because its trust boundary is
+/// the loopback/SSH listener itself.
+async fn readyz(State(state): State<App>) -> axum::response::Response {
+    let ready = state.auth == AuthMode::Open
+        || state
+            .managers
+            .read()
+            .map(|managers| !managers.is_empty())
+            .unwrap_or(false);
+    if ready {
+        Json(json!({ "ok": true })).into_response()
+    } else {
+        err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "host manager is not configured",
+        )
+        .into_response()
+    }
 }
 
 /// Restrictive CSP: no inline script, no external anything. Rendering uses
@@ -1015,8 +1085,51 @@ pub fn admit_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::ManagerRegistry;
     use apiary_core::identity;
+    use axum::{body::Body, http::Request};
     use nostr::prelude::Keys;
+    use tower::ServiceExt;
+
+    fn test_state(auth: AuthMode) -> App {
+        test_state_with(auth, Vec::new(), None)
+    }
+
+    fn test_state_with(
+        auth: AuthMode,
+        managers: Vec<nostr::prelude::PublicKey>,
+        desktop_token: Option<&str>,
+    ) -> App {
+        let home = std::env::temp_dir().join(format!(
+            "apiary-hostd-router-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        Arc::new(AppState {
+            home,
+            passphrase: std::sync::RwLock::new(None),
+            remember_passphrase: None,
+            forget_passphrase: None,
+            automatic_unlock: std::sync::atomic::AtomicBool::new(false),
+            auth,
+            origin: "https://apiary.example".into(),
+            managers: std::sync::RwLock::new(ManagerRegistry::in_memory(managers)),
+            token: None,
+            browser_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            desktop_token: desktop_token.map(str::to_string),
+            internal_token: "router-test-internal".into(),
+            control_audit: std::sync::Mutex::new(()),
+            control_tokens: std::sync::Mutex::new(()),
+            listeners: std::sync::Mutex::new(std::collections::HashMap::new()),
+            pending_oauth: std::sync::Mutex::new(std::collections::HashMap::new()),
+            supervisor_notes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            admitted: std::sync::Mutex::new(std::collections::HashMap::new()),
+            decisions: Default::default(),
+        })
+    }
 
     #[test]
     fn founding_template_persists_the_exact_purpose() {
@@ -1037,5 +1150,119 @@ mod tests {
             assert!(!page.contains(private_label));
         }
         assert!(!page.contains("/app.js"));
+    }
+
+    #[tokio::test]
+    async fn every_control_plane_response_is_marked_no_store() {
+        let app = build_router(test_state(AuthMode::Nip98));
+        for path in ["/", "/app.js", "/api/status"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.headers().get(axum::http::header::CACHE_CONTROL),
+                Some(&axum::http::HeaderValue::from_static("no-store")),
+                "missing private cache boundary on {path}"
+            );
+            if path == "/app.js" {
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn health_is_public_but_nip98_readiness_requires_a_manager() {
+        let app = build_router(test_state(AuthMode::Nip98));
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        let readiness = app
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let open = build_router(test_state(AuthMode::Open))
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(open.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ssh_desktop_credential_opens_only_a_manager_bound_session() {
+        let manager = Keys::generate().public_key();
+        let token = "11".repeat(32);
+        let app = build_router(test_state_with(
+            AuthMode::Nip98,
+            vec![manager],
+            Some(&token),
+        ));
+        let request = |authorization: Option<String>| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/api/desktop/session")
+                .header("content-type", "application/json");
+            if let Some(authorization) = authorization {
+                request = request.header("authorization", authorization);
+            }
+            request.body(Body::from("{}")).unwrap()
+        };
+
+        let refused = app.clone().oneshot(request(None)).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+
+        let accepted = app
+            .clone()
+            .oneshot(request(Some(format!("Bearer {token}"))))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let cookie = accepted
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(cookie.starts_with("apiary_session="));
+        assert!(!cookie.contains("Secure"));
+        let cookie = cookie.split(';').next().unwrap();
+
+        let cockpit = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cockpit.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(cockpit.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("New agent"));
     }
 }

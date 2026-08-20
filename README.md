@@ -1,34 +1,57 @@
 # Apiary
 
-**AI agents that remember, use tools, and remain under your control.**
+**Create AI team members that remember, use your tools, and stay under your
+control.**
 
-Apiary is a desktop and server app for building AI agents that can work across
-your services without being locked to one AI provider. Each agent keeps its own
-identity, instructions, memory, and permissions, so you can change models, move
-it between computers, or connect powerful external runtimes without starting
-over or silently expanding what it can do.
+Apiary turns an AI chat into an ongoing helper you can actually manage. Give an
+agent a job, a personality, memory, and access to the services it needs. It can
+then help from your computer, a private server, or connected messaging apps
+without starting from scratch each time.
+
+You choose the AI model and every tool the agent can use. You can make a
+connection read-only, allow writing when needed, set spending limits, and
+decide who may operate or change the agent. Changing models or moving to
+another machine does not erase the agent's identity, instructions, or history.
 
 [![CI](https://github.com/prellr/apiary/actions/workflows/ci.yml/badge.svg)](https://github.com/prellr/apiary/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
-> Apiary is under active development. The desktop app, headless host, governed
-> runtime, remote mode, connectors, skills, presence, and agent portability are
-> implemented. Interfaces and manifest fields may still change.
+> Apiary is under active development. Its core desktop, server, connector,
+> memory, skills, remote access, and portability features work today, but setup
+> and configuration may still change before the first stable release.
 
-## The idea
+## Why Apiary
 
-An Apiary agent has five durable parts:
+Most AI assistants are temporary conversations controlled by one provider.
+Apiary is designed for durable agents that belong to you:
 
-| Part | What it controls |
+- **They remember.** Each agent can carry useful history and retrieve older
+  context when it is relevant.
+- **They can do real work.** You may connect files, websites, Git repositories,
+  messaging services, MCP tools, or larger agent runtimes.
+- **They are portable.** Models, providers, computers, and runtimes can change
+  without creating a new agent.
+- **Their access is explicit.** An agent only receives tools and permissions
+  that a manager approves, and it cannot grant itself more.
+- **Management can be scoped.** Different people or manager agents can control
+  the whole Apiary host or only the individual agents assigned to them.
+
+## How an Apiary agent works
+
+Each agent keeps five things separate from whichever AI model it uses:
+
+| Part | In everyday terms |
 | --- | --- |
-| Identity | A self-owned Nostr keypair |
-| Constitution | Purpose, role, voice, principles, and boundaries |
-| Memory | A signed history plus local semantic retrieval |
-| Capabilities | Explicit connectors, skills, inference, and harness access |
-| Governance | The people or agents allowed to operate or change it |
+| Identity | A stable, portable identity backed by Nostr |
+| Role and rules | Its job, personality, behavior, and boundaries |
+| Memory | Its signed history and locally retrieved context |
+| Tools and AI | The approved models, services, skills, and runtimes it may use |
+| Management | The people or manager agents allowed to operate or change it |
 
-The model is replaceable cognition. It is not the agent's identity and it does
-not decide its own permissions.
+The AI model is the engine, not the agent. You can change the engine without
+replacing the agent, and the engine cannot change its own permissions.
+
+### Technical shape
 
 ```mermaid
 flowchart LR
@@ -42,9 +65,10 @@ flowchart LR
     R --> A["Optional ACP harnesses"]
 ```
 
-Signed manifests and ratification events are the portable authority. The host
-derives one small operational decision from them; task history, health, spend,
-indexes, and UI state remain ordinary off-chain projections.
+Approved changes are kept as signed, portable records. The host reduces those
+records to one fast authorization decision before work begins. Task history,
+health, spending, search indexes, and interface state stay off-chain so normal
+operation remains responsive.
 
 ## What works today
 
@@ -94,6 +118,18 @@ scripts/build-desktop.sh
 
 This produces `target/release/Apiary` with a stable signing identifier so
 macOS Keychain does not treat every rebuild as a different application.
+
+For a distributable macOS app and DMG, install Tauri CLI 2 and run the release
+packager:
+
+```bash
+cargo install tauri-cli --version '^2' --locked
+scripts/package-macos.sh
+```
+
+The release packager requires a Developer ID Application identity and Apple
+notarization credentials. See [docs/RELEASE.md](docs/RELEASE.md) for the
+fail-closed release checklist and the explicit local-test override.
 
 ### CLI
 
@@ -254,6 +290,9 @@ Useful references:
 - [Routines scope](docs/SCOPE_routines.md)
 - [Sealed handoffs scope](docs/SCOPE_sealed-handoffs.md)
 - [Voice and modalities scope](docs/SCOPE_voice-and-modalities.md)
+- [Release checklist](docs/RELEASE.md)
+- [Backup and recovery runbook](docs/RECOVERY.md)
+- [Security policy](SECURITY.md)
 
 ## Development
 

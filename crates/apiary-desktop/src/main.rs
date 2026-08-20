@@ -15,7 +15,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use apiary_hostd::{build_router, AppState, AuthMode};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -77,6 +79,8 @@ struct DesktopBootstrap {
     active_remote: Option<String>,
     remotes: Vec<DesktopRemoteView>,
     environment_override: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    access_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -189,6 +193,14 @@ fn main() {
     let home = std::env::var_os("APIARY_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(default_home);
+    // LaunchServices normally focuses the existing app, but direct binary
+    // launches and obsolete KeepAlive jobs can still attempt a second copy.
+    // Refuse before either process competes for the SSH tunnel port.
+    let _instance_lock = match acquire_instance_lock(&home) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => std::process::exit(0),
+        Err(error) => startup_error("Could not start Apiary", error, 2),
+    };
     match load_launch_config(&home) {
         Ok(LaunchConfig {
             remote: Some(remote),
@@ -199,6 +211,27 @@ fn main() {
             bootstrap,
         }) => run_local(home, bootstrap),
         Err(error) => startup_error("Remote configuration error", error, 2),
+    }
+}
+
+fn acquire_instance_lock(home: &Path) -> Result<Option<File>, String> {
+    std::fs::create_dir_all(home)
+        .map_err(|error| format!("could not create {}: {error}", home.display()))?;
+    let path = home.join("desktop-instance.lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&path)
+        .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(format!("could not lock {}: {error}", path.display())),
     }
 }
 
@@ -237,6 +270,7 @@ fn run_local(home: PathBuf, bootstrap: DesktopBootstrap) {
         origin: format!("http://127.0.0.1:{port}"),
         token: Some(token.clone()),
         browser_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+        desktop_token: None,
         internal_token: apiary_core::identity::generate()
             .secret_key()
             .to_secret_hex(),
@@ -286,7 +320,7 @@ fn run_local(home: PathBuf, bootstrap: DesktopBootstrap) {
     let _ = std::fs::remove_file(discovery_for_exit);
 }
 
-fn run_remote(home: PathBuf, remote: RemoteConfig, bootstrap: DesktopBootstrap) {
+fn run_remote(home: PathBuf, remote: RemoteConfig, mut bootstrap: DesktopBootstrap) {
     validate_remote(&remote)
         .unwrap_or_else(|error| startup_error("Remote configuration error", error, 2));
     let mut tunnel = start_ssh_tunnel(&remote).unwrap_or_else(|error| {
@@ -296,6 +330,13 @@ fn run_remote(home: PathBuf, remote: RemoteConfig, bootstrap: DesktopBootstrap) 
             1,
         )
     });
+    bootstrap.access_token = match read_remote_desktop_access(&remote) {
+        Ok(token) => token,
+        Err(error) => {
+            eprintln!("Apiary: desktop authentication is unavailable: {error}");
+            None
+        }
+    };
     let discovery = state_home_discovery_path(&home);
     write_discovery(
         &discovery,
@@ -451,6 +492,7 @@ fn load_launch_config(home: &Path) -> Result<LaunchConfig, String> {
                     ssh_target: remote.ssh_target.clone(),
                 }],
                 environment_override: true,
+                access_token: None,
             },
         });
     }
@@ -471,6 +513,7 @@ fn load_launch_config(home: &Path) -> Result<LaunchConfig, String> {
                 })
                 .collect(),
             environment_override: false,
+            access_token: None,
         },
     })
 }
@@ -864,6 +907,55 @@ fn ssh_args(remote: &RemoteConfig) -> Vec<String> {
     args
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteDesktopAccess {
+    version: u32,
+    token: String,
+}
+
+fn read_remote_desktop_access(remote: &RemoteConfig) -> Result<Option<String>, String> {
+    let mut args = vec![
+        "-T".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=yes".into(),
+        "-o".into(),
+        "ConnectTimeout=10".into(),
+    ];
+    if let Some(port) = remote.ssh_port {
+        args.extend(["-p".into(), port.to_string()]);
+    }
+    if let Some(identity) = remote.identity_file.as_ref() {
+        args.extend(["-i".into(), identity.to_string_lossy().into_owned()]);
+    }
+    args.extend([
+        remote.ssh_target.clone(),
+        "cat".into(),
+        ".apiary/desktop-access.json".into(),
+    ]);
+    let output = Command::new("ssh")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("could not read the remote desktop credential: {error}"))?;
+    if !output.status.success() {
+        // Older hosts do not publish this credential. Keep the NIP-07 flow as
+        // a backward-compatible fallback until they are upgraded.
+        return Ok(None);
+    }
+    let access: RemoteDesktopAccess = serde_json::from_slice(&output.stdout)
+        .map_err(|_| "the remote desktop credential file is invalid".to_string())?;
+    if access.version != 1
+        || access.token.len() != 64
+        || !access.token.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("the remote desktop credential was malformed".into());
+    }
+    Ok(Some(access.token))
+}
+
 fn start_ssh_tunnel(remote: &RemoteConfig) -> Result<SshTunnel, String> {
     TcpListener::bind(("127.0.0.1", remote.local_port)).map_err(|error| {
         format!(
@@ -911,22 +1003,37 @@ fn start_ssh_tunnel(remote: &RemoteConfig) -> Result<SshTunnel, String> {
 }
 
 fn remote_host_ready(port: u16) -> bool {
+    remote_probe(port, "/healthz")
+        .is_some_and(|response| apiary_probe_response_is_ready("/healthz", &response))
+        || remote_probe(port, "/api/status")
+            .is_some_and(|response| apiary_probe_response_is_ready("/api/status", &response))
+}
+
+fn remote_probe(port: u16, path: &str) -> Option<String> {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(300)) else {
-        return false;
-    };
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(300)).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
-    if stream
-        .write_all(b"GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-        .is_err()
-    {
-        return false;
-    }
+    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).ok()?;
     let mut response = String::new();
-    stream.read_to_string(&mut response).is_ok()
-        && (response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200"))
-        && response.contains("\"ok\":true")
+    stream.read_to_string(&mut response).ok()?;
+    Some(response)
+}
+
+fn apiary_probe_response_is_ready(path: &str, response: &str) -> bool {
+    let is_ok = response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200");
+    if is_ok && response.contains("\"ok\":true") {
+        return true;
+    }
+    // Hosts from before /healthz still prove they are Apiary by rejecting the
+    // status request at the NIP-98 boundary. Authentication happens inside the
+    // webview after the tunnel is established; a 401 here is readiness, not a
+    // failed SSH connection.
+    path == "/api/status"
+        && (response.starts_with("HTTP/1.1 401") || response.starts_with("HTTP/1.0 401"))
+        && response.contains("\"ok\":false")
+        && response.contains("nip98:")
 }
 
 fn percent_encode_query(value: &str) -> String {
@@ -963,6 +1070,24 @@ mod tests {
     }
 
     #[test]
+    fn a_second_desktop_instance_is_refused_before_opening_a_tunnel() {
+        let home = std::env::temp_dir().join(format!(
+            "apiary-desktop-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let first = acquire_instance_lock(&home).unwrap().unwrap();
+        assert!(acquire_instance_lock(&home).unwrap().is_none());
+        drop(first);
+        assert!(acquire_instance_lock(&home).unwrap().is_some());
+        let _ = std::fs::remove_file(home.join("desktop-instance.lock"));
+        let _ = std::fs::remove_dir(home);
+    }
+
+    #[test]
     fn ssh_tunnel_is_loopback_only_and_noninteractive() {
         let args = ssh_args(&remote());
         assert!(args.iter().any(|arg| arg == "BatchMode=yes"));
@@ -971,6 +1096,26 @@ mod tests {
             .iter()
             .any(|arg| arg == "127.0.0.1:7777:127.0.0.1:7777"));
         assert_eq!(args.last().map(String::as_str), Some("apiary@example.com"));
+    }
+
+    #[test]
+    fn remote_probe_accepts_health_and_nip98_auth_boundaries() {
+        assert!(apiary_probe_response_is_ready(
+            "/healthz",
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"ok\":true}"
+        ));
+        assert!(apiary_probe_response_is_ready(
+            "/api/status",
+            "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\n\r\n{\"error\":\"nip98: missing Authorization header\",\"ok\":false}"
+        ));
+        assert!(!apiary_probe_response_is_ready(
+            "/api/status",
+            "HTTP/1.1 401 Unauthorized\r\n\r\nlogin required"
+        ));
+        assert!(!apiary_probe_response_is_ready(
+            "/healthz",
+            "HTTP/1.1 404 Not Found\r\n\r\n"
+        ));
     }
 
     #[test]

@@ -278,7 +278,89 @@ pub async fn browser_session_create(
     if let Err(error) = nip98::authorize_cockpit(&state, Some(signer)) {
         return error.into_response();
     }
-    let session = match nip98::issue_browser_session(&state, signer) {
+    let secure = state.origin.starts_with("https://");
+    browser_session_response(&state, signer, secure)
+}
+
+#[derive(Default, serde::Deserialize)]
+pub struct DesktopSessionRequest {
+    manager: Option<String>,
+}
+
+/// Exchange the daemon's per-process desktop credential for the same
+/// manager-bound session created by NIP-98. The credential is only published
+/// in a 0600 file and is retrieved after SSH has authenticated the desktop.
+/// It is never a general API bearer token.
+pub async fn desktop_session_create(
+    State(state): State<App>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<DesktopSessionRequest>,
+) -> axum::response::Response {
+    if state.auth != crate::AuthMode::Nip98 {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "desktop session exchange is only used in NIP-98 mode",
+        )
+        .into_response();
+    }
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    let expected = state.desktop_token.as_deref().unwrap_or_default();
+    if expected.is_empty() || !nip98::constant_time_eq(presented, expected) {
+        return err(StatusCode::UNAUTHORIZED, "desktop credential was refused").into_response();
+    }
+
+    let managers = match state.managers.read() {
+        Ok(managers) => managers,
+        Err(_) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "manager registry unavailable",
+            )
+            .into_response()
+        }
+    };
+    let views = managers.views();
+    let selected = match body.manager.as_deref() {
+        Some(npub) => views.iter().find(|manager| manager.npub == npub),
+        None if views.len() == 1 => views.first(),
+        None => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "ok": false,
+                    "error": "choose the approved manager identity for this desktop session",
+                    "managers": views,
+                })),
+            )
+                .into_response()
+        }
+    };
+    let Some(selected) = selected else {
+        return err(StatusCode::FORBIDDEN, "that identity is not a host manager").into_response();
+    };
+    let signer = match apiary_core::identity::parse_npub(&selected.npub) {
+        Ok(signer) => signer,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    drop(managers);
+
+    // This cookie is deliberately not Secure: this endpoint is consumed over
+    // the SSH-forwarded loopback origin (http://127.0.0.1). The unpredictable
+    // bearer above is still required, and the resulting cookie remains
+    // HttpOnly, SameSite=Strict, manager-bound, and CSRF-bound.
+    browser_session_response(&state, signer, false)
+}
+
+fn browser_session_response(
+    state: &AppState,
+    signer: PublicKey,
+    secure_cookie: bool,
+) -> axum::response::Response {
+    let session = match nip98::issue_browser_session(state, signer) {
         Ok(session) => session,
         Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     };
@@ -286,11 +368,7 @@ pub async fn browser_session_create(
         Ok(npub) => npub,
         Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     };
-    let secure = if state.origin.starts_with("https://") {
-        "; Secure"
-    } else {
-        ""
-    };
+    let secure = if secure_cookie { "; Secure" } else { "" };
     let cookie = format!(
         "apiary_session={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
         session.token,
@@ -311,6 +389,38 @@ pub async fn browser_session_create(
     response.headers_mut().insert(
         axum::http::header::CACHE_CONTROL,
         axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// Explicitly revoke the current browser session and expire its cookie.
+pub async fn browser_session_delete(
+    State(state): State<App>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if state.auth != crate::AuthMode::Nip98 {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "browser sessions are only used in NIP-98 mode",
+        )
+        .into_response();
+    }
+    if let Err(error) = nip98::revoke_browser_session(&state, &headers) {
+        return error.into_response();
+    }
+    let secure = if state.origin.starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie = format!(
+        "apiary_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
+        secure,
+    );
+    let mut response = Json(json!({ "ok": true })).into_response();
+    response.headers_mut().insert(
+        axum::http::header::SET_COOKIE,
+        cookie.parse().expect("expired session cookie is valid"),
     );
     response
 }

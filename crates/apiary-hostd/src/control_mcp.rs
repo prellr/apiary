@@ -458,6 +458,7 @@ mod tests {
             managers: std::sync::RwLock::new(ManagerRegistry::in_memory(Vec::new())),
             token: None,
             browser_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            desktop_token: None,
             internal_token: "control-mcp-test-internal".into(),
             control_audit: std::sync::Mutex::new(()),
             control_tokens: std::sync::Mutex::new(()),

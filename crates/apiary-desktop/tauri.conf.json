@@ -13,6 +13,12 @@
     }
   },
   "bundle": {
-    "active": false
+    "active": true,
+    "targets": ["app", "dmg"],
+    "icon": ["icons/icon.png"],
+    "shortDescription": "Portable AI agents you govern",
+    "macOS": {
+      "minimumSystemVersion": "12.0"
+    }
   }
 }

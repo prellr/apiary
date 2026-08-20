@@ -3,7 +3,11 @@
 
 * * *
 ## 1. Thesis
-Build a host for **portable agents**: durable principals with self-owned identity, not sessions welded to a platform.
+Apiary gives AI agents a lasting home. Each agent keeps its own identity,
+memory, instructions, and permissions as it moves between models, computers,
+and services instead of being trapped inside one platform. Its identity is
+backed by a self-owned Nostr key, so it can be verified independently of any
+Apiary host.
 
 An agent here is five things, none of which is the model:
 

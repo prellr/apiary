@@ -69,6 +69,9 @@ async fn main() {
             eprintln!("error: host manager registry: {error}");
             std::process::exit(2);
         });
+    let desktop_token = apiary_core::identity::generate()
+        .secret_key()
+        .to_secret_hex();
     let state = Arc::new(AppState {
         home: args.home.clone(),
         passphrase: std::sync::RwLock::new(args.passphrase.clone()),
@@ -82,6 +85,7 @@ async fn main() {
             .unwrap_or_else(|| format!("http://{}", args.bind)),
         token: None,
         browser_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+        desktop_token: Some(desktop_token),
         internal_token: apiary_core::identity::generate()
             .secret_key()
             .to_secret_hex(),
@@ -96,6 +100,10 @@ async fn main() {
     });
     apiary_hostd::write_control_discovery(&state).unwrap_or_else(|error| {
         eprintln!("error: control-plane discovery: {error}");
+        std::process::exit(2);
+    });
+    apiary_hostd::write_desktop_access(&state).unwrap_or_else(|error| {
+        eprintln!("error: desktop access discovery: {error}");
         std::process::exit(2);
     });
     apiary_hostd::ops::spawn_supervisor(state.clone());

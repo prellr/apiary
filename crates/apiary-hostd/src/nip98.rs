@@ -130,6 +130,50 @@ pub fn browser_navigation_signer(
     check_browser_session(state, headers, false)
 }
 
+/// Revoke the browser session named by the HttpOnly cookie. Logout is a
+/// state-changing request, so it requires the same per-session CSRF value as
+/// every other cookie-authenticated mutation.
+pub fn revoke_browser_session(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<PublicKey, (StatusCode, Json<serde_json::Value>)> {
+    let token = headers
+        .get("cookie")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|cookie| {
+                let (name, value) = cookie.trim().split_once('=')?;
+                (name == "apiary_session").then(|| value.to_string())
+            })
+        })
+        .ok_or_else(|| crate::err(StatusCode::UNAUTHORIZED, "apiary session is missing"))?;
+    let csrf = headers
+        .get("x-apiary-csrf")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut sessions = state
+        .browser_sessions
+        .lock()
+        .map_err(|_| crate::err(StatusCode::UNAUTHORIZED, "apiary session is unavailable"))?;
+    sessions.retain(|_, session| session.expires_at > now);
+    let session = sessions
+        .get(&token)
+        .ok_or_else(|| crate::err(StatusCode::UNAUTHORIZED, "apiary session expired"))?;
+    if !constant_time_eq(csrf, &session.csrf) {
+        return Err(crate::err(
+            StatusCode::UNAUTHORIZED,
+            "apiary session is missing its request token",
+        ));
+    }
+    let signer = session.signer;
+    sessions.remove(&token);
+    Ok(signer)
+}
+
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct ControlTokenFile {
@@ -251,7 +295,7 @@ pub fn revoke_control_token(
     Ok(result)
 }
 
-fn constant_time_eq(presented: &str, expected: &str) -> bool {
+pub(crate) fn constant_time_eq(presented: &str, expected: &str) -> bool {
     presented.len() == expected.len()
         && presented
             .bytes()
@@ -731,6 +775,7 @@ mod tests {
             origin: "http://127.0.0.1:7777".into(),
             token: None,
             browser_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            desktop_token: None,
             internal_token: "test-internal-token".into(),
             control_audit: std::sync::Mutex::new(()),
             control_tokens: std::sync::Mutex::new(()),
@@ -854,6 +899,22 @@ mod tests {
             Some(signer)
         );
         assert!(check(&s, &headers, "GET", "/api/agents", None).is_err());
+    }
+
+    #[test]
+    fn browser_session_logout_requires_csrf_and_revokes_the_cookie() {
+        let s = state(AuthMode::Nip98);
+        let signer = Keys::generate().public_key();
+        let issued = issue_browser_session(&s, signer).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            format!("apiary_session={}", issued.token).parse().unwrap(),
+        );
+        assert!(revoke_browser_session(&s, &headers).is_err());
+        headers.insert("x-apiary-csrf", issued.csrf.parse().unwrap());
+        assert_eq!(revoke_browser_session(&s, &headers).unwrap(), signer);
+        assert!(browser_navigation_signer(&s, &headers).is_err());
     }
 
     #[test]

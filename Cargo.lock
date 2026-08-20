@@ -152,6 +152,7 @@ dependencies = [
  "apiary-core",
  "apiary-hostd",
  "axum",
+ "fs2",
  "security-framework",
  "serde",
  "serde_json",

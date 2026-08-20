@@ -100,6 +100,22 @@ async function j(url, opts) {
   const r = await apiaryFetch(url, opts);
   return r.json();
 }
+async function signOut() {
+  const response = await fetch('/api/session', {
+    method: 'DELETE',
+    credentials: 'same-origin',
+    headers: hdrs(),
+  });
+  if (!response.ok && response.status !== 401) {
+    const result = await response.json().catch(() => ({}));
+    throw new Error(result.error || `Sign out failed (${response.status}).`);
+  }
+  SESSION_CSRF = null;
+  SESSION_NPUB = null;
+  sessionStorage.removeItem('apiary.csrf');
+  sessionStorage.removeItem('apiary.npub');
+  location.replace('/');
+}
 
 // el('div', 'cls', 'text') — safe node construction.
 function el(tag, cls, text) {
@@ -343,6 +359,7 @@ async function loadStatus() {
   set('c-auth', 'Authentication · ' + (hostStatus.auth || '?')
       + (hostStatus.token_gated ? ' + token' : '')
       + (REMOTE ? ' · SSH → ' + REMOTE : ''));
+  document.getElementById('signout').hidden = hostStatus.auth !== 'nip98' || !!TOKEN;
   set('c-model', hostStatus.anthropic_key_present ? 'Drafting model ready' : 'Drafting model unavailable',
       'chip ' + (hostStatus.anthropic_key_present ? 'ok' : ''));
   document.getElementById('c-model').title = hostStatus.anthropic_key_present
@@ -363,6 +380,16 @@ async function loadStatus() {
       : 'keystore unlocked for this session — LOCK to forget the passphrase')
     : 'passphrase unlocks the NIP-49 keystore for this session — needed to run, ratify, found, post, seal:';
 }
+
+document.getElementById('signout').onclick = async event => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try { await signOut(); }
+  catch (error) {
+    button.disabled = false;
+    alert(error && error.message ? error.message : 'Could not sign out.');
+  }
+};
 
 async function loadOwners() {
   try {

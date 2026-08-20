@@ -3,11 +3,11 @@
 Three user agents cover desktop, speech, and headless deployments. Install only
 the services a machine needs:
 
-- `wine.wisco.apiary.desktop` — the desktop app (embedded daemon +
-  supervisor: presence, routines, lease). `KeepAlive` restarts it if it
-  dies. The first GUI unlock can remember the keystore passphrase in macOS
-  Keychain; the launchd plist never contains it. (NIP-46 remote signing is
-  still on the roadmap.)
+- `wine.wisco.apiary.desktop` is retained only as a migration template and is
+  deliberately **not** `KeepAlive`. Launch Apiary from Applications. Keeping a
+  GUI process alive causes it to reopen after Quit and races a manually opened
+  copy for the same SSH tunnel port. Use the headless host daemon below for
+  always-on agents, presence, routines, and leases.
 - `wine.wisco.apiary.kokoro` — the local TTS server (`services/kokoro`).
 - `wine.wisco.apiary.hostd` — the headless host for SSH remote mode. It binds
   only `127.0.0.1:7777`; the Desktop app supplies the encrypted tunnel.

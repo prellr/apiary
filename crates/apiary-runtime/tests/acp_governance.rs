@@ -51,11 +51,13 @@ fn grant(command: &str, access: HarnessAccess) -> HarnessGrant {
 fn acp_deny_mode_blocks_tool_and_logs_harness() {
     let (mut manifest, dir, custody, handle) = setup("deny");
     let mock = env!("CARGO_BIN_EXE_mock-acp-agent");
-    let mut grant = grant(mock, HarnessAccess::InferenceOnly);
+    let grant = grant(mock, HarnessAccess::InferenceOnly);
     #[cfg(target_os = "macos")]
-    {
+    let grant = {
+        let mut grant = grant;
         grant.sandbox = HarnessSandbox::ReadOnly;
-    }
+        grant
+    };
     manifest.harnesses.push(grant.clone());
     let out = apiary_runtime::runner::run_acp_task(
         &manifest,
