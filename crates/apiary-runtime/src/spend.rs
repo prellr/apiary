@@ -48,6 +48,48 @@ pub struct SpendLedger {
     lock_path: PathBuf,
 }
 
+/// Releases an inference reservation when a fallible run exits before it can
+/// record actual usage. Explicit settlement disarms the guard.
+pub struct ReservationGuard<'a> {
+    ledger: &'a SpendLedger,
+    reservation: Option<Reservation>,
+}
+
+impl<'a> ReservationGuard<'a> {
+    pub fn new(ledger: &'a SpendLedger, reservation: Reservation) -> Self {
+        Self {
+            ledger,
+            reservation: Some(reservation),
+        }
+    }
+
+    pub fn release(&mut self) -> Result<(), crate::Error> {
+        let Some(reservation) = self.reservation else {
+            return Ok(());
+        };
+        self.ledger.settle(reservation, 0, 0)?;
+        self.reservation = None;
+        Ok(())
+    }
+
+    pub fn settle(
+        &mut self,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<(DaySpend, bool), crate::Error> {
+        let reservation = self.reservation.take().ok_or_else(|| {
+            crate::Error::Budget("inference reservation was already settled".into())
+        })?;
+        self.ledger.settle(reservation, input_tokens, output_tokens)
+    }
+}
+
+impl Drop for ReservationGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -280,6 +322,18 @@ mod tests {
         assert_eq!(r2.amount, 40);
         l.settle(r2, 40, 0).unwrap();
         assert!(l.reserve(Some(100)).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dropped_guard_releases_capacity() {
+        let (ledger, dir) = ledger("guard");
+        {
+            let reservation = ledger.reserve(Some(100)).unwrap();
+            let _guard = ReservationGuard::new(&ledger, reservation);
+            assert!(ledger.reserve(Some(100)).is_err());
+        }
+        assert_eq!(ledger.reserve(Some(100)).unwrap().amount, 100);
         std::fs::remove_dir_all(&dir).ok();
     }
 

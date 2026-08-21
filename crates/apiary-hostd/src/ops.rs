@@ -21,6 +21,23 @@ use zeroize::Zeroizing;
 
 type Resp = (StatusCode, Json<serde_json::Value>);
 
+fn persist_manifest(dir: &std::path::Path, expected_raw: &str, yaml: &str) -> Result<String, Resp> {
+    crate::agent_store::replace_manifest(dir, expected_raw, yaml).map_err(|error| match error {
+        crate::agent_store::StoreError::Conflict { current_revision } => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "error": "the agent changed while this amendment was being prepared; reload and try again",
+                "code": "manifest_revision_conflict",
+                "current_revision": current_revision,
+            })),
+        ),
+        crate::agent_store::StoreError::Io(error) => {
+            err(StatusCode::INTERNAL_SERVER_ERROR, error)
+        }
+    })
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -169,6 +186,17 @@ fn gate(
     let (ks, npub, dir) = agent_ctx(state, npub)?;
     let (raw, manifest) = load_manifest(&dir)?;
     nip98::authorize_agent_request(state, signer, &manifest, method, &pq)?;
+    let path = uri.path();
+    let deleting_agent = method == "DELETE"
+        && path
+            .strip_prefix("/api/agents/")
+            .is_some_and(|tail| !tail.contains('/'));
+    if is_archived(&dir) && method != "GET" && !path.ends_with("/archive") && !deleting_agent {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "agent is archived — restore it before changing or running it",
+        ));
+    }
     Ok((ks, npub, dir, raw, manifest))
 }
 
@@ -355,7 +383,7 @@ pub async fn desktop_session_create(
     browser_session_response(&state, signer, false)
 }
 
-fn browser_session_response(
+pub(crate) fn browser_session_response(
     state: &AppState,
     signer: PublicKey,
     secure_cookie: bool,
@@ -405,8 +433,14 @@ pub async fn browser_session_delete(
         )
         .into_response();
     }
-    if let Err(error) = nip98::revoke_browser_session(&state, &headers) {
-        return error.into_response();
+    let signer = match nip98::revoke_browser_session(&state, &headers) {
+        Ok(signer) => signer,
+        Err(error) => return error.into_response(),
+    };
+    // NIP-46 client keys are disposable session material. Logging out drops
+    // the connection rather than silently retaining signing authority.
+    if let Ok(mut signers) = state.remote_signers.lock() {
+        signers.remove(&signer.to_hex());
     }
     let secure = if state.origin.starts_with("https://") {
         "; Secure"
@@ -488,6 +522,7 @@ pub async fn status(
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
         "home": state.home.display().to_string(),
+        "origin": state.origin,
         "auth": match state.auth { crate::AuthMode::Open => "open", crate::AuthMode::Nip98 => "nip98" },
         "token_gated": state.token.is_some(),
         "unlocked": unlocked,
@@ -637,7 +672,7 @@ pub async fn governors_set(
     headers: axum::http::HeaderMap,
     raw_body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let (_ks, npub, dir, _raw, mut manifest) =
+    let (_ks, npub, dir, raw, mut manifest) =
         match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
             Ok(value) => value,
             Err(error) => return error.into_response(),
@@ -712,8 +747,8 @@ pub async fn governors_set(
         Ok(yaml) => yaml,
         Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     };
-    if let Err(error) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    if let Err(error) = persist_manifest(&dir, &raw, &yaml) {
+        return error.into_response();
     }
     Json(json!({
         "ok": true,
@@ -749,7 +784,7 @@ pub async fn constitution_set(
     headers: axum::http::HeaderMap,
     raw_body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let (_ks, npub, dir, _raw, mut manifest) =
+    let (_ks, npub, dir, raw, mut manifest) =
         match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
             Ok(value) => value,
             Err(error) => return error.into_response(),
@@ -776,8 +811,8 @@ pub async fn constitution_set(
         Ok(yaml) => yaml,
         Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     };
-    if let Err(error) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    if let Err(error) = persist_manifest(&dir, &raw, &yaml) {
+        return error.into_response();
     }
     Json(json!({
         "ok": true,
@@ -850,7 +885,7 @@ pub async fn skill_upsert(
     headers: axum::http::HeaderMap,
     raw_body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let (_ks, npub, dir, _raw, mut manifest) =
+    let (_ks, npub, dir, raw, mut manifest) =
         match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
             Ok(value) => value,
             Err(error) => return error.into_response(),
@@ -890,8 +925,8 @@ pub async fn skill_upsert(
         Ok(yaml) => yaml,
         Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     };
-    if let Err(error) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    if let Err(error) = persist_manifest(&dir, &raw, &yaml) {
+        return error.into_response();
     }
     Json(json!({
         "ok": true,
@@ -910,7 +945,7 @@ pub async fn skill_delete(
     OriginalUri(uri): OriginalUri,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let (_ks, npub, dir, _raw, mut manifest) =
+    let (_ks, npub, dir, raw, mut manifest) =
         match gate(&state, &headers, "DELETE", &uri, None, &npub) {
             Ok(value) => value,
             Err(error) => return error.into_response(),
@@ -924,8 +959,8 @@ pub async fn skill_delete(
         Ok(yaml) => yaml,
         Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     };
-    if let Err(error) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    if let Err(error) = persist_manifest(&dir, &raw, &yaml) {
+        return error.into_response();
     }
     Json(json!({
         "ok": true,
@@ -1100,7 +1135,7 @@ pub async fn harness_upsert(
     headers: axum::http::HeaderMap,
     raw_body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let (_ks, npub, dir, _raw, mut manifest) =
+    let (_ks, npub, dir, raw, mut manifest) =
         match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
             Ok(value) => value,
             Err(error) => return error.into_response(),
@@ -1139,8 +1174,8 @@ pub async fn harness_upsert(
         Ok(yaml) => yaml,
         Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     };
-    if let Err(error) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    if let Err(error) = persist_manifest(&dir, &raw, &yaml) {
+        return error.into_response();
     }
     Json(json!({
         "ok": true,
@@ -1159,7 +1194,7 @@ pub async fn harness_delete(
     OriginalUri(uri): OriginalUri,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let (_ks, npub, dir, _raw, mut manifest) =
+    let (_ks, npub, dir, raw, mut manifest) =
         match gate(&state, &headers, "DELETE", &uri, None, &npub) {
             Ok(value) => value,
             Err(error) => return error.into_response(),
@@ -1173,8 +1208,8 @@ pub async fn harness_delete(
         Ok(yaml) => yaml,
         Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     };
-    if let Err(error) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    if let Err(error) = persist_manifest(&dir, &raw, &yaml) {
+        return error.into_response();
     }
     Json(json!({
         "ok": true,
@@ -1320,16 +1355,8 @@ pub async fn unlock(
     // NIP-49 scrypt is deliberately slow — off the async runtime.
     let verified = tokio::task::spawn_blocking(move || {
         let ks = Keystore::open(&state2.home).map_err(|e| e.to_string())?;
-        let listed = ks.list().map_err(|e| e.to_string())?;
-        match listed.first() {
-            Some(first) => ks
-                .load(first, &pass)
-                .map(|_| true)
-                .map_err(|e| format!("wrong passphrase? ({e})")),
-            // Empty keystore: nothing to verify against; accept and the
-            // first founding will set the standard.
-            None => Ok(false),
-        }
+        ks.verify_or_initialize_workspace(&pass)
+            .map_err(|_| "This workspace passphrase does not match.".to_string())
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()));
@@ -1843,7 +1870,7 @@ pub async fn inference_set_fallback(
     headers: axum::http::HeaderMap,
     raw_body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let (_ks, npub, dir, _raw, mut manifest) =
+    let (_ks, npub, dir, raw, mut manifest) =
         match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
             Ok(value) => value,
             Err(error) => return error.into_response(),
@@ -1894,8 +1921,8 @@ pub async fn inference_set_fallback(
         Ok(yaml) => yaml,
         Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
     };
-    if let Err(error) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    if let Err(error) = persist_manifest(&dir, &raw, &yaml) {
+        return error.into_response();
     }
     state.decisions.invalidate(&npub);
     Json(json!({
@@ -2014,7 +2041,7 @@ pub async fn inference_upsert(
     headers: axum::http::HeaderMap,
     raw_body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let (ks, npub, dir, _raw, mut manifest) =
+    let (ks, npub, dir, raw, mut manifest) =
         match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
             Ok(v) => v,
             Err(e) => return e.into_response(),
@@ -2172,8 +2199,8 @@ pub async fn inference_upsert(
         Ok(y) => y,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    if let Err(error) = persist_manifest(&dir, &raw, &yaml) {
+        return error.into_response();
     }
     Json(json!({
         "ok": true,
@@ -2196,7 +2223,7 @@ pub async fn inference_set_default(
     headers: axum::http::HeaderMap,
     raw_body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let (_ks, _npub, dir, _raw, mut manifest) =
+    let (_ks, _npub, dir, raw, mut manifest) =
         match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
             Ok(v) => v,
             Err(e) => return e.into_response(),
@@ -2221,8 +2248,8 @@ pub async fn inference_set_default(
         Ok(y) => y,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    if let Err(error) = persist_manifest(&dir, &raw, &yaml) {
+        return error.into_response();
     }
     Json(json!({"ok": true, "default": body.name, "ratified": false})).into_response()
 }
@@ -2233,7 +2260,7 @@ pub async fn inference_delete(
     OriginalUri(uri): OriginalUri,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let (_ks, _npub, dir, _raw, mut manifest) =
+    let (_ks, _npub, dir, raw, mut manifest) =
         match gate(&state, &headers, "DELETE", &uri, None, &npub) {
             Ok(v) => v,
             Err(e) => return e.into_response(),
@@ -2265,8 +2292,8 @@ pub async fn inference_delete(
         Ok(y) => y,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    if let Err(error) = persist_manifest(&dir, &raw, &yaml) {
+        return error.into_response();
     }
     Json(json!({"ok": true, "removed": name, "ratified": false})).into_response()
 }
@@ -3118,6 +3145,146 @@ pub fn is_active(dir: &std::path::Path) -> bool {
     dir.join("active").exists()
 }
 
+/// Archival is deliberately host-local, like activation. It does not alter
+/// or re-ratify the portable identity; it removes the agent from the normal
+/// workspace and prevents new work until a governor restores it.
+pub fn is_archived(dir: &std::path::Path) -> bool {
+    dir.join("archived").exists()
+}
+
+fn stop_agent_processes(state: &AppState, npub: &str) {
+    let mut listeners = state.listeners.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(mut presence) = listeners.remove(npub) {
+        stop_all(&mut presence);
+    }
+    state
+        .supervisor_notes
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(npub);
+}
+
+fn clear_agent_runtime_state(state: &AppState, npub: &str) {
+    stop_agent_processes(state, npub);
+    state
+        .admitted
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(npub);
+    state
+        .pending_oauth
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|_, grant| grant.npub != npub);
+    state.decisions.invalidate(npub);
+}
+
+#[derive(serde::Deserialize)]
+pub struct ArchiveBody {
+    archived: bool,
+}
+
+pub async fn archive_agent(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, _manifest) =
+        match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    let body: ArchiveBody = match serde_json::from_slice(&raw_body) {
+        Ok(body) => body,
+        Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let marker = dir.join("archived");
+    if body.archived {
+        clear_agent_runtime_state(&state, &npub);
+        if let Err(error) = std::fs::remove_file(dir.join("active")) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+            }
+        }
+        if let Err(error) = std::fs::write(&marker, b"1") {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+        }
+    } else if let Err(error) = std::fs::remove_file(&marker) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+        }
+    }
+    Json(json!({
+        "ok": true,
+        "npub": npub,
+        "archived": body.archived,
+        "active": false,
+        "note": if body.archived {
+            "agent archived — standing presence stopped and protected key material evicted from memory"
+        } else {
+            "agent restored — it remains inactive until explicitly activated"
+        },
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct DeleteAgentBody {
+    confirmation: String,
+}
+
+pub async fn delete_agent(
+    State(state): State<App>,
+    AxPath(npub): AxPath<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (_ks, npub, dir, _raw, _manifest) =
+        match gate(&state, &headers, "DELETE", &uri, Some(&raw_body), &npub) {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    let body: DeleteAgentBody = match serde_json::from_slice(&raw_body) {
+        Ok(body) => body,
+        Err(error) => return err(StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    if !is_archived(&dir) {
+        return err(
+            StatusCode::CONFLICT,
+            "archive the agent before permanently deleting it",
+        )
+        .into_response();
+    }
+    if body.confirmation.trim() != npub {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "confirmation must be the agent's exact npub",
+        )
+        .into_response();
+    }
+    if let Err(error) = require_pass(&state) {
+        return error.into_response();
+    }
+    clear_agent_runtime_state(&state, &npub);
+    let removed_tokens = match nip98::delete_control_tokens_for_agent(&state, &npub) {
+        Ok(count) => count,
+        Err(error) => return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    if let Err(error) = std::fs::remove_dir_all(&dir) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "deleted": npub,
+        "removed_control_tokens": removed_tokens,
+        "note": "agent identity, configuration, credentials, and local history permanently deleted",
+    }))
+    .into_response()
+}
+
 #[derive(serde::Deserialize)]
 pub struct ActiveBody {
     active: bool,
@@ -3154,10 +3321,7 @@ pub async fn set_active(
     // Deactivation takes effect immediately rather than on the next
     // supervisor tick — every channel and the lease keeper.
     if !body.active {
-        let mut map = state.listeners.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(mut p) = map.remove(&npub) {
-            stop_all(&mut p);
-        }
+        stop_agent_processes(&state, &npub);
     }
     Json(json!({
         "ok": true,
@@ -3595,8 +3759,10 @@ pub async fn agent_connector_discover(
     }
 }
 
-/// POST /api/agents/{npub}/connectors/{kind}/allowed_tools {"tools":[…]}
-/// — rewrite an mcp grant's allowlist (after Discover). An amendment:
+/// POST /api/agents/{npub}/connectors/{kind}/allowed_tools
+/// {"tools":[…], "tool_access":{"name":"read-only|read-write"}}
+/// — rewrite an mcp grant's allowlist and optional per-tool access policy
+/// (after Discover). An amendment:
 /// re-ratify afterward. Governor.
 pub async fn connector_set_allowed_tools(
     State(state): State<App>,
@@ -3605,7 +3771,7 @@ pub async fn connector_set_allowed_tools(
     headers: axum::http::HeaderMap,
     raw_body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let (_ks, npub, dir, _raw, mut manifest) =
+    let (_ks, npub, dir, raw, mut manifest) =
         match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
             Ok(v) => v,
             Err(e) => return e.into_response(),
@@ -3614,7 +3780,7 @@ pub async fn connector_set_allowed_tools(
         Ok(b) => b,
         Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
     };
-    let tools: Vec<String> = body["tools"]
+    let mut tools: Vec<String> = body["tools"]
         .as_array()
         .map(|a| {
             a.iter()
@@ -3622,6 +3788,35 @@ pub async fn connector_set_allowed_tools(
                 .collect()
         })
         .unwrap_or_default();
+    let tool_access = match body.get("tool_access") {
+        Some(value) if !value.is_null() => {
+            let Some(policies) = value.as_object() else {
+                return err(StatusCode::BAD_REQUEST, "tool_access must be an object")
+                    .into_response();
+            };
+            for (name, mode) in policies {
+                if name.trim().is_empty() || name.len() > 256 {
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        "tool_access has an invalid tool name",
+                    )
+                    .into_response();
+                }
+                if !matches!(mode.as_str(), Some("read-only" | "read-write")) {
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        format!("tool_access.{name} must be read-only or read-write"),
+                    )
+                    .into_response();
+                }
+            }
+            Some(policies.clone())
+        }
+        _ => None,
+    };
+    if let Some(policies) = &tool_access {
+        tools = policies.keys().cloned().collect();
+    }
     if tools.is_empty() {
         return err(
             StatusCode::BAD_REQUEST,
@@ -3637,15 +3832,24 @@ pub async fn connector_set_allowed_tools(
         .into_response();
     };
     c.caps.insert("allowed_tools".into(), json!(tools));
+    if let Some(policies) = tool_access {
+        c.caps.insert("tool_access".into(), json!(policies));
+        c.caps.insert("access".into(), json!("mixed"));
+    } else {
+        c.caps.remove("tool_access");
+    }
+    let tool_access_now = c.caps.get("tool_access").cloned();
+    let access_now = c.caps.get("access").cloned();
     let yaml = match serde_yaml::to_string(&manifest) {
         Ok(y) => y,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    if let Err(error) = persist_manifest(&dir, &raw, &yaml) {
+        return error.into_response();
     }
     Json(json!({
         "ok": true, "npub": npub, "kind": kind, "allowed_tools": tools,
+        "tool_access": tool_access_now, "access": access_now,
         "manifest_sha256": ceremony::manifest_hash(&yaml), "ratified": false,
         "note": "allowlist changed — re-ratify in the Manifest tab",
     }))
@@ -3662,7 +3866,7 @@ pub async fn connector_patch_caps(
     headers: axum::http::HeaderMap,
     raw_body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let (_ks, npub, dir, _raw, mut manifest) =
+    let (_ks, npub, dir, raw, mut manifest) =
         match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
             Ok(v) => v,
             Err(e) => return e.into_response(),
@@ -3689,8 +3893,8 @@ pub async fn connector_patch_caps(
         Ok(y) => y,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    if let Err(error) = persist_manifest(&dir, &raw, &yaml) {
+        return error.into_response();
     }
     Json(json!({
         "ok": true, "npub": npub, "kind": kind, "caps": caps_now,
@@ -3819,8 +4023,7 @@ pub async fn connector_grant(
             }
         }
     };
-    let _ = raw; // superseded by the amended manifest
-    match write_grant(&dir, &mut manifest, entry, credential) {
+    match write_grant(&dir, &raw, &mut manifest, entry, credential) {
         Ok(sha) => Json(json!({
             "ok": true,
             "npub": npub,
@@ -3838,6 +4041,7 @@ pub async fn connector_grant(
 /// Upsert a library entry into a manifest (one entry per kind) and persist.
 fn write_grant(
     dir: &std::path::Path,
+    expected_raw: &str,
     manifest: &mut apiary_core::manifest::Manifest,
     entry: &LibraryEntry,
     credential: Option<apiary_core::manifest::EncryptedBlob>,
@@ -3847,6 +4051,7 @@ fn write_grant(
     // Library-only provenance helps the cockpit explain a curated template,
     // but is not an agent capability and should not travel in its manifest.
     caps.remove("catalog_id");
+    caps.insert("library_name".into(), json!(entry.name));
     manifest.connectors.push(apiary_core::manifest::Connector {
         kind: entry.kind.clone(),
         credential,
@@ -3854,9 +4059,7 @@ fn write_grant(
     });
     let yaml =
         serde_yaml::to_string(manifest).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    std::fs::write(dir.join("manifest.yaml"), &yaml)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(ceremony::manifest_hash(&yaml))
+    persist_manifest(dir, expected_raw, &yaml)
 }
 
 pub async fn connector_revoke(
@@ -3865,7 +4068,7 @@ pub async fn connector_revoke(
     OriginalUri(uri): OriginalUri,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let (_ks, npub, dir, _raw, mut manifest) =
+    let (_ks, npub, dir, raw, mut manifest) =
         match gate(&state, &headers, "DELETE", &uri, None, &npub) {
             Ok(v) => v,
             Err(e) => return e.into_response(),
@@ -3883,8 +4086,8 @@ pub async fn connector_revoke(
         Ok(y) => y,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    if let Err(error) = persist_manifest(&dir, &raw, &yaml) {
+        return error.into_response();
     }
     Json(json!({
         "ok": true,
@@ -3945,6 +4148,7 @@ pub async fn rename_agent(
 /// An OAuth grant in flight: everything recorded BEFORE the browser
 /// redirect that the callback must verify against (PKCE verifier, expected
 /// issuer per RFC 9207, and which agent/library entry this authorizes).
+#[derive(Clone)]
 pub struct PendingOauth {
     pub npub: String,
     pub entry: LibraryEntry,
@@ -3955,6 +4159,15 @@ pub struct PendingOauth {
     pub client_id: String,
     pub resource: String,
     pub created_at: u64,
+}
+
+struct OauthDiscovery {
+    issuer: String,
+    iss_advertised: bool,
+    authorization_endpoint: String,
+    token_endpoint: String,
+    registration_endpoint: Option<String>,
+    scopes: Vec<String>,
 }
 
 fn rand_hex() -> String {
@@ -3974,7 +4187,7 @@ fn http_get_json(client: &reqwest::blocking::Client, url: &str) -> Option<serde_
 }
 
 /// RFC 9728 protected-resource metadata → RFC 8414 / OIDC discovery.
-fn discover(resource_url: &str) -> Result<(String, bool, String, String, Vec<String>), String> {
+fn discover(resource_url: &str) -> Result<OauthDiscovery, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
@@ -4054,13 +4267,69 @@ fn discover(resource_url: &str) -> Result<(String, bool, String, String, Vec<Str
         .as_str()
         .ok_or("AS metadata has no token_endpoint")?
         .to_string();
-    Ok((
+    Ok(OauthDiscovery {
         issuer,
         iss_advertised,
         authorization_endpoint,
         token_endpoint,
+        registration_endpoint: meta["registration_endpoint"].as_str().map(String::from),
         scopes,
-    ))
+    })
+}
+
+/// Register Apiary as a public OAuth client when an MCP authorization
+/// server still advertises RFC 7591 DCR. The 2026 MCP spec prefers Client
+/// ID Metadata Documents, but keeps DCR for compatibility; a user should
+/// not have to create and paste a client id when the server explicitly
+/// offers registration.
+fn register_oauth_client(
+    registration_endpoint: &str,
+    redirect_uri: &str,
+    scope: &str,
+) -> Result<String, String> {
+    let endpoint = reqwest::Url::parse(registration_endpoint)
+        .map_err(|e| format!("registration_endpoint: {e}"))?;
+    if endpoint.scheme() != "https" {
+        return Err("OAuth registration_endpoint must use HTTPS".into());
+    }
+    let redirect =
+        reqwest::Url::parse(redirect_uri).map_err(|e| format!("OAuth redirect URI: {e}"))?;
+    let loopback = matches!(redirect.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+    let application_type = if loopback { "native" } else { "web" };
+    let mut body = json!({
+        "client_name": "Apiary",
+        "redirect_uris": [redirect_uri],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "application_type": application_type
+    });
+    if !scope.is_empty() {
+        body["scope"] = json!(scope);
+    }
+    let response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| e.to_string())?
+        .post(endpoint)
+        .header("accept", "application/json")
+        .json(&body)
+        .send()
+        .map_err(|e| format!("OAuth client registration: {e}"))?;
+    let status = response.status();
+    let value: serde_json::Value = response
+        .json()
+        .map_err(|e| format!("OAuth client registration response: {e}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "OAuth client registration refused ({status}): {value}"
+        ));
+    }
+    value["client_id"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+        .map(String::from)
+        .ok_or_else(|| "OAuth client registration returned no client_id".into())
 }
 
 #[derive(serde::Deserialize)]
@@ -4107,23 +4376,15 @@ pub async fn oauth_start(
     let Some(resource_url) = cap("url") else {
         return err(StatusCode::BAD_REQUEST, "entry has no caps.url").into_response();
     };
-    let Some(client_id) = cap("oauth_client_id") else {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "entry has no caps.oauth_client_id — a pre-registered client id or a hosted \
-             Client ID Metadata Document URL (DCR is deprecated in MCP 2026-07-28)",
-        )
-        .into_response();
-    };
+    let configured_client_id = cap("oauth_client_id");
     let scope_override = cap("oauth_scopes");
     let resource_url2 = resource_url.clone();
     let discovered = tokio::task::spawn_blocking(move || discover(&resource_url2)).await;
-    let (issuer, iss_advertised, authorization_endpoint, token_endpoint, scopes_supported) =
-        match discovered {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => return err(StatusCode::BAD_GATEWAY, e).into_response(),
-            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-        };
+    let discovered = match discovered {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return err(StatusCode::BAD_GATEWAY, e).into_response(),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
     let verifier = format!("{}{}", rand_hex(), rand_hex());
     let challenge = {
         use base64::Engine;
@@ -4132,7 +4393,33 @@ pub async fn oauth_start(
     };
     let oauth_state = rand_hex();
     let redirect_uri = format!("{}/oauth/callback", state.origin);
-    let scope = scope_override.unwrap_or_else(|| scopes_supported.join(" "));
+    let scope = scope_override.unwrap_or_else(|| discovered.scopes.join(" "));
+    let client_id = match configured_client_id {
+        Some(id) => id,
+        None => match discovered.registration_endpoint.as_deref() {
+            Some(endpoint) => {
+                let endpoint = endpoint.to_string();
+                let redirect = redirect_uri.clone();
+                let scope = scope.clone();
+                match tokio::task::spawn_blocking(move || {
+                    register_oauth_client(&endpoint, &redirect, &scope)
+                })
+                .await
+                {
+                    Ok(Ok(id)) => id,
+                    Ok(Err(e)) => return err(StatusCode::BAD_GATEWAY, e).into_response(),
+                    Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+                }
+            }
+            None => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "the OAuth server offers neither automatic client registration nor a client id; enter its pre-registered client id",
+                )
+                .into_response()
+            }
+        },
+    };
     let mut params = vec![
         ("response_type", "code".to_string()),
         ("client_id", client_id.clone()),
@@ -4145,16 +4432,17 @@ pub async fn oauth_start(
     if !scope.is_empty() {
         params.push(("scope", scope));
     }
-    let auth_url = match reqwest::Url::parse_with_params(&authorization_endpoint, &params) {
-        Ok(u) => u.to_string(),
-        Err(e) => {
-            return err(
-                StatusCode::BAD_GATEWAY,
-                format!("authorization_endpoint: {e}"),
-            )
-            .into_response()
-        }
-    };
+    let auth_url =
+        match reqwest::Url::parse_with_params(&discovered.authorization_endpoint, &params) {
+            Ok(u) => u.to_string(),
+            Err(e) => {
+                return err(
+                    StatusCode::BAD_GATEWAY,
+                    format!("authorization_endpoint: {e}"),
+                )
+                .into_response()
+            }
+        };
     state
         .pending_oauth
         .lock()
@@ -4165,9 +4453,9 @@ pub async fn oauth_start(
                 npub,
                 entry,
                 verifier,
-                issuer,
-                iss_advertised,
-                token_endpoint,
+                issuer: discovered.issuer,
+                iss_advertised: discovered.iss_advertised,
+                token_endpoint: discovered.token_endpoint,
                 client_id,
                 resource: resource_url,
                 created_at: now_secs(),
@@ -4239,12 +4527,16 @@ pub async fn oauth_callback(
     let Some(st) = q.state.clone() else {
         return callback_page("Missing state", "This callback carries no state parameter.");
     };
-    let Some(pending) = state
-        .pending_oauth
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&st)
-    else {
+    let pending = {
+        let mut grants = state
+            .pending_oauth
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let cutoff = now_secs().saturating_sub(15 * 60);
+        grants.retain(|_, grant| grant.created_at > cutoff);
+        grants.get(&st).cloned()
+    };
+    let Some(pending) = pending else {
         return callback_page(
             "Unknown or expired grant",
             "No OAuth grant is waiting for this state. Start again from the Connectors tab.",
@@ -4256,6 +4548,11 @@ pub async fn oauth_callback(
             Some(i) => *i == pending.issuer,
             None => !pending.iss_advertised,
         };
+        state
+            .pending_oauth
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&st);
         return if iss_ok {
             callback_page(
                 "Authorization refused",
@@ -4313,10 +4610,14 @@ pub async fn oauth_callback(
             .form(&form)
             .send()
             .map_err(|e| format!("token endpoint: {e}"))?;
+        let status = resp.status();
         let tokens: serde_json::Value = resp.json().map_err(|e| format!("token body: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("token endpoint refused the grant ({status})"));
+        }
         let access = tokens["access_token"]
             .as_str()
-            .ok_or_else(|| format!("token endpoint refused: {tokens}"))?;
+            .ok_or_else(|| "token endpoint returned no access token".to_string())?;
         let credential = json!({
             "type": "oauth",
             "access_token": access,
@@ -4341,20 +4642,27 @@ pub async fn oauth_callback(
         let raw = std::fs::read_to_string(dir.join("manifest.yaml")).map_err(|e| e.to_string())?;
         let mut manifest =
             apiary_core::manifest::Manifest::from_yaml(&raw).map_err(|e| e.to_string())?;
-        write_grant(&dir, &mut manifest, &pending.entry, Some(blob))
+        write_grant(&dir, &raw, &mut manifest, &pending.entry, Some(blob))
             .map_err(|(_, j)| j.0.to_string())?;
         Ok(pending.entry.name.clone())
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()));
     match outcome {
-        Ok(name) => callback_page(
-            "Connector granted",
-            &format!(
-                "'{name}' is authorized and its tokens are sealed to the agent. \
-                 Return to Apiary and re-ratify the manifest — nothing runs unratified."
-            ),
-        ),
+        Ok(name) => {
+            state
+                .pending_oauth
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&st);
+            callback_page(
+                "Connector granted",
+                &format!(
+                    "'{name}' is authorized and its tokens are sealed to the agent. \
+                     Return to Apiary and re-ratify the manifest — nothing runs unratified."
+                ),
+            )
+        }
         Err(e) => callback_page("Grant failed", &e),
     }
 }
@@ -5398,7 +5706,7 @@ pub async fn presence_declare(
     headers: axum::http::HeaderMap,
     raw_body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let (ks, npub, dir, _raw, mut manifest) =
+    let (ks, npub, dir, raw, mut manifest) =
         match gate(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
             Ok(v) => v,
             Err(e) => return e.into_response(),
@@ -5452,8 +5760,8 @@ pub async fn presence_declare(
         Ok(y) => y,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    if let Err(error) = persist_manifest(&dir, &raw, &yaml) {
+        return error.into_response();
     }
     Json(json!({
         "ok": true,
@@ -5472,7 +5780,7 @@ pub async fn presence_revoke(
     OriginalUri(uri): OriginalUri,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let (_ks, npub, dir, _raw, mut manifest) =
+    let (_ks, npub, dir, raw, mut manifest) =
         match gate(&state, &headers, "DELETE", &uri, None, &npub) {
             Ok(v) => v,
             Err(e) => return e.into_response(),
@@ -5488,8 +5796,8 @@ pub async fn presence_revoke(
         Ok(y) => y,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    if let Err(error) = persist_manifest(&dir, &raw, &yaml) {
+        return error.into_response();
     }
     Json(json!({
         "ok": true,

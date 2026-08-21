@@ -16,12 +16,17 @@ tauri-build = { version = "2", features = [] }
 apiary-core = { path = "../apiary-core" }
 apiary-hostd = { path = "../apiary-hostd" }
 axum = "0.8"
+nostr.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 zeroize.workspace = true
+base64 = "0.22"
 fs2 = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+sha2 = "0.10"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -9,10 +9,12 @@
 //! (SPEC §2), never a second implementation.
 
 pub mod access;
+pub mod agent_store;
 pub mod agui;
 pub mod control_mcp;
 pub mod decision_gate;
 pub mod events;
+pub mod nip46;
 pub mod nip98;
 pub mod ops;
 pub mod routines;
@@ -71,6 +73,13 @@ pub struct AppState {
     /// host-manager or per-agent authorization gate to the bound signer.
     pub browser_sessions:
         std::sync::Mutex<std::collections::HashMap<String, nip98::BrowserSession>>,
+    /// NIP-46 connections waiting for a remote signer's approval. Keys are
+    /// opaque, high-entropy capabilities returned only to the initiating UI.
+    pub pending_nip46: std::sync::Mutex<std::collections::HashMap<String, nip46::RemoteSigner>>,
+    /// Connected remote signers, keyed by the human user pubkey. Only the
+    /// disposable client key lives here; the human private key never enters
+    /// Apiary.
+    pub remote_signers: std::sync::Mutex<std::collections::HashMap<String, nip46::RemoteSigner>>,
     /// Per-process credential published only into the host's 0600 state
     /// directory. A desktop client that already authenticated over SSH may
     /// exchange it for an ordinary manager-bound browser session. It is
@@ -161,12 +170,17 @@ pub fn build_router(state: App) -> Router {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/app.js", get(cockpit_js))
+        .route("/cockpit-api.js", get(cockpit_api_js))
+        .route("/cockpit-inference.js", get(cockpit_inference_js))
         .route("/signin.js", get(signin_js))
         .route("/api/status", get(ops::status))
         .route(
             "/api/session",
             post(ops::browser_session_create).delete(ops::browser_session_delete),
         )
+        .route("/api/nip46/connect", post(nip46::connect_start))
+        .route("/api/nip46/connect/continue", post(nip46::connect_continue))
+        .route("/api/nip46/sign", post(nip46::sign))
         .route("/api/desktop/session", post(ops::desktop_session_create))
         .route("/api/unlock", post(ops::unlock))
         .route("/api/unlock/forget", post(ops::forget_automatic_unlock))
@@ -206,6 +220,11 @@ pub fn build_router(state: App) -> Router {
         .route("/api/agents", get(list_agents))
         .route("/api/agents/found", post(found_agent))
         .route("/api/agents/import", post(ops::import_agent))
+        .route(
+            "/api/agents/{npub}",
+            axum::routing::delete(ops::delete_agent),
+        )
+        .route("/api/agents/{npub}/archive", post(ops::archive_agent))
         .route("/api/agents/{npub}/export", post(ops::export_agent))
         .route(
             "/api/agents/{npub}/manifest",
@@ -423,6 +442,42 @@ async fn cockpit_js(
         .into_response()
 }
 
+async fn cockpit_api_js(
+    State(state): State<App>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if !cockpit_navigation_authorized(&state, &headers) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    (
+        [
+            ("content-type", "application/javascript; charset=utf-8"),
+            ("content-security-policy", CSP),
+            ("cache-control", "no-store"),
+        ],
+        include_str!("cockpit_api.js"),
+    )
+        .into_response()
+}
+
+async fn cockpit_inference_js(
+    State(state): State<App>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if !cockpit_navigation_authorized(&state, &headers) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    (
+        [
+            ("content-type", "application/javascript; charset=utf-8"),
+            ("content-security-policy", CSP),
+            ("cache-control", "no-store"),
+        ],
+        include_str!("cockpit_inference.js"),
+    )
+        .into_response()
+}
+
 async fn signin_js() -> impl IntoResponse {
     (
         [
@@ -551,6 +606,7 @@ async fn list_agents(
             "ratified": decision.ratified,
             "log_entries": decision.log_entries,
             "active": ops::is_active(&dir),
+            "archived": ops::is_archived(&dir),
             "declared_channels": m.presence.channels.keys().cloned().collect::<Vec<_>>(),
         }));
     }
@@ -686,8 +742,8 @@ async fn put_manifest(
     // Governorship is checked against the CURRENT constitution — the one
     // being amended — so a stranger cannot grant themselves authority by
     // writing a manifest that names them.
-    match load_manifest(&dir) {
-        Ok((_, current)) => {
+    let current_raw = match load_manifest(&dir) {
+        Ok((current_raw, current)) => {
             if let Err(e) = nip98::authorize_agent_request(
                 &state,
                 signer,
@@ -697,9 +753,10 @@ async fn put_manifest(
             ) {
                 return e.into_response();
             }
+            current_raw
         }
         Err(e) => return e.into_response(),
-    }
+    };
     let manifest = match Manifest::from_yaml(&body.yaml) {
         Ok(m) => m,
         Err(e) => return err(StatusCode::BAD_REQUEST, e).into_response(),
@@ -716,13 +773,28 @@ async fn put_manifest(
         )
         .into_response();
     }
-    if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &body.yaml) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-    }
+    let manifest_sha256 = match agent_store::replace_manifest(&dir, &current_raw, &body.yaml) {
+        Ok(revision) => revision,
+        Err(agent_store::StoreError::Conflict { current_revision }) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "ok": false,
+                    "error": "the agent changed while this amendment was being prepared; reload and try again",
+                    "code": "manifest_revision_conflict",
+                    "current_revision": current_revision,
+                })),
+            )
+                .into_response()
+        }
+        Err(agent_store::StoreError::Io(error)) => {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response()
+        }
+    };
     Json(json!({
         "ok": true,
         "npub": npub,
-        "manifest_sha256": ceremony::manifest_hash(&body.yaml),
+        "manifest_sha256": manifest_sha256,
         "ratified": false,
         "note": "amendment saved — re-ratify before the agent runs again",
     }))
@@ -961,10 +1033,11 @@ async fn found_agent(
         .to_yaml()
         .expect("validated founding manifest must serialize");
     let dir = ks.agent_dir(&npub);
-    if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml)
-        .and_then(|_| std::fs::write(dir.join("name"), &body.name))
-    {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    if let Err(error) = agent_store::create_manifest(&dir, &yaml) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
+    if let Err(error) = std::fs::write(dir.join("name"), &body.name) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
     }
     Json(json!({
         "ok": true,
@@ -1119,6 +1192,8 @@ mod tests {
             managers: std::sync::RwLock::new(ManagerRegistry::in_memory(managers)),
             token: None,
             browser_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            pending_nip46: std::sync::Mutex::new(std::collections::HashMap::new()),
+            remote_signers: std::sync::Mutex::new(std::collections::HashMap::new()),
             desktop_token: desktop_token.map(str::to_string),
             internal_token: "router-test-internal".into(),
             control_audit: std::sync::Mutex::new(()),
@@ -1152,10 +1227,198 @@ mod tests {
         assert!(!page.contains("/app.js"));
     }
 
+    #[test]
+    fn cockpit_keeps_transport_and_catalog_out_of_the_renderer() {
+        let html = include_str!("cockpit.html");
+        let renderer = include_str!("cockpit.js");
+        let transport = include_str!("cockpit_api.js");
+        let inference = include_str!("cockpit_inference.js");
+
+        assert!(html.contains("<script type=\"module\" src=\"/app.js\"></script>"));
+        assert!(renderer.contains("createApiaryClient"));
+        assert!(renderer.contains("inferenceModels"));
+        assert!(!renderer.contains("async function nip98Authorization"));
+        assert!(!renderer.contains("const inferenceModels ="));
+        assert!(transport.contains("async function nip98Authorization"));
+        assert!(inference.contains("export const inferenceModels"));
+    }
+
+    #[test]
+    fn cockpit_authenticates_oauth_mcp_before_tool_discovery() {
+        let renderer = include_str!("cockpit.js");
+
+        assert!(renderer.contains("OAuth sign-in (recommended)"));
+        assert!(renderer.contains("SAVE & CONNECT WITH OAUTH"));
+        assert!(renderer.contains("Authenticate first. Apiary will discover"));
+        assert!(renderer.contains("Connect with OAuth below before discovering tools."));
+        assert!(renderer.contains("function renderMcpToolPolicyPicker"));
+        assert!(renderer.contains("Set category…"));
+        assert!(renderer.contains("tool_access"));
+    }
+
+    #[test]
+    fn cockpit_exposes_archive_before_permanent_agent_deletion() {
+        let renderer = include_str!("cockpit.js");
+
+        assert!(renderer.contains("Archive agent"));
+        assert!(renderer.contains("Restore agent"));
+        assert!(renderer.contains("Permanently delete this agent"));
+        assert!(renderer.contains("Type ${expected} to confirm"));
+        assert!(renderer.contains("api('/archive')"));
+        assert!(renderer.contains("method: 'DELETE'"));
+    }
+
+    #[test]
+    fn cockpit_overview_exposes_a_copyable_full_agent_nostr_id() {
+        let renderer = include_str!("cockpit.js");
+        let shell = include_str!("cockpit.html");
+
+        assert!(renderer.contains("function copyableNostrId(value)"));
+        assert!(renderer.contains("copyableNostrId(sel)"));
+        assert!(renderer.contains("Copy Nostr ID"));
+        assert!(renderer.contains("navigator.clipboard.writeText"));
+        assert!(shell.contains(".agent-public-id-value"));
+        assert!(shell.contains("user-select:all"));
+    }
+
+    #[test]
+    fn cockpit_remote_signer_uses_inline_setup_and_the_desktop_browser_bridge() {
+        let renderer = include_str!("cockpit.js");
+
+        assert!(renderer.contains("Bunker connection string"));
+        assert!(renderer.contains("bunker://…"));
+        assert!(renderer.contains("showRemoteSignerAuthorization(status, result.auth_url"));
+        assert!(renderer.contains("if (DESKTOP) openExternalUrl(url)"));
+        assert!(renderer.contains("desktopAction('open-external', { url })"));
+        assert!(!renderer.contains("window.prompt("));
+    }
+
+    #[test]
+    fn cockpit_preserves_technical_values_without_text_assistance() {
+        let renderer = include_str!("cockpit.js");
+
+        for attribute in [
+            "autocapitalize', 'none",
+            "autocorrect', 'off",
+            "data-gramm', 'false",
+        ] {
+            assert!(renderer.contains(attribute));
+        }
+        assert!(renderer.contains("function technicalInput(control)"));
+        assert!(renderer.contains("technicalInput(el('input', 'grow'))"));
+        assert!(renderer.contains("technicalInput(el('input', 'relay-address'))"));
+        assert!(renderer.contains("inp.placeholder = 'wss://your-buzz-relay'"));
+
+        let shell = include_str!("cockpit.html");
+        assert!(shell.contains("input.relay-address"));
+        assert!(shell.contains("width:100%"));
+    }
+
+    #[tokio::test]
+    async fn agent_archive_and_permanent_delete_are_enforced() {
+        let state = test_state(AuthMode::Open);
+        let passphrase = "correct horse battery staple";
+        *state.passphrase.write().unwrap() = Some(passphrase.to_string());
+        let keystore = Keystore::open(&state.home).unwrap();
+        let keys = Keys::generate();
+        let agent = identity::to_npub(&keys.public_key()).unwrap();
+        let governor = identity::to_npub(&Keys::generate().public_key()).unwrap();
+        keystore.store(&keys, passphrase).unwrap();
+        let dir = keystore.agent_dir(&agent);
+        let yaml = template_manifest(&agent, &[governor], "Test lifecycle controls");
+        agent_store::create_manifest(&dir, &yaml).unwrap();
+        std::fs::write(dir.join("name"), "Lifecycle test").unwrap();
+        std::fs::write(dir.join("active"), b"1").unwrap();
+        let app = build_router(state.clone());
+
+        let archive = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/agents/{agent}/archive"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"archived":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(archive.status(), StatusCode::OK);
+        assert!(dir.join("archived").exists());
+        assert!(!dir.join("active").exists());
+
+        let roster = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(roster.status(), StatusCode::OK);
+        let roster_body = axum::body::to_bytes(roster.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let roster: serde_json::Value = serde_json::from_slice(&roster_body).unwrap();
+        assert_eq!(roster["agents"][0]["archived"], true);
+
+        let run_while_archived = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/agents/{agent}/active"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"active":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(run_while_archived.status(), StatusCode::CONFLICT);
+
+        let wrong_confirmation = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/agents/{agent}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"confirmation":"Lifecycle test"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_confirmation.status(), StatusCode::BAD_REQUEST);
+        assert!(dir.exists());
+
+        let delete = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/agents/{agent}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"confirmation":"{agent}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete.status(), StatusCode::OK);
+        assert!(!dir.exists());
+        let _ = std::fs::remove_dir_all(&state.home);
+    }
+
     #[tokio::test]
     async fn every_control_plane_response_is_marked_no_store() {
         let app = build_router(test_state(AuthMode::Nip98));
-        for path in ["/", "/app.js", "/api/status"] {
+        for path in [
+            "/",
+            "/app.js",
+            "/cockpit-api.js",
+            "/cockpit-inference.js",
+            "/api/status",
+        ] {
             let response = app
                 .clone()
                 .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
@@ -1166,7 +1429,7 @@ mod tests {
                 Some(&axum::http::HeaderValue::from_static("no-store")),
                 "missing private cache boundary on {path}"
             );
-            if path == "/app.js" {
+            if path.ends_with(".js") {
                 assert_eq!(response.status(), StatusCode::NOT_FOUND);
             }
         }

@@ -85,6 +85,8 @@ async fn main() {
             .unwrap_or_else(|| format!("http://{}", args.bind)),
         token: None,
         browser_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+        pending_nip46: std::sync::Mutex::new(std::collections::HashMap::new()),
+        remote_signers: std::sync::Mutex::new(std::collections::HashMap::new()),
         desktop_token: Some(desktop_token),
         internal_token: apiary_core::identity::generate()
             .secret_key()

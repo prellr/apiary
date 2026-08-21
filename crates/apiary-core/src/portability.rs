@@ -54,6 +54,13 @@ pub fn export_with_passphrase(
     npub: &str,
     reencrypt: Option<(&str, &str)>, // (keystore passphrase, export passphrase)
 ) -> Result<Value, crate::Error> {
+    // This is descriptive metadata for import UX, not a security decision.
+    // Older v1 bundles do not have it, so import must remain compatible.
+    let key_protection = if reencrypt.is_some() {
+        "handoff_passphrase"
+    } else {
+        "source_workspace_passphrase"
+    };
     let read = |name: &str| -> Result<String, crate::Error> {
         std::fs::read_to_string(agent_dir.join(name))
             .map_err(|e| crate::Error::Keystore(format!("export: cannot read {name}: {e}")))
@@ -97,6 +104,7 @@ pub fn export_with_passphrase(
         "name": name,
         "manifest_yaml": manifest_yaml,
         "key_ncryptsec": key_ncryptsec,
+        "key_protection": key_protection,
         "log": log_events,
         "published": published,
         "index_jsonl": index_jsonl,
@@ -166,10 +174,11 @@ pub fn import_with_options(
     // 1. The key must decrypt with the provided passphrase and be the npub.
     let enc = EncryptedSecretKey::from_bech32(key_ncryptsec.trim())
         .map_err(|e| fail(format!("key blob is not valid ncryptsec: {e}")))?;
-    let secret = enc.decrypt(bundle_passphrase).map_err(|e| {
-        fail(format!(
-            "bundle passphrase does not open the traveling key: {e}"
-        ))
+    let secret = enc.decrypt(bundle_passphrase).map_err(|_| {
+        fail(
+            "the agent has no passphrase; its exported private key is still protected by either the one-time transfer passphrase or the source workspace passphrase, and the supplied value did not match"
+                .into(),
+        )
     })?;
     let keys = Keys::new(secret);
     let derived = crate::identity::to_npub(&keys.public_key())?;
@@ -588,6 +597,7 @@ mod sealed_tests {
         // Right key opens; self-consistency holds.
         let bundle = open_sealed(&envelope, &recipient).unwrap();
         assert_eq!(bundle["npub"].as_str().unwrap(), npub);
+        assert_eq!(bundle["key_protection"], "handoff_passphrase");
         assert!(bundle["key_passphrase"].as_str().is_some());
 
         // Wrong recipient key: refused at the p-tag gate.
@@ -619,6 +629,10 @@ mod sealed_tests {
         let _ = rx_npub;
         let plain = export(&rx_ks.agent_dir(&npub), &npub);
         assert!(plain.is_ok());
+        assert_eq!(
+            plain.unwrap()["key_protection"],
+            "source_workspace_passphrase"
+        );
 
         let _ = std::fs::remove_dir_all(&sender_home);
         let _ = std::fs::remove_dir_all(&rx_home);

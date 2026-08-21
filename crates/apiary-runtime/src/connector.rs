@@ -273,6 +273,9 @@ impl Connector for MockEcho {
 ///     url: https://…/mcp         # http only
 ///     allowed_tools: [read_text_file, list_directory]   # REQUIRED; ["*"] = all
 ///     access: read-only          # or "read-write"; absent preserves legacy behavior
+///     tool_access:               # optional per-tool override; keys are the allowlist
+///       read_text_file: read-only
+///       update_file: read-write
 ///   credential: <nip44 blob>     # http only: bearer token or OAuth JSON
 /// ```
 ///
@@ -298,17 +301,46 @@ fn bind_mcp(
             })
             .unwrap_or_default()
     };
-    let allowed = cap_list("allowed_tools");
+    let tool_access = entry
+        .caps
+        .get("tool_access")
+        .and_then(|value| value.as_object())
+        .map(|policies| {
+            policies
+                .iter()
+                .map(|(name, mode)| {
+                    let mode = mode.as_str().ok_or_else(|| {
+                        crate::Error::Provider(format!(
+                            "mcp caps.tool_access.{name} must be read-only or read-write"
+                        ))
+                    })?;
+                    match mode {
+                        "read-only" => Ok((name.clone(), true)),
+                        "read-write" => Ok((name.clone(), false)),
+                        other => Err(crate::Error::Provider(format!(
+                            "mcp caps.tool_access.{name} '{other}' is invalid (read-only | read-write)"
+                        ))),
+                    }
+                })
+                .collect::<Result<std::collections::HashMap<_, _>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let mut allowed = cap_list("allowed_tools");
+    if !tool_access.is_empty() {
+        allowed = tool_access.keys().cloned().collect();
+    }
     if allowed.is_empty() {
         return Err(crate::Error::Provider(
-            "mcp connector requires caps.allowed_tools (an explicit allowlist; [\"*\"] \
-             grants every tool the server offers — say so deliberately)"
+            "mcp connector requires caps.allowed_tools or caps.tool_access (an explicit \
+             allowlist; [\"*\"] grants every tool the server offers — say so deliberately)"
                 .into(),
         ));
     }
     let read_only = match cap_str("access").as_deref() {
         Some("read-only") => true,
         Some("read-write") | None => false,
+        Some("mixed") if !tool_access.is_empty() => false,
         Some(other) => {
             return Err(crate::Error::Provider(format!(
                 "mcp caps.access '{other}' is invalid (read-only | read-write)"
@@ -362,7 +394,7 @@ fn bind_mcp(
     let wildcard = allowed.iter().any(|a| a == "*");
     let granted: Vec<crate::mcp::McpTool> = tools
         .into_iter()
-        .filter(|t| mcp_tool_allowed(t, &allowed, wildcard, read_only))
+        .filter(|t| mcp_tool_allowed(t, &allowed, wildcard, read_only, &tool_access))
         .collect();
     if granted.is_empty() {
         let message = if read_only {
@@ -431,7 +463,13 @@ fn mcp_tool_allowed(
     allowed: &[String],
     wildcard: bool,
     read_only: bool,
+    tool_access: &std::collections::HashMap<String, bool>,
 ) -> bool {
+    if !tool_access.is_empty() {
+        return tool_access
+            .get(&tool.name)
+            .is_some_and(|requires_read_only| !requires_read_only || tool.read_only);
+    }
     (wildcard || allowed.contains(&tool.name)) && (!read_only || tool.read_only)
 }
 
@@ -2479,8 +2517,24 @@ mod connector_security_tests {
             input_schema: json!({"type":"object"}),
             read_only: false,
         };
-        assert!(mcp_tool_allowed(&read, &[], true, true));
-        assert!(!mcp_tool_allowed(&write, &[], true, true));
-        assert!(mcp_tool_allowed(&write, &["write".into()], false, false));
+        let no_overrides = std::collections::HashMap::new();
+        assert!(mcp_tool_allowed(&read, &[], true, true, &no_overrides));
+        assert!(!mcp_tool_allowed(&write, &[], true, true, &no_overrides));
+        assert!(mcp_tool_allowed(
+            &write,
+            &["write".into()],
+            false,
+            false,
+            &no_overrides
+        ));
+
+        let granular = std::collections::HashMap::from([
+            ("read".to_string(), true),
+            ("write".to_string(), false),
+        ]);
+        assert!(mcp_tool_allowed(&read, &[], false, false, &granular));
+        assert!(mcp_tool_allowed(&write, &[], false, false, &granular));
+        let unsafe_read = std::collections::HashMap::from([("write".to_string(), true)]);
+        assert!(!mcp_tool_allowed(&write, &[], false, false, &unsafe_read));
     }
 }

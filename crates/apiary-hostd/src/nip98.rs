@@ -270,6 +270,24 @@ pub fn list_all_control_tokens(state: &AppState) -> Result<Vec<ControlTokenRecor
     Ok(tokens)
 }
 
+/// Remove every bearer issued by an agent before its durable state is
+/// permanently deleted. A deleted identity must not leave live credentials
+/// in the host-level token registry.
+pub fn delete_control_tokens_for_agent(state: &AppState, agent: &str) -> Result<usize, String> {
+    let _guard = state
+        .control_tokens
+        .lock()
+        .map_err(|_| "control-token registry is unavailable".to_string())?;
+    let mut file = load_control_tokens(state)?;
+    let before = file.tokens.len();
+    file.tokens.retain(|token| token.agent != agent);
+    let removed = before.saturating_sub(file.tokens.len());
+    if removed > 0 {
+        save_control_tokens(state, &file)?;
+    }
+    Ok(removed)
+}
+
 pub fn revoke_control_token(
     state: &AppState,
     agent: &str,
@@ -629,24 +647,54 @@ pub fn authorize_cockpit(
     ))
 }
 
-pub fn required_agent_role(method: &str, path_and_query: &str) -> ManagerRole {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentOperation {
+    View,
+    EditDraft,
+    Operate,
+    Govern,
+    /// A new mutating route has not declared its authority yet. Unknown
+    /// writes fail closed at the strongest role instead of silently becoming
+    /// editor operations.
+    UnknownWrite,
+}
+
+impl AgentOperation {
+    pub fn required_role(self) -> ManagerRole {
+        match self {
+            Self::View => ManagerRole::Viewer,
+            Self::Operate => ManagerRole::Operator,
+            Self::EditDraft => ManagerRole::Editor,
+            Self::Govern | Self::UnknownWrite => ManagerRole::Governor,
+        }
+    }
+}
+
+pub fn agent_operation(method: &str, path_and_query: &str) -> AgentOperation {
     let path = path_and_query.split('?').next().unwrap_or(path_and_query);
     if method == "GET" {
         return if path.ends_with("/control-tokens") {
-            ManagerRole::Governor
+            AgentOperation::Govern
         } else {
-            ManagerRole::Viewer
+            AgentOperation::View
         };
     }
-    let governor_only = path.ends_with("/manifest")
+    let deleting_agent = method == "DELETE"
+        && path
+            .strip_prefix("/api/agents/")
+            .is_some_and(|tail| !tail.is_empty() && !tail.contains('/'));
+    let governor_only = deleting_agent
+        || path.ends_with("/manifest")
         || path.contains("/ratify")
+        || path.ends_with("/archive")
         || path.ends_with("/governors")
         || path.contains("/control-token")
         || path.contains("/credential/")
         || path.ends_with("/export")
-        || path.ends_with("/connectors/oauth");
+        || path.ends_with("/connectors/oauth")
+        || path.contains("/proposal/");
     if governor_only {
-        return ManagerRole::Governor;
+        return AgentOperation::Govern;
     }
     let operator = path.ends_with("/run")
         || path.ends_with("/ag-ui")
@@ -658,10 +706,31 @@ pub fn required_agent_role(method: &str, path_and_query: &str) -> ManagerRole {
         || (path.contains("/routines/")
             && (path.ends_with("/run") || path.ends_with("/pause") || path.ends_with("/resume")));
     if operator {
-        ManagerRole::Operator
-    } else {
-        ManagerRole::Editor
+        return AgentOperation::Operate;
     }
+    let editor = path.ends_with("/constitution")
+        || path.ends_with("/skills")
+        || path.contains("/skills/")
+        || path.ends_with("/harnesses")
+        || path.contains("/harnesses/")
+        || path.ends_with("/inference")
+        || path.contains("/inference/")
+        || path.ends_with("/connectors")
+        || path.contains("/connectors/")
+        || path.ends_with("/name")
+        || path.ends_with("/presence")
+        || path.contains("/presence/")
+        || path.ends_with("/buzz/profile")
+        || path.ends_with("/buzz/join");
+    if editor {
+        AgentOperation::EditDraft
+    } else {
+        AgentOperation::UnknownWrite
+    }
+}
+
+pub fn required_agent_role(method: &str, path_and_query: &str) -> ManagerRole {
+    agent_operation(method, path_and_query).required_role()
 }
 
 /// Authorize one per-agent request at the minimum role required by its route.
@@ -775,6 +844,8 @@ mod tests {
             origin: "http://127.0.0.1:7777".into(),
             token: None,
             browser_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            pending_nip46: std::sync::Mutex::new(std::collections::HashMap::new()),
+            remote_signers: std::sync::Mutex::new(std::collections::HashMap::new()),
             desktop_token: None,
             internal_token: "test-internal-token".into(),
             control_audit: std::sync::Mutex::new(()),
@@ -1096,6 +1167,8 @@ mod tests {
         for (method, path) in [
             ("PUT", "/api/agents/x/manifest"),
             ("POST", "/api/agents/x/ratify"),
+            ("POST", "/api/agents/x/archive"),
+            ("DELETE", "/api/agents/x"),
             ("POST", "/api/agents/x/credential/seal"),
             ("POST", "/api/agents/x/control-token"),
             ("GET", "/api/agents/x/control-tokens"),
@@ -1103,6 +1176,18 @@ mod tests {
         ] {
             assert_eq!(required_agent_role(method, path), ManagerRole::Governor);
         }
+        assert_eq!(
+            agent_operation("POST", "/api/agents/x/a-new-sensitive-route"),
+            AgentOperation::UnknownWrite
+        );
+        assert_eq!(
+            required_agent_role("POST", "/api/agents/x/a-new-sensitive-route"),
+            ManagerRole::Governor
+        );
+        assert_eq!(
+            required_agent_role("POST", "/api/agents/x/proposal/accept"),
+            ManagerRole::Governor
+        );
     }
 
     #[test]

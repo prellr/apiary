@@ -9,6 +9,8 @@ const workspaceStatus = document.getElementById('workspace-status');
 const desktopAuth = document.getElementById('desktop-auth');
 const desktopManager = document.getElementById('desktop-manager');
 const desktopContinue = document.getElementById('desktop-continue');
+const bunkerUri = document.getElementById('bunker-uri');
+const connectBunker = document.getElementById('connect-bunker');
 
 function desktopBootstrap() {
   const prefix = '#desktop=';
@@ -27,6 +29,15 @@ function desktopHash() {
   const safe = { ...DESKTOP };
   delete safe.access_token;
   return '#desktop=' + encodeURIComponent(JSON.stringify(safe));
+}
+
+function openAuthenticatedCockpit() {
+  // Changing only the fragment is a same-document navigation in WebKit, so
+  // the server never gets a chance to serve the authenticated cockpit. Strip
+  // the desktop credential from the fragment, preserve any deep link, then
+  // force a real navigation with the newly issued session cookie.
+  history.replaceState(null, '', '/' + location.search + desktopHash());
+  location.reload();
 }
 
 function desktopAction(action, params) {
@@ -67,6 +78,7 @@ function renderWorkspaceSwitcher() {
 
 async function desktopSignIn(manager) {
   if (!DESKTOP || !DESKTOP.access_token) return false;
+  sessionStorage.setItem('apiary.desktop_access', DESKTOP.access_token);
   status.className = '';
   status.textContent = 'Authenticating through your SSH connection…';
   const response = await fetch('/api/desktop/session', {
@@ -96,7 +108,7 @@ async function desktopSignIn(manager) {
   }
   sessionStorage.setItem('apiary.csrf', result.csrf);
   sessionStorage.setItem('apiary.npub', result.npub);
-  location.replace('/' + desktopHash());
+  openAuthenticatedCockpit();
   return true;
 }
 
@@ -152,9 +164,58 @@ async function signIn() {
   }
   sessionStorage.setItem('apiary.csrf', result.csrf);
   sessionStorage.setItem('apiary.npub', result.npub);
-  // Preserve the desktop-only bootstrap fragment. The server never receives
-  // it, but the authenticated cockpit needs it to render the same switcher.
-  location.replace('/' + desktopHash());
+  openAuthenticatedCockpit();
+}
+
+function acceptSession(result) {
+  if (!result || !result.ok) return false;
+  sessionStorage.setItem('apiary.csrf', result.csrf);
+  sessionStorage.setItem('apiary.npub', result.npub);
+  sessionStorage.setItem('apiary.nip46', 'connected');
+  bunkerUri.value = '';
+  openAuthenticatedCockpit();
+  return true;
+}
+
+async function remoteSignerRequest(path, body) {
+  const response = await fetch(path, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: {'content-type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.error || `Remote signer connection failed (${response.status}).`);
+  return result;
+}
+
+async function connectRemoteSigner() {
+  const uri = bunkerUri.value.trim();
+  if (!uri.startsWith('bunker://')) {
+    throw new Error('Paste a bunker:// connection string from your remote signer.');
+  }
+  status.className = '';
+  status.textContent = 'Connecting to your remote signer…';
+  let result = await remoteSignerRequest('/api/nip46/connect', {bunker_uri: uri});
+  const opened = new Set();
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    if (acceptSession(result)) return;
+    if (!result.pending || !result.connection) {
+      throw new Error(result.error || 'The remote signer did not complete the connection.');
+    }
+    if (result.auth_url && !opened.has(result.auth_url)) {
+      opened.add(result.auth_url);
+      window.open(result.auth_url, '_blank', 'noopener,noreferrer');
+      status.textContent = 'Approve Apiary in your remote signer, then return here…';
+    } else if (!result.auth_url) {
+      status.textContent = 'Waiting for your remote signer…';
+    }
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    result = await remoteSignerRequest('/api/nip46/connect/continue', {
+      connection: result.connection,
+    });
+  }
+  throw new Error('The remote signer did not answer. Check its relay connection and try again.');
 }
 
 button.addEventListener('click', async () => {
@@ -166,6 +227,18 @@ button.addEventListener('click', async () => {
     status.className = 'bad';
     status.textContent = error && error.message ? error.message : 'Could not sign in.';
     button.disabled = false;
+  }
+});
+
+connectBunker.addEventListener('click', async () => {
+  connectBunker.disabled = true;
+  try {
+    await connectRemoteSigner();
+  } catch (error) {
+    status.className = 'bad';
+    status.textContent = error && error.message ? error.message : 'Could not connect the remote signer.';
+  } finally {
+    connectBunker.disabled = false;
   }
 });
 

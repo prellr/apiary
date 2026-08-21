@@ -70,6 +70,9 @@ records to one fast authorization decision before work begins. Task history,
 health, spending, search indexes, and interface state stay off-chain so normal
 operation remains responsive.
 
+The implementation boundaries and fail-closed invariants are summarized in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ## What works today
 
 - **Desktop and headless operation** — run Apiary locally, on a server, or use

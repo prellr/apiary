@@ -27,6 +27,9 @@ pub struct RunTimings {
     pub transcription_ms: f64,
     pub memory_ms: f64,
     pub connectors_ms: f64,
+    /// Credential opening and provider construction before the first model
+    /// request. Kept separate so process/bootstrap overhead is measurable.
+    pub provider_bind_ms: f64,
     /// Model or foreign harness wall time, including its tool loop.
     pub engine_ms: f64,
     /// Time spent inside governed connector execution during the engine loop.
@@ -147,6 +150,7 @@ pub fn run_task_observed(
             return Err(e);
         }
     };
+    let mut reservation_guard = crate::spend::ReservationGuard::new(&ledger, reservation);
     timings.budget_ms = elapsed_ms(budget_started);
 
     // Every fallible step between reserve and settle must release the
@@ -158,7 +162,7 @@ pub fn run_task_observed(
             match $e {
                 Ok(v) => v,
                 Err(e) => {
-                    let _ = ledger.settle(reservation, 0, 0);
+                    let _ = reservation_guard.release();
                     return Err(e.into());
                 }
             }
@@ -242,7 +246,7 @@ pub fn run_task_observed(
         + audio_tokens;
     timings.connectors_ms = elapsed_ms(connectors_started);
     if input_estimate >= reservation.amount {
-        let _ = ledger.settle(reservation, 0, 0);
+        let _ = reservation_guard.release();
         return Err(crate::Error::Budget(format!(
             "working set (~{input_estimate} tokens) exceeds the remaining budget \
              reservation ({}); a human raises the floor, not the agent",
@@ -252,6 +256,7 @@ pub fn run_task_observed(
     let engine_started = std::time::Instant::now();
     let first_token_ms = std::cell::Cell::new(None::<f64>);
     let tools_ms = std::cell::Cell::new(0.0f64);
+    let provider_bind_ms = std::cell::Cell::new(0.0f64);
     let mut candidates = vec![primary_slot_name.clone()];
     if !ctx.disable_fallback {
         if let Some(fallbacks) = manifest.routing.fallbacks.get(&primary_slot_name) {
@@ -259,11 +264,11 @@ pub fn run_task_observed(
         }
     }
     let mut attempt_failures = Vec::<serde_json::Value>::new();
-    let fail_run = |slot: &str,
-                    model: Option<&str>,
-                    harness: Option<&str>,
-                    error: &crate::Error,
-                    attempts: &[serde_json::Value]| {
+    let mut fail_run = |slot: &str,
+                        model: Option<&str>,
+                        harness: Option<&str>,
+                        error: &crate::Error,
+                        attempts: &[serde_json::Value]| {
         let _ = log.append(
             custody,
             agent,
@@ -286,7 +291,7 @@ pub fn run_task_observed(
                 })),
             },
         );
-        let _ = ledger.settle(reservation, 0, 0);
+        let _ = reservation_guard.release();
     };
     let (completion, slot_name, inference_harness) = 'attempts: loop {
         let index = attempt_failures.len();
@@ -304,6 +309,7 @@ pub fn run_task_observed(
 
         // Credentials remain JIT-opened per attempt. A fallback is another
         // already-ratified slot, never a host-invented provider.
+        let bind_started = std::time::Instant::now();
         let bound = (|| -> Result<Box<dyn crate::inference::Provider>, crate::Error> {
             let credential = match &slot.credential {
                 Some(blob) => Some(custody.open(agent, blob)?),
@@ -317,6 +323,7 @@ pub fn run_task_observed(
             let auth = slot.requires.get("auth").and_then(|value| value.as_str());
             bind(&slot.provider, credential, base_url, auth)
         })();
+        provider_bind_ms.set(provider_bind_ms.get() + elapsed_ms(bind_started));
         let provider = match bound {
             Ok(provider) => provider,
             Err(error) => {
@@ -479,6 +486,7 @@ pub fn run_task_observed(
         }
     };
     timings.engine_ms = elapsed_ms(engine_started);
+    timings.provider_bind_ms = provider_bind_ms.get();
     timings.tools_ms = tools_ms.get();
     timings.first_token_ms = first_token_ms.get().or(Some(elapsed_ms(total_started)));
 
@@ -512,11 +520,8 @@ pub fn run_task_observed(
             })),
         },
     )?;
-    let (_, overran) = ledger.settle(
-        reservation,
-        completion.input_tokens,
-        completion.output_tokens,
-    )?;
+    let (_, overran) =
+        reservation_guard.settle(completion.input_tokens, completion.output_tokens)?;
     if overran {
         // Real usage exceeded the reservation (estimates are estimates).
         // The ledger recorded the truth — the overrun is visible in the
@@ -1261,6 +1266,7 @@ governance:
         let out = run_task(&manifest, &dir, &custody, &handle, "say hello", &ctx).unwrap();
         assert!(out.completion.text.contains("say hello"));
         assert_eq!(out.slot, "brain");
+        assert!(out.timings.engine_ms >= out.timings.provider_bind_ms);
 
         // Log has one signed, verifiable entry.
         let log = EpisodicLog::open(&dir);

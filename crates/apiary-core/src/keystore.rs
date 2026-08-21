@@ -14,6 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub struct Keystore {
+    state_dir: PathBuf,
     root: PathBuf,
 }
 
@@ -29,7 +30,59 @@ impl Keystore {
             let _ = fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700));
             let _ = fs::set_permissions(&root, fs::Permissions::from_mode(0o700));
         }
-        Ok(Self { root })
+        Ok(Self {
+            state_dir: state_dir.to_path_buf(),
+            root,
+        })
+    }
+
+    fn workspace_verifier_path(&self) -> PathBuf {
+        self.state_dir.join("workspace.ncryptsec")
+    }
+
+    fn write_workspace_verifier(&self, passphrase: &str) -> Result<(), crate::Error> {
+        let keys = Keys::generate();
+        let enc =
+            EncryptedSecretKey::new(keys.secret_key(), passphrase, 16, KeySecurity::Medium)
+                .map_err(|e| crate::Error::Keystore(format!("workspace verifier encrypt: {e}")))?;
+        let value = enc
+            .to_bech32()
+            .map_err(|e| crate::Error::Keystore(format!("workspace verifier encode: {e}")))?;
+        let path = self.workspace_verifier_path();
+        fs::write(&path, value)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+
+    /// Verify the workspace passphrase even before the first agent exists.
+    /// Returns false only when this call initializes a brand-new verifier.
+    /// Legacy workspaces without a verifier are checked against an existing
+    /// agent key first, then upgraded in place.
+    pub fn verify_or_initialize_workspace(&self, passphrase: &str) -> Result<bool, crate::Error> {
+        let marker = self.workspace_verifier_path();
+        if marker.exists() {
+            let raw = fs::read_to_string(&marker)?;
+            let enc = EncryptedSecretKey::from_bech32(raw.trim()).map_err(|e| {
+                crate::Error::Keystore(format!("workspace verifier is invalid: {e}"))
+            })?;
+            enc.decrypt(passphrase).map_err(|_| {
+                crate::Error::Keystore("workspace passphrase does not match".into())
+            })?;
+            return Ok(true);
+        }
+
+        if let Some(first) = self.list()?.first() {
+            self.load(first, passphrase)?;
+            self.write_workspace_verifier(passphrase)?;
+            return Ok(true);
+        }
+
+        self.write_workspace_verifier(passphrase)?;
+        Ok(false)
     }
 
     pub fn agent_dir(&self, npub: &str) -> PathBuf {
@@ -68,8 +121,10 @@ impl Keystore {
             .map_err(|e| crate::Error::Keystore(format!("read {}: {e}", path.display())))?;
         let enc = EncryptedSecretKey::from_bech32(ncryptsec.trim())
             .map_err(|e| crate::Error::Keystore(format!("parse ncryptsec: {e}")))?;
-        let sk = enc.decrypt(passphrase).map_err(|e| {
-            crate::Error::Keystore(format!("nip49 decrypt (wrong passphrase?): {e}"))
+        let sk = enc.decrypt(passphrase).map_err(|_| {
+            crate::Error::Keystore(
+                "encrypted key did not open with this workspace passphrase".into(),
+            )
         })?;
         Ok(Keys::new(sk))
     }
@@ -106,6 +161,26 @@ mod tests {
         let loaded = ks.load(&npub, "correct horse").unwrap();
         assert_eq!(loaded.public_key(), keys.public_key());
         assert!(ks.load(&npub, "wrong").is_err());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_workspace_passphrase_is_persistent_and_verifiable() {
+        let dir = std::env::temp_dir().join(format!(
+            "apiary-empty-workspace-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let ks = Keystore::open(&dir).unwrap();
+        assert!(!ks
+            .verify_or_initialize_workspace("first passphrase")
+            .unwrap());
+        assert!(ks
+            .verify_or_initialize_workspace("first passphrase")
+            .unwrap());
+        assert!(ks
+            .verify_or_initialize_workspace("different passphrase")
+            .is_err());
         fs::remove_dir_all(&dir).ok();
     }
 }

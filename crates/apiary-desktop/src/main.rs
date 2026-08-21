@@ -88,6 +88,10 @@ struct DesktopRemoteView {
     id: String,
     name: String,
     ssh_target: String,
+    ssh_port: Option<u16>,
+    remote_port: u16,
+    local_port: u16,
+    identity_file: Option<PathBuf>,
 }
 
 struct LaunchConfig {
@@ -270,6 +274,8 @@ fn run_local(home: PathBuf, bootstrap: DesktopBootstrap) {
         origin: format!("http://127.0.0.1:{port}"),
         token: Some(token.clone()),
         browser_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+        pending_nip46: std::sync::Mutex::new(std::collections::HashMap::new()),
+        remote_signers: std::sync::Mutex::new(std::collections::HashMap::new()),
         desktop_token: None,
         internal_token: apiary_core::identity::generate()
             .secret_key()
@@ -499,6 +505,10 @@ fn load_launch_config(home: &Path) -> Result<LaunchConfig, String> {
                     id: "environment".into(),
                     name: remote.ssh_target.clone(),
                     ssh_target: remote.ssh_target.clone(),
+                    ssh_port: remote.ssh_port,
+                    remote_port: remote.remote_port,
+                    local_port: remote.local_port,
+                    identity_file: remote.identity_file.clone(),
                 }],
                 environment_override: true,
                 access_token: None,
@@ -519,6 +529,10 @@ fn load_launch_config(home: &Path) -> Result<LaunchConfig, String> {
                     id: saved.id,
                     name: saved.name,
                     ssh_target: saved.remote.ssh_target,
+                    ssh_port: saved.remote.ssh_port,
+                    remote_port: saved.remote.remote_port,
+                    local_port: saved.remote.local_port,
+                    identity_file: saved.remote.identity_file,
                 })
                 .collect(),
             environment_override: false,
@@ -640,6 +654,21 @@ fn unique_profile_id(seed: &str, existing: &std::collections::HashSet<String>) -
 }
 
 fn handle_desktop_navigation(handle: &tauri::AppHandle, home: &Path, url: &tauri::Url) {
+    if url.host_str() == Some("open-external") {
+        let result = desktop_external_url(url).and_then(|target| {
+            tauri_plugin_opener::open_url(target.as_str(), None::<&str>)
+                .map_err(|error| format!("could not open the system browser: {error}"))
+        });
+        if let Err(error) = result {
+            handle
+                .dialog()
+                .message(error)
+                .title("Could not open OAuth sign-in")
+                .kind(MessageDialogKind::Error)
+                .show(|_| {});
+        }
+        return;
+    }
     let pending = match pending_desktop_action(home, url) {
         Ok(pending) => pending,
         Err(error) => {
@@ -681,6 +710,27 @@ fn handle_desktop_navigation(handle: &tauri::AppHandle, home: &Path, url: &tauri
             }
             restart_handle.request_restart();
         });
+}
+
+fn desktop_external_url(url: &tauri::Url) -> Result<tauri::Url, String> {
+    let value = url
+        .query_pairs()
+        .find_map(|(key, value)| (key == "url").then(|| value.into_owned()))
+        .unwrap_or_default();
+    let value = value.trim();
+    if value.is_empty() || value.len() > 8192 || value.chars().any(char::is_control) {
+        return Err("OAuth URL is missing or invalid".into());
+    }
+    let target = tauri::Url::parse(value).map_err(|_| "OAuth URL is invalid".to_string())?;
+    let loopback_http = target.scheme() == "http"
+        && matches!(target.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+    if target.scheme() != "https" && !loopback_http {
+        return Err("OAuth sign-in must use HTTPS (or loopback HTTP for local development)".into());
+    }
+    if !target.username().is_empty() || target.password().is_some() {
+        return Err("OAuth URL must not contain embedded credentials".into());
+    }
+    Ok(target)
 }
 
 fn pending_desktop_action(home: &Path, url: &tauri::Url) -> Result<PendingDesktopAction, String> {
@@ -762,6 +812,42 @@ fn pending_desktop_action(home: &Path, url: &tauri::Url) -> Result<PendingDeskto
                     "Apiary will save this backend, restart, and connect to {} over SSH.",
                     saved.remote.ssh_target
                 ),
+                config: Some(config),
+            })
+        }
+        "edit" => {
+            let profile = desktop_param(url, "profile")?;
+            let name = desktop_param(url, "name")?;
+            let remote = RemoteConfig {
+                ssh_target: desktop_param(url, "ssh_target")?,
+                ssh_port: optional_port_param(url, "ssh_port")?,
+                remote_port: port_param(url, "remote_port", default_remote_port())?,
+                local_port: port_param(url, "local_port", default_remote_port())?,
+                identity_file: optional_path_param(url, "identity_file")?,
+            };
+            let saved = config
+                .remotes
+                .iter_mut()
+                .find(|saved| saved.id == profile)
+                .ok_or_else(|| "that saved backend no longer exists".to_string())?;
+            saved.name = name;
+            saved.remote = remote;
+            validate_saved_remote(saved)?;
+            let saved = saved.clone();
+            if config.active_remote.as_deref() == Some(&profile) {
+                config.remote = Some(saved.remote.clone());
+            }
+            Ok(PendingDesktopAction {
+                title: format!("Save changes to {}?", saved.name),
+                message: if config.active_remote.as_deref() == Some(&profile) {
+                    format!(
+                        "Apiary will save this backend, restart, and reconnect to {} over SSH.",
+                        saved.remote.ssh_target
+                    )
+                } else {
+                    "Apiary will save this backend and restart. The current backend will remain selected."
+                        .into()
+                },
                 config: Some(config),
             })
         }
@@ -1233,5 +1319,74 @@ mod tests {
         )
         .unwrap();
         assert!(optional_path_param(&url, "identity_file").is_err());
+    }
+
+    #[test]
+    fn external_oauth_navigation_allows_https_and_loopback_http_only() {
+        let https = tauri::Url::parse(
+            "apiary-desktop://open-external?url=https%3A%2F%2Flogin.example.com%2Fauthorize%3Fclient_id%3Dapiary",
+        )
+        .unwrap();
+        assert_eq!(
+            desktop_external_url(&https).unwrap().as_str(),
+            "https://login.example.com/authorize?client_id=apiary"
+        );
+
+        let loopback = tauri::Url::parse(
+            "apiary-desktop://open-external?url=http%3A%2F%2F127.0.0.1%3A7777%2Foauth%2Fcallback",
+        )
+        .unwrap();
+        assert_eq!(
+            desktop_external_url(&loopback).unwrap().as_str(),
+            "http://127.0.0.1:7777/oauth/callback"
+        );
+
+        let insecure = tauri::Url::parse(
+            "apiary-desktop://open-external?url=http%3A%2F%2Fevil.example%2Fauthorize",
+        )
+        .unwrap();
+        assert!(desktop_external_url(&insecure).is_err());
+    }
+
+    #[test]
+    fn edit_backend_updates_the_existing_profile_in_place() {
+        let home = std::env::temp_dir().join(format!(
+            "apiary-desktop-edit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let original = DesktopConfig {
+            mode: DesktopMode::Remote,
+            remote: Some(remote()),
+            active_remote: Some("home-server".into()),
+            remotes: vec![SavedRemote {
+                id: "home-server".into(),
+                name: "Home server".into(),
+                remote: remote(),
+            }],
+        };
+        write_desktop_config(&home, &original).unwrap();
+        let url = tauri::Url::parse(
+            "apiary-desktop://edit?profile=home-server&name=Production&ssh_target=admin%40prod.example.com&ssh_port=2200&remote_port=8888&local_port=9999&identity_file=%2Ftmp%2Fprod-key",
+        )
+        .unwrap();
+        let pending = pending_desktop_action(&home, &url).unwrap();
+        let edited = pending.config.unwrap();
+        assert_eq!(edited.remotes.len(), 1);
+        assert_eq!(edited.remotes[0].id, "home-server");
+        assert_eq!(edited.remotes[0].name, "Production");
+        assert_eq!(
+            edited.remotes[0].remote.ssh_target,
+            "admin@prod.example.com"
+        );
+        assert_eq!(edited.remotes[0].remote.ssh_port, Some(2200));
+        assert_eq!(edited.remotes[0].remote.remote_port, 8888);
+        assert_eq!(edited.remotes[0].remote.local_port, 9999);
+        assert_eq!(edited.remote, Some(edited.remotes[0].remote.clone()));
+        let _ = std::fs::remove_file(home.join("desktop-config.json"));
+        let _ = std::fs::remove_dir(home);
     }
 }

@@ -96,6 +96,13 @@ fn valid_agui_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
 }
 
+fn new_run_id() -> String {
+    format!(
+        "run-{}",
+        apiary_core::identity::generate().public_key().to_hex()
+    )
+}
+
 fn normalize_run(request: RunRequest) -> Result<NormalizedRun, &'static str> {
     match request {
         RunRequest::Apiary(body) => Ok(NormalizedRun {
@@ -233,12 +240,7 @@ pub async fn run_stream(
         Err(e) => return err(StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
     };
 
-    let run_id = normalized.run_id.unwrap_or_else(|| {
-        format!(
-            "run-{:x}",
-            std::process::id() as u64 ^ std::ptr::addr_of!(state) as u64
-        )
-    });
+    let run_id = normalized.run_id.unwrap_or_else(new_run_id);
     let thread_id = normalized.thread_id.unwrap_or_else(|| npub.clone());
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SseEvent>();
 
@@ -487,5 +489,14 @@ mod tests {
         .unwrap();
         let run = normalize_run(request).unwrap();
         assert!(run.body.disable_tools);
+    }
+
+    #[test]
+    fn generated_run_ids_are_unique_and_printable() {
+        let first = new_run_id();
+        let second = new_run_id();
+        assert_ne!(first, second);
+        assert!(valid_agui_id(&first));
+        assert!(valid_agui_id(&second));
     }
 }

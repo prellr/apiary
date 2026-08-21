@@ -2,120 +2,36 @@
 // names, log fields, model output, tool args, and errors are DATA, and the
 // governance origin never interprets data as markup. (CSP backs this up:
 // no inline script, no external sources.)
-'use strict';
+import { createApiaryClient } from '/cockpit-api.js';
+import {
+  inferenceDefaultBaseURL,
+  inferenceEndpoint,
+  inferenceModels,
+  inferenceProviderLabel,
+  inferenceProviders,
+  inferenceRoleForName,
+  inferenceRoleLabel,
+} from '/cockpit-inference.js';
 
 let sel = null, tab = 'overview', agents = [], owners = [], managers = [], hostStatus = {};
-let hostView = null; // null | 'library' | 'found' | 'import'
+let hostView = null; // null | 'library' | 'managers' | 'audit' | 'found' | 'import'
 let listenerPoll = null;
 let manifestRequest = null;
+let browserApprovalWatch = null;
 
 // Desktop mode hands the per-launch token in the boot URL; every API call
 // echoes it back in a header. Without a token this is a no-op.
 const TOKEN = new URLSearchParams(location.search).get('token');
 const REMOTE = new URLSearchParams(location.search).get('remote');
-let SESSION_CSRF = sessionStorage.getItem('apiary.csrf');
-let SESSION_NPUB = sessionStorage.getItem('apiary.npub');
-let SESSION_CONNECTING = null;
-let DESKTOP = null;
-try {
-  const encoded = new URLSearchParams(location.hash.slice(1)).get('desktop');
-  if (encoded) DESKTOP = JSON.parse(encoded);
-} catch {
-  DESKTOP = null;
-}
-function hdrs(extra) {
-  const h = Object.assign({}, extra);
-  if (TOKEN) h['x-apiary-token'] = TOKEN;
-  if (SESSION_CSRF) h['x-apiary-csrf'] = SESSION_CSRF;
-  return h;
-}
-function bytesBase64(bytes) {
-  let binary = '';
-  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
-  }
-  return btoa(binary);
-}
-async function sha256Hex(value) {
-  const bytes = new TextEncoder().encode(value);
-  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
-  return [...digest].map(byte => byte.toString(16).padStart(2, '0')).join('');
-}
-async function nip98Authorization(url, opts) {
-  if (!window.nostr || typeof window.nostr.signEvent !== 'function') {
-    throw new Error('This Apiary host requires a Nostr signer. Enable a NIP-07 browser signer, then reload.');
-  }
-  const method = String((opts && opts.method) || 'GET').toUpperCase();
-  const target = new URL(url, location.href);
-  const tags = [['u', target.href], ['method', method]];
-  if (opts && opts.body !== undefined && opts.body !== null) {
-    tags.push(['payload', await sha256Hex(String(opts.body))]);
-  }
-  const signed = await window.nostr.signEvent({
-    kind: 27235,
-    created_at: Math.floor(Date.now() / 1000),
-    tags,
-    content: '',
-  });
-  return 'Nostr ' + bytesBase64(new TextEncoder().encode(JSON.stringify(signed)));
-}
-async function establishBrowserSession() {
-  if (SESSION_CONNECTING) return SESSION_CONNECTING;
-  SESSION_CONNECTING = (async () => {
-    const opts = { method: 'POST' };
-    const authorization = await nip98Authorization('/api/session', opts);
-    const response = await fetch('/api/session', {
-      method: 'POST',
-      credentials: 'same-origin',
-      headers: hdrs({ authorization }),
-    });
-    const result = await response.json().catch(() => ({}));
-    if (!response.ok || !result.ok) {
-      throw new Error(result.error || `Nostr sign-in was refused (${response.status}).`);
-    }
-    SESSION_CSRF = result.csrf;
-    SESSION_NPUB = result.npub;
-    sessionStorage.setItem('apiary.csrf', result.csrf);
-    sessionStorage.setItem('apiary.npub', result.npub);
-    return result;
-  })();
-  try {
-    return await SESSION_CONNECTING;
-  } finally {
-    SESSION_CONNECTING = null;
-  }
-}
-async function apiaryFetch(url, opts, retried) {
-  opts = Object.assign({}, opts || {});
-  opts.credentials = 'same-origin';
-  opts.headers = hdrs(opts.headers);
-  const response = await fetch(url, opts);
-  if (response.status === 401 && !retried && !TOKEN) {
-    await establishBrowserSession();
-    return apiaryFetch(url, opts, true);
-  }
-  return response;
-}
-async function j(url, opts) {
-  const r = await apiaryFetch(url, opts);
-  return r.json();
-}
-async function signOut() {
-  const response = await fetch('/api/session', {
-    method: 'DELETE',
-    credentials: 'same-origin',
-    headers: hdrs(),
-  });
-  if (!response.ok && response.status !== 401) {
-    const result = await response.json().catch(() => ({}));
-    throw new Error(result.error || `Sign out failed (${response.status}).`);
-  }
-  SESSION_CSRF = null;
-  SESSION_NPUB = null;
-  sessionStorage.removeItem('apiary.csrf');
-  sessionStorage.removeItem('apiary.npub');
-  location.replace('/');
-}
+const INITIAL_AGENT = new URLSearchParams(location.search).get('agent');
+const INITIAL_TAB = new URLSearchParams(location.search).get('tab');
+const client = createApiaryClient(TOKEN);
+const DESKTOP = client.desktop;
+const apiaryFetch = client.fetch;
+const j = client.json;
+const signOut = client.signOut;
+const establishBrowserSession = client.establishBrowserSession;
+const establishDesktopSession = client.establishDesktopSession;
 
 // el('div', 'cls', 'text') — safe node construction.
 function el(tag, cls, text) {
@@ -135,6 +51,46 @@ function nostrId(value, tag = 'span', cls = null) {
   node.setAttribute('aria-label', String(value || ''));
   return node;
 }
+async function copyText(value) {
+  const text = String(value || '');
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const fallback = el('textarea');
+  fallback.value = text;
+  fallback.setAttribute('readonly', '');
+  fallback.style.cssText = 'position:fixed;left:-9999px;top:0;';
+  document.body.append(fallback);
+  fallback.select();
+  const copied = document.execCommand('copy');
+  fallback.remove();
+  if (!copied) throw new Error('Clipboard access is unavailable.');
+}
+function copyableNostrId(value) {
+  const full = String(value || '');
+  const row = el('div', 'agent-public-id');
+  const label = el('span', 'agent-public-id-label', 'Nostr ID');
+  const id = el('code', 'agent-public-id-value', full);
+  id.title = 'Agent public identity';
+  const copy = el('button', 'btn agent-public-id-copy', 'Copy Nostr ID');
+  copy.type = 'button';
+  const status = el('span', 'agent-public-id-status');
+  status.setAttribute('role', 'status');
+  status.setAttribute('aria-live', 'polite');
+  copy.onclick = async () => {
+    try {
+      await copyText(full);
+      status.textContent = 'Copied';
+      copy.textContent = 'Copied';
+      setTimeout(() => { copy.textContent = 'Copy Nostr ID'; status.textContent = ''; }, 1800);
+    } catch (error) {
+      status.textContent = error && error.message ? error.message : 'Could not copy';
+    }
+  };
+  row.append(label, id, copy, status);
+  return row;
+}
 function help(text) { return el('div', 'help', text); }
 function kv(k, v) {
   const row = el('div', 'kv');
@@ -151,6 +107,142 @@ function api(path) { return `/api/agents/${encodeURIComponent(sel)}${path}`; }
 function currentManifest() {
   if (!manifestRequest) manifestRequest = j(api('/manifest'));
   return manifestRequest;
+}
+
+function approvalBrowserUrl() {
+  const base = new URL(hostStatus.origin || location.origin);
+  base.searchParams.set('agent', sel);
+  base.searchParams.set('tab', 'overview');
+  return base.href;
+}
+
+async function approveWithNostr(governor, status, button) {
+  if (!window.nostr || typeof window.nostr.signEvent !== 'function') {
+    status.textContent = 'Enable a NIP-07 Nostr signer in this browser, then try again.';
+    return false;
+  }
+  button.disabled = true;
+  status.textContent = 'Preparing the approval for your Nostr signer…';
+  try {
+    const exported = await j(api('/ratify/export'), {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ as: governor }),
+    });
+    if (!exported.ok) throw new Error(exported.error || 'Apiary could not prepare the approval.');
+    status.textContent = 'Confirm the approval in your Nostr signer…';
+    const event = await window.nostr.signEvent(exported.unsigned_event);
+    const imported = await j(api('/ratify/import'), {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ event }),
+    });
+    if (!imported.ok) throw new Error(imported.error || 'Apiary could not verify the signed approval.');
+    status.textContent = imported.snapshot_warning
+      ? 'Approved. Apiary could not save the optional review snapshot: ' + imported.snapshot_warning
+      : 'Approved. Opening the agent overview…';
+    await loadRoster();
+    openTab('overview');
+    return true;
+  } catch (error) {
+    status.textContent = 'Could not approve: ' + (error && error.message ? error.message : String(error));
+    return false;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function connectRemoteSigner(status, button, bunkerUri) {
+  const bunker = String(bunkerUri || '').trim();
+  if (!bunker.startsWith('bunker://')) {
+    status.textContent = 'Paste a bunker:// connection string from your remote signer.';
+    return false;
+  }
+  button.disabled = true;
+  status.textContent = 'Connecting to the remote signer…';
+  try {
+    let response = await fetch('/api/nip46/connect', {
+      method: 'POST', credentials: 'same-origin', headers: {'content-type': 'application/json'},
+      body: JSON.stringify({bunker_uri: bunker.trim()}),
+    });
+    let result = await response.json().catch(() => ({}));
+    const opened = new Set();
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      if (!response.ok) throw new Error(result.error || `Remote signer connection failed (${response.status}).`);
+      if (result.ok) {
+        sessionStorage.setItem('apiary.csrf', result.csrf);
+        sessionStorage.setItem('apiary.npub', result.npub);
+        sessionStorage.setItem('apiary.nip46', 'connected');
+        status.textContent = 'Remote signer connected. Reloading the approval…';
+        location.reload();
+        return true;
+      }
+      if (!result.pending || !result.connection) throw new Error(result.error || 'The remote signer did not complete the connection.');
+      if (result.auth_url && !opened.has(result.auth_url)) {
+        opened.add(result.auth_url);
+        showRemoteSignerAuthorization(status, result.auth_url, 'Approve Apiary in the remote signer, then return here.');
+      } else if (!result.auth_url) {
+        status.textContent = 'Waiting for the remote signer…';
+      }
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      response = await fetch('/api/nip46/connect/continue', {
+        method: 'POST', credentials: 'same-origin', headers: {'content-type': 'application/json'},
+        body: JSON.stringify({connection: result.connection}),
+      });
+      result = await response.json().catch(() => ({}));
+    }
+    throw new Error('The remote signer did not answer. Check its relay connection and try again.');
+  } catch (error) {
+    status.textContent = 'Could not connect remote signer: ' + (error && error.message ? error.message : String(error));
+    return false;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function approveWithNip46(governor, status, button) {
+  button.disabled = true;
+  status.textContent = 'Preparing the approval for your remote signer…';
+  try {
+    const exported = await j(api('/ratify/export'), {
+      method: 'POST', headers: {'content-type': 'application/json'},
+      body: JSON.stringify({as: governor}),
+    });
+    if (!exported.ok) throw new Error(exported.error || 'Apiary could not prepare the approval.');
+    let signed;
+    const opened = new Set();
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      const result = await j('/api/nip46/sign', {
+        method: 'POST', headers: {'content-type': 'application/json'},
+        body: JSON.stringify({unsigned_event: exported.unsigned_event}),
+      });
+      if (result.ok) { signed = result.event; break; }
+      if (result.code === 'nip46_auth_required' && result.auth_url) {
+        if (!opened.has(result.auth_url)) {
+          opened.add(result.auth_url);
+          showRemoteSignerAuthorization(status, result.auth_url, 'Approve this event in the remote signer, then return here.');
+        }
+      } else if (result.pending) {
+        status.textContent = 'Waiting for the remote signer to sign…';
+      } else {
+        throw new Error(result.error || 'The remote signer could not sign this approval.');
+      }
+      await new Promise(resolve => setTimeout(resolve, 1500));
+    }
+    if (!signed) throw new Error('The remote signer did not answer.');
+    const imported = await j(api('/ratify/import'), {
+      method: 'POST', headers: {'content-type': 'application/json'},
+      body: JSON.stringify({event: signed}),
+    });
+    if (!imported.ok) throw new Error(imported.error || 'Apiary could not verify the signed approval.');
+    status.textContent = 'Approved. Opening the agent overview…';
+    await loadRoster();
+    openTab('overview');
+    return true;
+  } catch (error) {
+    status.textContent = 'Could not approve: ' + (error && error.message ? error.message : String(error));
+    return false;
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function ownerHolders(keys) {
@@ -179,6 +271,20 @@ function field(labelText, control, hint) {
   label.append(el('span', null, labelText), control);
   if (hint) label.append(el('small', null, hint));
   return label;
+}
+
+// Technical values must survive the OS/browser text stack byte-for-byte.
+// In particular, macOS autocapitalization turns `wss://` into `Wss://`, and
+// writing assistants can replace punctuation inside URLs, keys, and tokens.
+function technicalInput(control) {
+  control.autocomplete = 'off';
+  control.spellcheck = false;
+  control.setAttribute('autocapitalize', 'none');
+  control.setAttribute('autocorrect', 'off');
+  control.setAttribute('data-gramm', 'false');
+  control.setAttribute('data-gramm_editor', 'false');
+  control.setAttribute('data-enable-grammarly', 'false');
+  return control;
 }
 
 const connectorKindLabel = {
@@ -223,6 +329,141 @@ function accessSelect(mode = 'read-only') {
   return select;
 }
 
+const mcpActionWords = new Set([
+  'get', 'list', 'find', 'search', 'lookup', 'check', 'view', 'read',
+  'create', 'add', 'update', 'set', 'delete', 'remove', 'submit', 'send',
+]);
+
+function singularToolWord(word) {
+  if (word.endsWith('ies') && word.length > 3) return word.slice(0, -3) + 'y';
+  if (/(ches|shes|xes|zes)$/.test(word)) return word.slice(0, -2);
+  if (word.endsWith('s') && !word.endsWith('ss')) return word.slice(0, -1);
+  return word;
+}
+
+function mcpToolCategory(name) {
+  const source = String(name || 'Other');
+  const snake = source.split(/[_./:-]+/).filter(Boolean);
+  if (snake.length > 1 && !mcpActionWords.has(snake[0].toLowerCase())) {
+    const count = snake[0].toLowerCase() === 'platform' && snake.length > 2 ? 2 : 1;
+    return snake.slice(0, count).map(word => word[0].toUpperCase() + word.slice(1)).join(' ');
+  }
+  let words = source
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .split(/[^A-Za-z0-9]+/)
+    .filter(Boolean)
+    .map(word => word.toLowerCase());
+  if (words.length > 1 && mcpActionWords.has(words[0])) words = words.slice(1);
+  if (!words.length) return 'Other';
+  words = words.slice(0, Math.min(2, words.length));
+  words[words.length - 1] = singularToolWord(words[words.length - 1]);
+  return words.map(word => word[0].toUpperCase() + word.slice(1)).join(' ');
+}
+
+function mcpToolPolicies(tools, caps) {
+  const policies = new Map();
+  const explicit = caps && caps.tool_access && typeof caps.tool_access === 'object'
+    ? caps.tool_access : null;
+  if (explicit) {
+    for (const tool of tools) {
+      const mode = explicit[tool.name];
+      if (mode === 'read-write') policies.set(tool.name, tool.read_only ? 'read-only' : 'read-write');
+      else if (mode === 'read-only' && tool.read_only) policies.set(tool.name, mode);
+    }
+    return policies;
+  }
+  const allowed = new Set((caps && caps.allowed_tools) || []);
+  const wildcard = allowed.has('*');
+  const mode = connectorAccessMode('mcp', caps || {}) === 'read-only' ? 'read-only' : 'read-write';
+  for (const tool of tools) {
+    if ((wildcard || allowed.has(tool.name)) && (mode === 'read-write' || tool.read_only)) {
+      policies.set(tool.name, tool.read_only ? 'read-only' : mode);
+    }
+  }
+  return policies;
+}
+
+function mcpToolPolicyObject(policies) {
+  return Object.fromEntries([...policies.entries()].sort(([a], [b]) => a.localeCompare(b)));
+}
+
+function renderMcpToolPolicyPicker(root, tools, policies) {
+  root.replaceChildren();
+  const groups = new Map();
+  for (const tool of tools) {
+    const category = mcpToolCategory(tool.name);
+    if (!groups.has(category)) groups.set(category, []);
+    groups.get(category).push(tool);
+  }
+  const intro = help('Choose a category policy, then refine individual tools. “Read only” is available only when the MCP server explicitly marks that tool readOnlyHint=true; unmarked tools remain blocked unless you grant Read + write.');
+  const allRow = el('div', 'row');
+  const allPolicy = el('select');
+  for (const [value, label] of [['', 'Select across all tools…'], ['blocked', 'Block all'], ['read-only', 'Allow all declared read-only tools'], ['read-write', 'Allow all tools (Read + write where needed)']]) {
+    const option = el('option', null, label); option.value = value; allPolicy.append(option);
+  }
+  allPolicy.onchange = () => {
+    if (!allPolicy.value) return;
+    for (const tool of tools) {
+      let mode = allPolicy.value;
+      if (mode === 'read-only' && !tool.read_only) mode = 'blocked';
+      if (mode === 'read-write' && tool.read_only) mode = 'read-only';
+      if (mode === 'blocked') policies.delete(tool.name);
+      else policies.set(tool.name, mode);
+    }
+    renderMcpToolPolicyPicker(root, tools, policies);
+  };
+  allRow.append(allPolicy, el('span', 'meta', 'Bulk selection is expanded into explicit named-tool permissions.'));
+  root.append(intro, allRow);
+  for (const [category, categoryTools] of [...groups.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    const details = el('details', 'mcp-tool-group');
+    const selectedCount = () => categoryTools.filter(tool => policies.has(tool.name)).length;
+    const summary = el('summary', null, `${category} · ${selectedCount()}/${categoryTools.length} allowed`);
+    const categoryRow = el('div', 'row');
+    const categoryPolicy = el('select');
+    for (const [value, label] of [['', 'Set category…'], ['blocked', 'Block category'], ['read-only', 'Allow declared read-only tools'], ['read-write', 'Allow category (R/W where needed)']]) {
+      const option = el('option', null, label); option.value = value; categoryPolicy.append(option);
+    }
+    categoryRow.append(categoryPolicy, el('span', 'meta', 'Applies to every tool in this category; you can override below.'));
+    details.append(summary, categoryRow);
+    const selects = [];
+    for (const tool of categoryTools.sort((a, b) => a.name.localeCompare(b.name))) {
+      const row = el('div', 'mcp-tool-policy');
+      const select = el('select');
+      const choices = tool.read_only
+        ? [['blocked', 'Blocked'], ['read-only', 'Read only']]
+        : [['blocked', 'Blocked'], ['read-write', 'Read + write']];
+      for (const [value, label] of choices) {
+        const option = el('option', null, label); option.value = value; select.append(option);
+      }
+      select.value = policies.get(tool.name) || 'blocked';
+      const description = el('span', 'mcp-tool-description');
+      description.append(el('b', null, tool.name), el('span', 'meta', ` · ${tool.read_only ? 'server-marked read only' : 'write-capable or unmarked'}`));
+      if (tool.description) description.append(document.createTextNode(' — ' + tool.description));
+      select.onchange = () => {
+        if (select.value === 'blocked') policies.delete(tool.name);
+        else policies.set(tool.name, select.value);
+        summary.textContent = `${category} · ${selectedCount()}/${categoryTools.length} allowed`;
+        categoryPolicy.value = '';
+      };
+      selects.push([tool, select]);
+      row.append(select, description); details.append(row);
+    }
+    categoryPolicy.onchange = () => {
+      if (!categoryPolicy.value) return;
+      for (const [tool, select] of selects) {
+        let mode = categoryPolicy.value;
+        if (mode === 'read-only' && !tool.read_only) mode = 'blocked';
+        if (mode === 'read-write' && tool.read_only) mode = 'read-only';
+        select.value = mode;
+        if (mode === 'blocked') policies.delete(tool.name);
+        else policies.set(tool.name, mode);
+      }
+      summary.textContent = `${category} · ${selectedCount()}/${categoryTools.length} allowed`;
+    };
+    root.append(details);
+  }
+}
+
 function desktopAction(action, params) {
   const target = new URL(`apiary-desktop://${action}`);
   for (const [key, value] of Object.entries(params || {})) {
@@ -231,6 +472,197 @@ function desktopAction(action, params) {
     }
   }
   location.assign(target.href);
+}
+
+function openExternalUrl(url) {
+  if (DESKTOP) {
+    desktopAction('open-external', { url });
+    return;
+  }
+  const opened = window.open(url, '_blank', 'noopener,noreferrer');
+  if (!opened) throw new Error('The browser blocked the signer authorization window. Allow pop-ups for this Apiary host and try again.');
+}
+
+function stopBrowserApprovalWatch(watch = browserApprovalWatch) {
+  if (!watch) return;
+  if (watch.interval) clearInterval(watch.interval);
+  if (watch.timeout) clearTimeout(watch.timeout);
+  window.removeEventListener('focus', watch.check);
+  document.removeEventListener('visibilitychange', watch.onVisibility);
+  if (browserApprovalWatch === watch) browserApprovalWatch = null;
+}
+
+function watchForBrowserApproval(targetNpub, status, button, { restart = false, announce = false } = {}) {
+  if (!DESKTOP || !targetNpub) return null;
+  if (browserApprovalWatch?.targetNpub === targetNpub && !restart) {
+    browserApprovalWatch.status = status;
+    browserApprovalWatch.button = button;
+    return browserApprovalWatch;
+  }
+
+  stopBrowserApprovalWatch();
+  const watch = {
+    targetNpub,
+    status,
+    button,
+    checking: false,
+    interval: null,
+    timeout: null,
+    announced: announce,
+  };
+  watch.onVisibility = () => {
+    if (!document.hidden) watch.check();
+  };
+  watch.check = async () => {
+    if (watch.checking || browserApprovalWatch !== watch) return;
+    watch.checking = true;
+    try {
+      const data = await j('/api/agents');
+      const updated = data.agents || [];
+      const target = updated.find(agent => agent.npub === targetNpub);
+      if (!target?.ratified) return;
+
+      agents = updated;
+      manifestRequest = null;
+      if (watch.status?.isConnected) {
+        watch.status.textContent = 'Approval received. Refreshing the agent…';
+      }
+      stopBrowserApprovalWatch(watch);
+      await loadRoster();
+      if (sel === targetNpub) {
+        tab = 'overview';
+        await render();
+      }
+    } catch (_) {
+      // Browser approval may still be in progress; keep polling until timeout.
+    } finally {
+      watch.checking = false;
+    }
+  };
+
+  browserApprovalWatch = watch;
+  window.addEventListener('focus', watch.check);
+  document.addEventListener('visibilitychange', watch.onVisibility);
+  watch.interval = setInterval(watch.check, 1500);
+  watch.timeout = setTimeout(() => {
+    if (browserApprovalWatch !== watch) return;
+    stopBrowserApprovalWatch(watch);
+    if (watch.button?.isConnected) watch.button.disabled = false;
+    if (watch.announced && watch.status?.isConnected) {
+      watch.status.textContent = 'Approval has not appeared yet. Complete it in the browser, then try again.';
+    }
+  }, 300000);
+  if (announce) {
+    if (button?.isConnected) button.disabled = true;
+    if (status?.isConnected) status.textContent = 'Browser opened. Waiting for signed approval…';
+  }
+  watch.check();
+  return watch;
+}
+
+function browserApprovalControl(label, url, targetNpub, status) {
+  const button = el('button', 'btn', label);
+  button.type = 'button';
+  watchForBrowserApproval(targetNpub, status, button);
+  button.onclick = () => {
+    watchForBrowserApproval(targetNpub, status, button, { restart: true, announce: true });
+    openExternalUrl(url);
+  };
+  return button;
+}
+
+function showRemoteSignerAuthorization(status, url, message) {
+  status.replaceChildren(document.createTextNode(`${message} `));
+  status.append(oauthAuthorizeControl('Open signer approval', url));
+  if (DESKTOP) openExternalUrl(url);
+}
+
+function oauthAuthorizeControl(label, url) {
+  if (!DESKTOP) {
+    const link = el('a', null, label);
+    link.href = url;
+    link.target = '_blank';
+    link.rel = 'noopener';
+    link.style.color = 'var(--amber)';
+    return link;
+  }
+  const button = el('button', 'btn', label);
+  button.type = 'button';
+  button.onclick = () => desktopAction('open-external', { url });
+  return button;
+}
+
+function remoteSignerControl(status, label = 'Connect remote signer') {
+  const trigger = el('button', 'btn solid', label);
+  trigger.type = 'button';
+
+  const panel = section('Connect a NIP-46 remote signer', 'In your signer, create a connection for Apiary and copy its bunker:// connection string. Apiary keeps only a temporary client connection; your private key stays in the signer.');
+  panel.hidden = true;
+  const uriLabel = el('label', null, 'Bunker connection string');
+  const uri = document.createElement('input');
+  uri.type = 'text';
+  uri.placeholder = 'bunker://…';
+  technicalInput(uri);
+  uri.setAttribute('aria-label', 'NIP-46 bunker connection string');
+  uriLabel.append(uri);
+  const connect = el('button', 'btn solid', 'Connect signer');
+  connect.type = 'button';
+  const cancel = el('button', 'btn', 'Cancel');
+  cancel.type = 'button';
+  const actions = el('div', 'row');
+  actions.append(connect, cancel);
+  panel.append(uriLabel, actions);
+
+  trigger.onclick = () => {
+    panel.hidden = false;
+    trigger.setAttribute('aria-expanded', 'true');
+    uri.focus();
+  };
+  cancel.onclick = () => {
+    panel.hidden = true;
+    trigger.setAttribute('aria-expanded', 'false');
+    status.textContent = '';
+  };
+  connect.onclick = () => connectRemoteSigner(status, connect, uri.value);
+  uri.addEventListener('keydown', event => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      connect.click();
+    }
+  });
+
+  return { trigger, panel };
+}
+
+function hostDisplayName() {
+  if (DESKTOP) {
+    if (DESKTOP.mode !== 'remote') return 'This Mac';
+    const profiles = Array.isArray(DESKTOP.remotes) ? DESKTOP.remotes : [];
+    const active = profiles.find(profile => profile.id === DESKTOP.active_remote);
+    if (active && active.name) return active.name;
+  }
+  if (REMOTE) return REMOTE;
+  if (location.hostname === 'localhost' || location.hostname === '127.0.0.1' || location.hostname === '::1') {
+    return 'This Mac';
+  }
+  return location.hostname || 'Apiary host';
+}
+
+function setHostHealth(state, detail) {
+  const name = hostDisplayName();
+  const label = state === 'online' ? `${name} · Online`
+    : state === 'offline' ? `${name} · Unreachable`
+      : `${name} · Checking`;
+  const toggle = document.getElementById('host-status-toggle');
+  const statusLabel = document.getElementById('host-status-label');
+  const health = document.getElementById('c-health');
+  statusLabel.textContent = label;
+  toggle.classList.toggle('is-online', state === 'online');
+  toggle.classList.toggle('is-offline', state === 'offline');
+  toggle.title = detail || label;
+  health.textContent = label;
+  health.className = 'chip' + (state === 'online' ? ' ok' : state === 'offline' ? ' bad' : '');
+  health.title = detail || label;
 }
 
 function renderBackendSwitcher() {
@@ -271,7 +703,6 @@ function renderBackendSwitcher() {
   const switchButton = el('button', 'btn solid', 'Switch');
   switchButton.type = 'button';
   switchButton.disabled = select.value === activeId;
-  select.onchange = () => { switchButton.disabled = select.value === activeId; };
   switchButton.onclick = () => {
     message.textContent = 'Confirm the backend change in the Apiary dialog.';
     desktopAction('switch', { profile: select.value });
@@ -287,15 +718,17 @@ function renderBackendSwitcher() {
     message.textContent = 'Confirm the restart in the Apiary dialog.';
     desktopAction('reconnect');
   };
+  const editButton = el('button', 'btn', 'Edit selected server');
+  editButton.type = 'button';
+  editButton.disabled = select.value === 'local';
   const remove = el('button', 'btn danger', 'Remove saved server');
   remove.type = 'button';
   remove.disabled = select.value === 'local';
-  select.addEventListener('change', () => { remove.disabled = select.value === 'local'; });
   remove.onclick = () => {
     message.textContent = 'Confirm removal in the Apiary dialog.';
     desktopAction('remove', { profile: select.value });
   };
-  secondary.append(reconnect, remove);
+  secondary.append(reconnect, editButton, remove);
   root.append(secondary);
 
   const message = el('div', 'backend-message');
@@ -303,10 +736,6 @@ function renderBackendSwitcher() {
   message.setAttribute('aria-live', 'polite');
   root.append(message);
 
-  const add = document.createElement('details');
-  add.className = 'backend-add';
-  add.append(el('summary', null, 'Add a server'));
-  const form = el('form', 'backend-form');
   const input = (label, name, placeholder, options) => {
     const control = el('input');
     control.name = name;
@@ -315,30 +744,81 @@ function renderBackendSwitcher() {
       if (value === true) control.setAttribute(key, '');
       else control.setAttribute(key, value);
     }
+    if (name !== 'name') technicalInput(control);
     return field(label, control);
   };
-  const name = input('Name', 'name', 'Home server', { required: true, maxlength: '80' });
-  name.classList.add('wide');
-  const target = input('SSH destination', 'ssh_target', 'user@server', { required: true, maxlength: '255', pattern: '[^\\s]+' });
-  target.classList.add('wide');
-  const remotePort = input('Apiary port', 'remote_port', '7777', { type: 'number', min: '1', max: '65535', value: '7777' });
-  const localPort = input('Local tunnel port', 'local_port', '7777', { type: 'number', min: '1', max: '65535', value: '7777' });
-  const sshPort = input('SSH port (optional)', 'ssh_port', '22', { type: 'number', min: '1', max: '65535' });
-  const identity = input('SSH key path (optional)', 'identity_file', '/Users/you/.ssh/apiary', { maxlength: '1024' });
-  identity.classList.add('wide');
-  const connect = el('button', 'btn solid', 'Save and connect');
-  connect.type = 'submit';
-  connect.classList.add('wide');
-  form.append(name, target, remotePort, localPort, sshPort, identity, connect);
-  form.onsubmit = event => {
+  const remoteForm = submitLabel => {
+    const form = el('form', 'backend-form');
+    const name = input('Name', 'name', 'Home server', { required: true, maxlength: '80' });
+    name.classList.add('wide');
+    const target = input('SSH destination', 'ssh_target', 'user@server', { required: true, maxlength: '255', pattern: '[^\\s]+' });
+    target.classList.add('wide');
+    const remotePort = input('Apiary port', 'remote_port', '7777', { type: 'number', min: '1', max: '65535', value: '7777' });
+    const localPort = input('Preferred local tunnel port', 'local_port', '7777', { type: 'number', min: '1', max: '65535', value: '7777' });
+    const sshPort = input('SSH port (optional)', 'ssh_port', '22', { type: 'number', min: '1', max: '65535' });
+    const identity = input('SSH key path (optional)', 'identity_file', '/Users/you/.ssh/apiary', { maxlength: '1024' });
+    identity.classList.add('wide');
+    const submit = el('button', 'btn solid', submitLabel);
+    submit.type = 'submit';
+    submit.classList.add('wide');
+    form.append(name, target, remotePort, localPort, sshPort, identity, submit);
+    return form;
+  };
+
+  const edit = document.createElement('details');
+  edit.className = 'backend-add';
+  edit.append(el('summary', null, 'Edit selected server'));
+  const editForm = remoteForm('Save changes');
+  const fillEditForm = () => {
+    const profile = profiles.find(candidate => candidate.id === select.value);
+    if (!profile) return;
+    editForm.elements.name.value = profile.name || '';
+    editForm.elements.ssh_target.value = profile.ssh_target || '';
+    editForm.elements.remote_port.value = profile.remote_port || 7777;
+    editForm.elements.local_port.value = profile.local_port || 7777;
+    editForm.elements.ssh_port.value = profile.ssh_port || '';
+    editForm.elements.identity_file.value = profile.identity_file || '';
+  };
+  editButton.onclick = () => {
+    fillEditForm();
+    edit.open = true;
+    editForm.elements.name.focus();
+  };
+  editForm.onsubmit = event => {
     event.preventDefault();
-    if (!form.reportValidity()) return;
-    const data = Object.fromEntries(new FormData(form).entries());
+    if (!editForm.reportValidity()) return;
+    const data = Object.fromEntries(new FormData(editForm).entries());
+    data.profile = select.value;
+    message.textContent = 'Confirm the server changes in the Apiary dialog.';
+    desktopAction('edit', data);
+  };
+  edit.append(editForm);
+  root.append(edit);
+
+  const add = document.createElement('details');
+  add.className = 'backend-add';
+  add.append(el('summary', null, 'Add a server'));
+  const addForm = remoteForm('Save and connect');
+  addForm.onsubmit = event => {
+    event.preventDefault();
+    if (!addForm.reportValidity()) return;
+    const data = Object.fromEntries(new FormData(addForm).entries());
     message.textContent = 'Confirm the new server in the Apiary dialog.';
     desktopAction('add', data);
   };
-  add.append(form);
+  add.append(addForm);
   root.append(add);
+
+  const syncSelectedServer = () => {
+    const localSelected = select.value === 'local';
+    switchButton.disabled = select.value === activeId;
+    editButton.disabled = localSelected;
+    remove.disabled = localSelected;
+    edit.hidden = localSelected;
+    if (!localSelected && edit.open) fillEditForm();
+  };
+  select.onchange = syncSelectedServer;
+  syncSelectedServer();
 }
 
 renderBackendSwitcher();
@@ -346,8 +826,15 @@ renderBackendSwitcher();
 // ------------------------------------------------------------ host status
 
 async function loadStatus() {
-  hostStatus = await j('/api/status');
-  if (!hostStatus.ok) throw new Error(hostStatus.error || 'Could not load this Apiary host.');
+  try {
+    hostStatus = await j('/api/status');
+    if (!hostStatus.ok) throw new Error(hostStatus.error || 'Could not load this Apiary host.');
+  } catch (error) {
+    const message = error && error.message ? error.message : 'Could not reach this Apiary host.';
+    setHostHealth('offline', message);
+    throw error;
+  }
+  setHostHealth('online', `${hostDisplayName()} is connected and responding.`);
   const set = (id, text, cls) => {
     const n = document.getElementById(id);
     n.textContent = text;
@@ -365,7 +852,7 @@ async function loadStatus() {
   document.getElementById('c-model').title = hostStatus.anthropic_key_present
     ? 'The host can use ANTHROPIC_API_KEY to draft new agent configurations'
     : 'No host ANTHROPIC_API_KEY. Agent-owned inference credentials may still be configured and ready.';
-  set('c-lock', hostStatus.unlocked ? 'unlocked' : 'LOCKED — click to unlock',
+  set('c-lock', hostStatus.unlocked ? 'Workspace unlocked' : 'Workspace locked · Unlock',
       'chip click ' + (hostStatus.unlocked ? 'ok' : 'bad'));
   // Once unlocked, never ask again: the passphrase prompt disappears and
   // the bar only offers LOCK.
@@ -378,7 +865,7 @@ async function loadStatus() {
     ? (hostStatus.automatic_unlock
       ? 'keystore unlocked · automatic launch unlock is protected by macOS Keychain'
       : 'keystore unlocked for this session — LOCK to forget the passphrase')
-    : 'passphrase unlocks the NIP-49 keystore for this session — needed to run, ratify, found, post, seal:';
+    : 'Workspace locked. Unlock to run agents, approve changes, and use protected credentials.';
 }
 
 document.getElementById('signout').onclick = async event => {
@@ -417,27 +904,51 @@ document.getElementById('c-keytool').onclick = () => {
   const b = document.getElementById('keybar');
   b.style.display = b.style.display === 'flex' ? 'none' : 'flex';
 };
-document.getElementById('u-go').onclick = async () => {
-  const st = document.getElementById('u-status');
-  st.textContent = 'unlocking… (NIP-49 scrypt is deliberately slow)';
-  const r = await j('/api/unlock', {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      passphrase: document.getElementById('u-pass').value,
-      remember: !!document.getElementById('u-remember').checked,
-    }),
-  });
-  st.textContent = r.ok
-    ? ((r.verified_against_key ? 'unlocked ✓' : 'unlocked ✓ (empty keystore)')
-      + (r.automatic_unlock ? ' · saved in macOS Keychain' : '')
-      + (r.remember_warning ? ' · could not remember: ' + r.remember_warning : ''))
-    : 'refused: ' + r.error;
-  if (r.ok) {
-    document.getElementById('u-pass').value = '';
-    setTimeout(() => { document.getElementById('unlockbar').style.display = 'none'; }, 1200);
-    await loadOwners();
+async function requestUnlock(passphrase, remember) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60000);
+  try {
+    return await j('/api/unlock', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ passphrase, remember: !!remember }),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error && error.name === 'AbortError') {
+      throw new Error('Unlock timed out after 60 seconds. Check the host connection and try again.');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
   }
-  await loadStatus(); render();
+}
+document.getElementById('u-go').onclick = async () => {
+  const button = document.getElementById('u-go');
+  const st = document.getElementById('u-status');
+  const pass = document.getElementById('u-pass');
+  if (!pass.value) { st.textContent = 'Enter the workspace passphrase.'; pass.focus(); return; }
+  button.disabled = true;
+  const originalLabel = button.textContent;
+  button.textContent = 'Unlocking…';
+  st.textContent = 'Deriving the workspace key. This normally takes a few seconds.';
+  try {
+    const r = await requestUnlock(pass.value, document.getElementById('u-remember').checked);
+    st.textContent = r.ok
+      ? ((r.verified_against_key ? 'Workspace unlocked.' : 'Workspace unlocked (empty keystore).')
+        + (r.automatic_unlock ? ' Saved in macOS Keychain.' : '')
+        + (r.remember_warning ? ' Could not remember it: ' + r.remember_warning : ''))
+      : 'Could not unlock: ' + (r.error || 'The host refused the passphrase.');
+    if (!r.ok) return;
+    pass.value = '';
+    await Promise.all([loadOwners(), loadStatus()]);
+    render();
+    setTimeout(() => { document.getElementById('unlockbar').style.display = 'none'; }, 1200);
+  } catch (error) {
+    st.textContent = 'Could not unlock: ' + (error && error.message ? error.message : String(error));
+  } finally {
+    button.disabled = false;
+    button.textContent = originalLabel;
+  }
 };
 document.getElementById('u-lock').onclick = async () => {
   await j('/api/lock', { method: 'POST' });
@@ -465,19 +976,29 @@ async function loadRoster() {
   agents = d.agents || [];
   const root = document.getElementById('roster');
   root.replaceChildren();
-  if (!agents.length) root.append(el('div', 'empty', 'Your first agent will appear here.'));
   const running = new Set((hostStatus.listeners || []).filter(l => l.running).map(l => l.npub));
-  for (const a of agents) {
+  const makeCard = a => {
     const card = el('button', 'agent' + (sel === a.npub ? ' sel' : ''));
     card.type = 'button';
     card.setAttribute('aria-pressed', sel === a.npub ? 'true' : 'false');
     const nm = el('div', 'nm', a.name || '(unnamed)');
     nm.append(el('span', 'badge ' + (a.ratified ? 'rat' : 'unrat'), a.ratified ? 'ratified' : 'unratified'));
-    nm.append(el('span', 'badge ' + (a.active ? 'live' : 'unrat'), a.active ? 'active' : 'inactive'));
+    nm.append(el('span', 'badge ' + (a.archived ? 'unrat' : a.active ? 'live' : 'unrat'), a.archived ? 'archived' : a.active ? 'active' : 'inactive'));
     if (running.has(a.npub)) nm.append(el('span', 'badge live', 'listening'));
     card.append(nm, nostrId(a.npub, 'div', 'np'), el('div', 'np', a.log_entries + ' signed events'));
     card.onclick = () => { hostView = null; sel = a.npub; render(); loadRoster(); };
-    root.append(card);
+    return card;
+  };
+  const current = agents.filter(a => !a.archived);
+  const archived = agents.filter(a => a.archived);
+  if (!current.length) root.append(el('div', 'empty', agents.length ? 'No current agents.' : 'Your first agent will appear here.'));
+  for (const a of current) root.append(makeCard(a));
+  if (archived.length) {
+    const group = el('details', 'archived-agents');
+    group.open = archived.some(a => a.npub === sel);
+    group.append(el('summary', null, `Archived (${archived.length})`));
+    for (const a of archived) group.append(makeCard(a));
+    root.append(group);
   }
 }
 
@@ -511,11 +1032,27 @@ function entryLine(bold, rest, metaLines) {
 
 async function render() {
   if (listenerPoll) { clearInterval(listenerPoll); listenerPoll = null; }
+  if (browserApprovalWatch && (browserApprovalWatch.targetNpub !== sel || hostView)) {
+    stopBrowserApprovalWatch();
+  }
   manifestRequest = null;
+  syncSidebarSelection();
   // Agent tabs only make sense when looking at an agent.
   document.querySelector('nav').style.display = (hostView || !sel) ? 'none' : 'flex';
   const c = document.getElementById('content');
   c.replaceChildren();
+  if (!hostStatus.unlocked && agents.length) {
+    const notice = el('div', 'attention');
+    notice.append(el('h2', null, 'Workspace locked'));
+    notice.append(help('You can inspect agents while locked. Unlock the workspace to run agents, approve changes, or use protected credentials.'));
+    const unlock = el('button', 'btn solid', 'Unlock workspace');
+    unlock.onclick = () => {
+      document.getElementById('unlockbar').style.display = 'flex';
+      document.getElementById('u-pass').focus();
+    };
+    notice.append(unlock);
+    c.append(notice);
+  }
   if (hostView === 'library') return renderLibrary(c);
   if (hostView === 'managers') return renderManagers(c);
   if (hostView === 'audit') return renderControlAudit(c);
@@ -523,7 +1060,16 @@ async function render() {
   if (hostView === 'import') return renderImport(c);
   if (!sel && !agents.length) return renderWelcome(c);
   if (!sel) { c.append(el('div', 'empty', 'Choose an agent from the sidebar.')); return; }
-  await ratifyBanner(c);
+  const selectedAgent = agents.find(agent => agent.npub === sel);
+  if (selectedAgent && selectedAgent.archived && tab !== 'overview') {
+    tab = 'overview';
+    document.querySelectorAll('nav button').forEach(button => {
+      const current = button.dataset.tab === 'overview';
+      button.classList.toggle('sel', current);
+      button.setAttribute('aria-current', current ? 'page' : 'false');
+    });
+  }
+  if (!selectedAgent || !selectedAgent.archived) await ratifyBanner(c);
   if (tab === 'overview') return renderOverview(c);
   if (tab === 'run') return renderRun(c);
   if (tab === 'log') return renderLog(c);
@@ -567,10 +1113,16 @@ function renderWelcome(c) {
       if (pass.value.length < 10) { status.textContent = 'Use at least 10 characters.'; pass.focus(); return; }
       if (pass.value !== confirm.value) { status.textContent = 'The passphrases do not match.'; confirm.focus(); return; }
       go.disabled = true; status.textContent = 'Creating your encrypted workspace…';
-      const r = await j('/api/unlock', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({passphrase:pass.value}) });
-      pass.value = ''; confirm.value = ''; go.disabled = false;
-      if (!r.ok) { status.textContent = 'Could not unlock: ' + r.error; return; }
-      await Promise.all([loadStatus(), loadOwners()]); render();
+      try {
+        const r = await requestUnlock(pass.value, false);
+        if (!r.ok) { status.textContent = 'Could not unlock: ' + (r.error || 'The host refused the passphrase.'); return; }
+        pass.value = ''; confirm.value = '';
+        await Promise.all([loadStatus(), loadOwners()]); render();
+      } catch (error) {
+        status.textContent = 'Could not unlock: ' + (error && error.message ? error.message : String(error));
+      } finally {
+        go.disabled = false;
+      }
     };
     return;
   }
@@ -640,7 +1192,12 @@ function renderWelcome(c) {
 /// every tab, with the button right there.
 async function ratifyBanner(c) {
   const a = agents.find(x => x.npub === sel);
-  if (!a || a.ratified) return;
+  if (!a || a.ratified) {
+    if (a?.ratified && browserApprovalWatch?.targetNpub === a.npub) {
+      stopBrowserApprovalWatch();
+    }
+    return;
+  }
   const box = el('section', 'attention');
   box.append(el('h2', null, 'Review changes before this agent can run'),
     help(`${a.name || 'This agent'} is paused because its configuration has not been approved. Apiary will show you the effective setup and the exact file changes before signing.`));
@@ -651,43 +1208,37 @@ async function ratifyBanner(c) {
     ...(governance.managers || []).filter(manager => manager.role === 'governor').map(manager => manager.npub),
   ];
   const holders = ownerHolders(keys);
-  const row = el('div', 'row');
-  const review = el('button', 'btn solid', 'Review changes');
-  const st = el('span', 'meta', holders.length ? '' : 'This host does not hold an approval key named by this configuration.');
-  row.append(review, st); box.append(row);
+  const localApprovers = hostStatus.auth === 'open'
+    ? holders
+    : holders.filter(identity => identity.npub === client.sessionNpub);
+  const sessionIsGovernor = !!client.sessionNpub && keys.includes(client.sessionNpub);
+  const st = el('div', 'meta');
+  st.setAttribute('role', 'status');
+  st.setAttribute('aria-live', 'polite');
   c.append(box);
+  if (!d.ok) { st.textContent = 'Could not load the configuration: ' + d.error; box.append(st); return; }
+  const m = d.manifest || {};
+  const inf = (m.inference || [])[0];
+  const summary = el('div', 'section');
+  summary.append(el('h3', null, 'Effective setup'),
+    kv('Model', inf ? `${inf.provider} / ${inf.model}` : 'No model configured'),
+    kv('Daily token limit', ((m.governance || {}).budgets || {}).tokens_per_day || 'No limit set'),
+    kv('Capabilities', `${(m.connectors || []).length} granted`),
+    kv('Always-on channels', Object.keys(m.presence || {}).length),
+    kv('Automations', (m.routines || []).length));
+  const technical = el('details', 'technical');
+  technical.append(el('summary', null, d.approved_yaml ? 'Technical diff' : 'Full configuration for first approval'));
+  technical.append(d.approved_yaml ? lineDiff(d.approved_yaml, d.yaml || '') : (() => {
+    const pre = el('pre'); pre.textContent = d.yaml || ''; return pre;
+  })());
+  summary.append(technical); box.append(summary);
 
-  review.onclick = () => {
-    review.remove();
-    if (!d.ok) { st.textContent = 'Could not load the configuration: ' + d.error; return; }
-    const m = d.manifest || {};
-    const inf = (m.inference || [])[0];
-    const summary = el('div', 'section');
-    summary.append(el('h3', null, 'Effective setup'),
-      kv('Model', inf ? `${inf.provider} / ${inf.model}` : 'No model configured'),
-      kv('Daily token limit', ((m.governance || {}).budgets || {}).tokens_per_day || 'No limit set'),
-      kv('Capabilities', `${(m.connectors || []).length} granted`),
-      kv('Always-on channels', Object.keys(m.presence || {}).length),
-      kv('Automations', (m.routines || []).length));
-    const technical = el('details', 'technical');
-    technical.append(el('summary', null, d.approved_yaml ? 'Technical diff' : 'Full configuration for first approval'));
-    technical.append(d.approved_yaml ? lineDiff(d.approved_yaml, d.yaml || '') : (() => {
-      const pre = el('pre'); pre.textContent = d.yaml || ''; return pre;
-    })());
-    summary.append(technical); box.append(summary);
-
-    if (!holders.length) {
-      st.textContent = 'Approval is unavailable here. Add a locally held identity with the governor role, or use external approval tools in Configuration.';
-      const open = el('button', 'btn', 'Open Configuration');
-      open.onclick = () => openTab('manifest');
-      box.append(open);
-      return;
-    }
+  if (localApprovers.length) {
     const who = el('select');
-    for (const h of holders) { const o = el('option', null, h.name || shortNostrId(h.npub)); o.value = h.npub; who.append(o); }
+    for (const h of localApprovers) { const o = el('option', null, h.name || shortNostrId(h.npub)); o.value = h.npub; who.append(o); }
     const rat = el('button', 'btn solid', 'Approve configuration');
     const approveRow = el('div', 'row');
-    approveRow.append(el('span', 'meta', 'Approve as'), who, rat); box.append(approveRow);
+    approveRow.append(el('span', 'meta', 'Approve as'), who, rat); box.append(approveRow, st);
     rat.onclick = async () => {
       rat.disabled = true; st.textContent = 'Signing with the agent and your approval identity…';
       const r = await j(api('/ratify'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ as: who.value }) });
@@ -695,9 +1246,57 @@ async function ratifyBanner(c) {
         ? (r.snapshot_warning ? 'Approved, but Apiary could not save the review snapshot: ' + r.snapshot_warning : 'Approved. The configuration is now in force.')
         : 'Could not approve: ' + r.error;
       rat.disabled = false;
-      if (r.ok) { await loadRoster(); render(); }
+      if (r.ok) { await loadRoster(); openTab('overview'); }
     };
-  };
+    return;
+  }
+
+  if (sessionIsGovernor && window.nostr && typeof window.nostr.signEvent === 'function') {
+    const rat = el('button', 'btn solid', 'Approve with Nostr');
+    const approveRow = el('div', 'row');
+    approveRow.append(rat); box.append(approveRow, st);
+    rat.onclick = () => approveWithNostr(client.sessionNpub, st, rat);
+    return;
+  }
+
+  if (sessionIsGovernor && sessionStorage.getItem('apiary.nip46') === 'connected') {
+    const rat = el('button', 'btn solid', 'Approve with remote signer');
+    const reconnect = remoteSignerControl(st, 'Change remote signer');
+    const approveRow = el('div', 'row');
+    approveRow.append(rat, reconnect.trigger); box.append(approveRow, reconnect.panel, st);
+    rat.onclick = () => approveWithNip46(client.sessionNpub, st, rat);
+    return;
+  }
+
+  if (sessionIsGovernor) {
+    const remote = remoteSignerControl(st);
+    const row = el('div', 'row');
+    row.append(remote.trigger);
+    if (!DESKTOP) {
+      box.append(row, remote.panel, help('Use a NIP-46 bunker to approve without putting your Nostr private key in Apiary.'), st);
+      return;
+    }
+    const approve = browserApprovalControl(
+      'Open secure browser approval',
+      approvalBrowserUrl(),
+      a.npub,
+      st,
+    );
+    row.append(approve);
+    box.append(row, remote.panel, help('Connect a NIP-46 remote signer here, or open a browser that already has a NIP-07 signer. Your private key stays in the signer.'), st);
+    return;
+  }
+
+  st.textContent = sessionIsGovernor
+    ? 'This session is authorized, but no signing key is available. Open Apiary in a browser with your Nostr signer, or use the external signing tools in Configuration.'
+    : 'A listed agent governor must approve these changes. Sign in as a governor or ask one to review this agent.';
+  const row = el('div', 'row');
+  if (tab !== 'manifest') {
+    const open = el('button', 'btn', 'Open advanced approval tools');
+    open.onclick = () => openTab('manifest');
+    row.append(open);
+  }
+  box.append(row, st);
 }
 
 // ------------------------------------------------------ proposal banner
@@ -773,15 +1372,80 @@ function quickAction(title, description, action) {
   return button;
 }
 
+function agentLifecycleSection(roster) {
+  const archived = !!roster.archived;
+  const lifecycle = section('Agent lifecycle', archived
+    ? 'This agent is archived. It cannot accept new work or be changed, and its standing presence is stopped.'
+    : 'Archiving safely removes this agent from everyday use without destroying its portable identity, configuration, or history.');
+  const status = el('span', 'meta', '');
+  if (!archived) {
+    const archive = el('button', 'btn danger', 'Archive agent');
+    archive.onclick = async () => {
+      if (!confirm(`Archive ${roster.name || 'this agent'}? It will stop running and move out of the normal agent list.`)) return;
+      archive.disabled = true; status.textContent = 'Stopping and archiving…';
+      const result = await j(api('/archive'), {
+        method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({archived: true}),
+      });
+      archive.disabled = false;
+      if (!result.ok) { status.textContent = 'Could not archive: ' + result.error; return; }
+      status.textContent = 'Archived.';
+      await loadRoster(); render();
+    };
+    const row = el('div', 'row'); row.append(archive, status); lifecycle.append(row);
+    lifecycle.append(help('An already-running one-time request may finish; archiving prevents all new runs and scheduled work.'));
+    return lifecycle;
+  }
+
+  const restore = el('button', 'btn solid', 'Restore agent');
+  restore.onclick = async () => {
+    restore.disabled = true; status.textContent = 'Restoring…';
+    const result = await j(api('/archive'), {
+      method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({archived: false}),
+    });
+    restore.disabled = false;
+    if (!result.ok) { status.textContent = 'Could not restore: ' + result.error; return; }
+    status.textContent = 'Restored. The agent remains inactive until you explicitly activate it.';
+    await loadRoster(); render();
+  };
+  const restoreRow = el('div', 'row'); restoreRow.append(restore, status); lifecycle.append(restoreRow);
+
+  const permanent = el('details', 'technical');
+  permanent.append(el('summary', null, 'Permanently delete this agent'));
+  const warning = el('div', 'attention');
+  warning.append(el('b', null, 'This cannot be undone'),
+    help('Apiary will permanently remove the local private identity, credentials, configuration, signed history, and issued control tokens. Export the agent first if it may be needed again.'));
+  const expected = roster.name || sel;
+  const confirmation = el('input'); confirmation.placeholder = `Type ${expected} to confirm`;
+  confirmation.autocomplete = 'off';
+  const remove = el('button', 'btn danger', 'Permanently delete agent'); remove.disabled = true;
+  const deleteStatus = el('span', 'meta', '');
+  confirmation.oninput = () => { remove.disabled = confirmation.value !== expected; };
+  remove.onclick = async () => {
+    if (confirmation.value !== expected) return;
+    if (!confirm(`Permanently delete ${expected}? There is no recovery without an export.`)) return;
+    remove.disabled = true; deleteStatus.textContent = 'Permanently deleting local agent data…';
+    const result = await j(`/api/agents/${encodeURIComponent(sel)}`, {
+      method: 'DELETE', headers: {'content-type': 'application/json'}, body: JSON.stringify({confirmation: sel}),
+    });
+    if (!result.ok) { remove.disabled = false; deleteStatus.textContent = 'Could not delete: ' + result.error; return; }
+    sel = null; tab = 'overview'; hostView = null;
+    await loadRoster(); render();
+  };
+  const deleteRow = el('div', 'row'); deleteRow.append(remove, deleteStatus);
+  permanent.append(warning, field('Confirmation', confirmation), deleteRow);
+  lifecycle.append(permanent);
+  return lifecycle;
+}
+
 async function renderOverview(c) {
-  const proposal = proposalBanner(c);
+  const roster = agents.find(a => a.npub === sel) || {};
+  const proposal = roster.archived ? Promise.resolve() : proposalBanner(c);
   const [d, spend, listener, controlTokens] = await Promise.all([
     currentManifest(), j(api('/spend')), j(api('/listener')), j(api('/control-tokens')),
   ]);
   await proposal;
   if (!d.ok) { c.append(el('div', 'ev err', 'Could not load this agent: ' + d.error)); return; }
   const m = d.manifest || {};
-  const roster = agents.find(a => a.npub === sel) || {};
   const models = m.inference || [];
   const taskModels = models.filter(x => inferenceRoleForName(x.name) === 'language');
   const supportingModels = models.filter(x => inferenceRoleForName(x.name) !== 'language');
@@ -792,7 +1456,10 @@ async function renderOverview(c) {
   const head = el('div', 'page-head');
   head.append(el('div', 'eyebrow', roster.active ? 'Active on this host' : 'Agent overview'),
     el('h2', 'page-title', roster.name || 'Unnamed agent'),
-    el('p', 'page-lede', d.ratified
+    copyableNostrId(sel),
+    el('p', 'page-lede', roster.archived
+      ? 'Archived and safely stopped. Restore it to make changes or run it again.'
+      : d.ratified
       ? 'Ready for governed tasks. Review its limits, connections, and always-on presence at a glance.'
       : 'Its draft configuration is waiting for your review and approval.'));
   c.append(head);
@@ -805,6 +1472,18 @@ async function renderOverview(c) {
     metric('Capabilities', String(connectors.length)),
     metric('Always-on channels', String(declared.length)));
   c.append(stats);
+
+  if (roster.archived) {
+    c.append(agentLifecycleSection(roster));
+    const archivedSetup = section('Archived agent details', 'Archived agents remain inspectable but are read-only until restored.');
+    const publicIdentity = kv('Public identity', shortNostrId(sel));
+    publicIdentity.querySelector('.v').title = sel;
+    archivedSetup.append(publicIdentity, kv('Configuration hash', d.manifest_sha256),
+      kv('Signed events', String(roster.log_entries || 0)),
+      help('Restore this agent before editing its configuration, granting capabilities, approving changes, or starting work.'));
+    c.append(archivedSetup);
+    return;
+  }
 
   const shortcuts = el('div', 'quick-grid');
   shortcuts.append(quick('Start a task', 'Give this agent a one-time job.', 'run'),
@@ -1181,17 +1860,17 @@ async function renderOverview(c) {
     if (r.ok) await loadRoster();
   };
   const exPass = el('input'); exPass.type = 'password'; exPass.placeholder = 'Optional handoff passphrase';
-  const exTo = el('input'); exTo.placeholder = 'Or recipient npub';
+  const exTo = technicalInput(el('input')); exTo.placeholder = 'Or recipient npub';
   const exBtn = el('button', 'btn', 'Export agent'); const exSt = el('span', 'meta', '');
   const exRow = el('div', 'row'); exRow.append(exBtn, exSt);
-  body.append(field('Protect export with', exPass), field('Seal export to', exTo), exRow,
-    help('Leave both blank for your own hosts. Choose either a handoff passphrase or a recipient identity, never both.'));
+  body.append(field('One-time transfer passphrase', exPass), field('Seal export to', exTo), exRow,
+    help('The agent does not have a passphrase. For another host, create a disposable transfer passphrase or seal to its recipient identity. If both are blank, this is a same-workspace backup and its key remains protected by the source workspace passphrase.'));
   exBtn.onclick = async () => {
     if (exPass.value && exTo.value) { exSt.textContent = 'Choose a passphrase or recipient, not both.'; return; }
     exBtn.disabled = true; exSt.textContent = 'Creating verified bundle…';
     const r = await j(api('/export'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ export_passphrase: exPass.value || null, to_npub: exTo.value.trim() || null }) });
     exBtn.disabled = false; exPass.value = ''; exTo.value = '';
-    exSt.textContent = r.ok ? `Saved to ${r.path}` : 'Could not export: ' + r.error;
+    exSt.textContent = r.ok ? `${r.note} Saved to ${r.path}` : 'Could not export: ' + r.error;
   };
   const leaseLine = kv('Host lease', 'Checking…'); body.append(leaseLine);
   j(api('/lease')).then(lz => {
@@ -1208,90 +1887,10 @@ async function renderOverview(c) {
       body.append(take);
     }
   });
-  advanced.append(body); c.append(advanced);
+  advanced.append(body); c.append(advanced, agentLifecycleSection(roster));
 }
 
 // ------------------------------------------------------ inference setup
-
-const inferenceRoleLabel = {
-  language: 'Task model', embedding: 'Memory embeddings',
-  transcription: 'Speech to text', speech: 'Text to speech',
-};
-
-function inferenceRoleForName(name) {
-  return ({ embed: 'embedding', transcribe: 'transcription', speak: 'speech' })[name] || 'language';
-}
-
-const inferenceProviders = {
-  language: [['claude-code', 'Claude Code (subscription)'], ['codex', 'ChatGPT subscription (Codex)'], ['anthropic', 'Anthropic API'], ['openai', 'OpenAI compatible'], ['xai', 'xAI'], ['ollama', 'Ollama (local)']],
-  embedding: [['ollama', 'Ollama (local)'], ['hash', 'Built-in lexical index']],
-  transcription: [['apple-speech', 'Apple Speech (local)'], ['whisper-cpp', 'whisper.cpp (local)'], ['openai', 'OpenAI compatible']],
-  speech: [['openai', 'OpenAI compatible / Kokoro'], ['apple-speech', 'Apple Speech (local)'], ['macos-say', 'macOS voices']],
-};
-
-// Curated, understandable defaults—not an availability claim. Every remote
-// provider still offers Custom because account access and compatible servers
-// vary; local engines especially may use any installed model identifier.
-const inferenceModels = {
-  language: {
-    'claude-code': [
-      ['claude-sonnet-5', 'Claude Sonnet 5 · balanced (recommended)'],
-      ['claude-opus-5', 'Claude Opus 5 · complex work'],
-      ['claude-haiku-4-5-20251001', 'Claude Haiku 4.5 · fastest'],
-      ['claude-fable-5', 'Claude Fable 5 · highest capability'],
-    ],
-    codex: [
-      ['gpt-5.6-terra', 'GPT-5.6 Terra · balanced (recommended)'],
-      ['gpt-5.6-luna', 'GPT-5.6 Luna · fastest'],
-      ['gpt-5.6-sol', 'GPT-5.6 Sol · complex work'],
-      ['gpt-5.5', 'GPT-5.5'],
-      ['gpt-5.4-mini', 'GPT-5.4 Mini'],
-    ],
-    anthropic: [
-      ['claude-sonnet-5', 'Claude Sonnet 5 · balanced (recommended)'],
-      ['claude-opus-5', 'Claude Opus 5 · complex work'],
-      ['claude-haiku-4-5-20251001', 'Claude Haiku 4.5 · fastest'],
-      ['claude-fable-5', 'Claude Fable 5 · highest capability / cost'],
-    ],
-    openai: [['gpt-5.6', 'GPT-5.6'], ['gpt-5.1', 'GPT-5.1'], ['gpt-5-mini', 'GPT-5 mini'], ['gpt-5-nano', 'GPT-5 nano']],
-    xai: [['grok-4.5', 'Grok 4.5'], ['grok-4.3', 'Grok 4.3'], ['grok-build-0.1', 'Grok Build 0.1']],
-    ollama: [['llama3.3', 'Llama 3.3'], ['qwen3', 'Qwen 3'], ['gemma3', 'Gemma 3']],
-  },
-  embedding: { ollama: [['nomic-embed-text', 'nomic-embed-text'], ['mxbai-embed-large', 'mxbai-embed-large'], ['all-minilm', 'all-minilm']] },
-  transcription: {
-    'whisper-cpp': [['base.en', 'Whisper base.en'], ['small.en', 'Whisper small.en'], ['medium.en', 'Whisper medium.en']],
-    openai: [['gpt-4o-transcribe', 'GPT-4o Transcribe'], ['gpt-4o-mini-transcribe', 'GPT-4o mini Transcribe'], ['whisper-1', 'Whisper 1']],
-  },
-  speech: { openai: [['gpt-4o-mini-tts', 'GPT-4o mini TTS'], ['tts-1', 'TTS-1'], ['tts-1-hd', 'TTS-1 HD']] },
-};
-
-function inferenceDefaultBaseURL(role, provider) {
-  if (provider === 'anthropic') return 'https://api.anthropic.com';
-  if (provider === 'xai') return 'https://api.x.ai/v1';
-  if (provider === 'openai') return 'https://api.openai.com/v1';
-  if (provider === 'ollama') return 'http://localhost:11434';
-  return '';
-}
-
-function inferenceProviderLabel(provider) {
-  for (const choices of Object.values(inferenceProviders)) {
-    const found = choices.find(([value]) => value === provider);
-    if (found) return found[1];
-  }
-  return provider;
-}
-
-function inferenceEndpoint(slot) {
-  const configured = ((slot.requires || {}).base_url || '').replace(/\/$/, '');
-  if (configured) return configured;
-  if (slot.provider === 'claude-code') return 'local Claude Code runtime';
-  if (slot.provider === 'codex') return 'local Codex runtime';
-  if (slot.provider === 'anthropic') return 'api.anthropic.com';
-  if (slot.provider === 'xai') return 'api.x.ai';
-  if (slot.provider === 'openai') return 'api.openai.com';
-  if (slot.provider === 'ollama') return 'localhost:11434';
-  return 'on this device';
-}
 
 function inferenceForm(slot, afterSave) {
   const form = el('div', 'connection-form');
@@ -1308,9 +1907,9 @@ function inferenceForm(slot, afterSave) {
   const legacyClaude = !!(slot && slot.provider === 'anthropic' && (slot.requires || {}).auth === 'oauth');
   const initialProvider = legacyClaude ? 'claude-code' : (slot && slot.provider);
   const model = el('select');
-  const customModel = el('input'); customModel.placeholder = 'Custom model identifier'; customModel.style.display = 'none';
+  const customModel = technicalInput(el('input')); customModel.placeholder = 'Custom model identifier'; customModel.style.display = 'none';
   const modelControls = el('div'); modelControls.style.display = 'grid'; modelControls.style.gap = '6px'; modelControls.append(model, customModel);
-  const endpoint = el('input'); endpoint.value = (slot && slot.requires && slot.requires.base_url) || '';
+  const endpoint = technicalInput(el('input')); endpoint.value = (slot && slot.requires && slot.requires.base_url) || '';
   endpoint.placeholder = 'Provider API base URL';
   endpoint.dataset.auto = endpoint.value ? '0' : '1';
   endpoint.oninput = () => { endpoint.dataset.auto = '0'; };
@@ -1319,11 +1918,11 @@ function inferenceForm(slot, afterSave) {
     const option = el('option', null, label); option.value = value; auth.append(option);
   }
   auth.value = 'api-key';
-  const credential = el('input'); credential.type = 'password'; credential.autocomplete = 'off';
+  const credential = technicalInput(el('input')); credential.type = 'password';
   credential.placeholder = slot && slot.credential_source && slot.credential_source.startsWith('sealed') ? 'Leave blank to keep current credential' : 'API key, if required';
   const voice = el('input'); voice.value = (slot && slot.requires && slot.requires.voice) || '';
   voice.placeholder = 'Voice, e.g. af_heart or alloy';
-  const locale = el('input'); locale.value = (slot && slot.requires && slot.requires.locale) || '';
+  const locale = technicalInput(el('input')); locale.value = (slot && slot.requires && slot.requires.locale) || '';
   locale.placeholder = 'Locale, e.g. en_US';
   const makeDefault = el('input'); makeDefault.type = 'checkbox';
   const makeDefaultLabel = el('label'); makeDefaultLabel.append(makeDefault, document.createTextNode(' Use as the default task model'));
@@ -1678,8 +2277,10 @@ async function runTask(ta, go, events, cls, dcls, harness) {
               const timing = v.timings_ms || {};
               const prep = ['admission_ms', 'budget_ms', 'route_ms', 'memory_ms', 'connectors_ms']
                 .reduce((sum, key) => sum + (Number(timing[key]) || 0), 0);
+              const providerSetup = Number(timing.provider_bind_ms) || 0;
               const speed = timing.first_token_ms == null ? ''
-                : ` · first text ${Math.round(timing.first_token_ms)}ms · Apiary prep ${prep.toFixed(1)}ms`;
+                : ` · first text ${Math.round(timing.first_token_ms)}ms · Apiary prep ${prep.toFixed(1)}ms`
+                  + (providerSetup > 0 ? ` · provider setup ${providerSetup.toFixed(1)}ms` : '');
               const model = v.model ? ` · ${v.model}` : '';
               const tokens = v.input_tokens == null ? '' : ` · ${v.input_tokens}in/${v.output_tokens}out`;
               ev(events, 'meta', `✓ signed checkpoint ${v.log_event}${model}${tokens}${speed}`);
@@ -1835,7 +2436,7 @@ async function renderManifest(c) {
   const extBody = el('div');
   extBody.append(help('For governors who keep their master nostr key outside this host: export the unsigned ratification event, sign it with your own tooling (nak, a NIP-07 extension, a signer app), and import the signed event. The keystore never sees the key.'));
   const exRow = el('div', 'row');
-  const exKey = el('input', 'grow'); exKey.placeholder = 'external governor key (npub or hex, must have governor role)';
+  const exKey = technicalInput(el('input', 'grow')); exKey.placeholder = 'external governor key (npub or hex, must have governor role)';
   const exGo = el('button', 'btn', 'EXPORT UNSIGNED EVENT');
   exRow.append(exKey, exGo);
   const exOut = el('pre'); exOut.style.display = 'none';
@@ -1873,7 +2474,7 @@ async function renderManifest(c) {
 // ------------------------------------------------------------ buzz
 
 function relayInput() {
-  const inp = el('input', 'grow');
+  const inp = technicalInput(el('input', 'relay-address'));
   inp.placeholder = 'wss://your-buzz-relay';
   inp.value = localStorage.getItem('apiary.relay') || '';
   inp.onchange = () => localStorage.setItem('apiary.relay', inp.value.trim());
@@ -1881,6 +2482,7 @@ function relayInput() {
 }
 
 async function renderBuzz(c) {
+  const roster = agents.find(a => a.npub === sel) || {};
   c.append(help('Buzz is a nostr-native agent workspace — and structurally just a relay, so the agent joins with its own key (NIP-42 auth), not a bot token. Everything here acts AS the selected agent and logs to its signed history.'));
 
   const relaySec = section('Workspace relay', 'The Buzz relay URL. Membership is admitted relay-side (buzz-admin); until admitted, operations will be refused politely.');
@@ -1969,21 +2571,132 @@ async function renderBuzz(c) {
   };
 
   const lisSec = section('Mention listener',
-    'Supervised presence: declare presence.buzz in the manifest (or Overview → Declare presence), re-ratify, and ACTIVATE the agent — the supervisor runs this channel alongside any others (telegram, slack, plugins) under one lease. Live status and manual per-channel stop live in Overview → Presence channels.');
+    `Keep ${roster.name || 'this agent'} listening for mentions in this Buzz workspace. Apiary will save the listener as a reviewable change before it can run.`);
   const supNote = el('div', 'kv');
   lisSec.append(supNote);
+  const listenerDetail = el('p', 'muted');
+  lisSec.append(listenerDetail);
+  const listenerActions = el('div', 'row');
+  const listenerAction = el('button', 'btn', 'Checking listener…');
+  listenerAction.disabled = true;
+  const listenerStatus = el('span', 'muted');
+  listenerActions.append(listenerAction, listenerStatus);
+  lisSec.append(listenerActions);
   const lLines = el('pre'); lLines.style.display = 'none';
   lisSec.append(lLines);
   c.append(lisSec);
+  const listenerConfig = async () => {
+    const result = await currentManifest();
+    const active = Boolean((agents.find(a => a.npub === sel) || {}).active);
+    if (!result.ok) {
+      return {
+        ok: false,
+        error: result.error || 'Could not load the agent configuration.',
+        declared: false,
+        ratified: false,
+        active,
+      };
+    }
+    const manifest = result.manifest || {};
+    return {
+      ok: true,
+      declared: Boolean(manifest && manifest.presence && manifest.presence.buzz),
+      ratified: Boolean(result.ratified),
+      active,
+    };
+  };
+  const setListenerAction = (label, run, primary = false) => {
+    listenerAction.textContent = label;
+    listenerAction.className = primary ? 'btn solid' : 'btn';
+    listenerAction.disabled = false;
+    listenerAction.onclick = async () => {
+      listenerAction.disabled = true;
+      listenerStatus.textContent = '';
+      try { await run(); }
+      catch (e) {
+        listenerStatus.textContent = e.message || String(e);
+        listenerAction.disabled = false;
+      }
+    };
+  };
+  let listenerPolling = false;
   const pollListener = async () => {
-    const r = await j(api('/listener'));
-    if (!r.ok) return;
-    const ch = (r.channels || {}).buzz;
-    supNote.replaceChildren(el('span', 'k', 'buzz channel'), el('span', 'v',
-      !((r.declared || []).includes('buzz')) ? 'not declared — nothing to supervise'
-        : ch && ch.running ? 'running'
-        : (ch && ch.note) || 'not running (activate the agent; supervisor starts it)'));
-    if (ch && (ch.lines || []).length) { lLines.style.display = 'block'; lLines.textContent = ch.lines.join('\n'); }
+    if (listenerPolling) return;
+    listenerPolling = true;
+    try {
+      manifestRequest = null;
+      const [state, runtime] = await Promise.all([listenerConfig(), j(api('/listener'))]);
+      const ch = runtime.ok ? (runtime.channels || {}).buzz : null;
+      const trigger = `@${roster.name || 'agent'}`;
+
+      if (!state.ok) {
+        supNote.replaceChildren(el('span', 'k', 'buzz channel'), el('span', 'v', 'configuration unavailable'));
+        listenerDetail.textContent = state.error;
+        setListenerAction('Retry', pollListener);
+        return;
+      }
+
+      const status = !state.declared ? 'not set up'
+        : !state.ratified ? 'waiting for approval'
+        : !state.active ? 'approved, inactive'
+        : !runtime.ok ? 'live status unavailable'
+        : ch && ch.running ? 'listening'
+        : (ch && ch.note) || 'starting';
+      supNote.replaceChildren(el('span', 'k', 'buzz channel'), el('span', 'v', status));
+
+      if (!state.declared) {
+        listenerDetail.textContent = `Not configured. Set up a listener for ${trigger} on ${rv() || 'the Buzz relay'}, then review and approve the change.`;
+        setListenerAction('Set up mention listener', async () => {
+          const relayUrl = rv();
+          if (!/^wss?:\/\//i.test(relayUrl)) throw new Error('Enter the Buzz relay address first (wss://…).');
+          listenerStatus.textContent = 'Creating a reviewable change…';
+          const saved = await j(api('/presence'), {
+            method: 'POST', headers: {'content-type': 'application/json'},
+            body: JSON.stringify({kind: 'buzz', credential: null, config: {relay: relayUrl, trigger}}),
+          });
+          if (!saved.ok) throw new Error(saved.error || 'Could not set up the mention listener.');
+          manifestRequest = null;
+          await loadRoster();
+          openTab('overview');
+        }, true);
+      } else if (!state.ratified) {
+        listenerDetail.textContent = `The ${trigger} listener is saved but waiting for review and approval.`;
+        setListenerAction('Review & approve', async () => openTab('overview'), true);
+      } else if (!state.active) {
+        listenerDetail.textContent = `The ${trigger} listener is approved. Activate ${roster.name || 'the agent'} to start listening.`;
+        setListenerAction(`Activate ${roster.name || 'agent'}`, async () => {
+          listenerStatus.textContent = 'Activating…';
+          const activated = await j(api('/active'), {
+            method: 'POST', headers: {'content-type': 'application/json'},
+            body: JSON.stringify({active: true}),
+          });
+          if (!activated.ok) throw new Error(activated.error || 'Could not activate the agent.');
+          await loadRoster();
+          listenerStatus.textContent = 'Activated. Starting listener…';
+          setTimeout(pollListener, 250);
+        }, true);
+      } else if (runtime.ok && ch && ch.running) {
+        listenerDetail.textContent = `Listening for ${trigger} on ${rv() || 'the configured Buzz relay'}.`;
+        listenerAction.textContent = 'Listening';
+        listenerAction.className = 'btn';
+        listenerAction.disabled = true;
+        listenerAction.onclick = null;
+        listenerStatus.textContent = '';
+      } else if (!runtime.ok) {
+        listenerDetail.textContent = `The ${trigger} listener is approved and active, but Apiary could not read its live status: ${runtime.error || 'unknown error'}`;
+        setListenerAction('Retry live status', pollListener);
+      } else {
+        listenerDetail.textContent = `The ${trigger} listener is approved and the agent is active, but the listener has not started. Open the presence controls for its live status and logs.`;
+        setListenerAction('Open presence controls', async () => openTab('overview'));
+      }
+      if (ch && (ch.lines || []).length) {
+        lLines.style.display = 'block'; lLines.textContent = ch.lines.join('\n');
+      } else {
+        lLines.style.display = 'none'; lLines.textContent = '';
+      }
+    } finally {
+      listenerPolling = false;
+    }
   };
   pollListener();
   listenerPoll = setInterval(pollListener, 3000);
@@ -2230,8 +2943,13 @@ async function renderConnectors(c) {
       const r = await j(api('/connectors/' + encodeURIComponent(g.type) + '/caps'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ caps }) });
       select.disabled = false;
       if (!r.ok) select.value = previous;
-      else setConnectorAccess(g.type, g.caps || (g.caps = {}), mode);
-      gStatus.textContent = r.ok ? `${mode === 'read-write' ? 'read + write enabled' : 'read-only'} — re-ratify in Configuration` : 'failed: ' + r.error;
+      else {
+        g.caps = Object.assign({}, g.caps || {}, r.caps || {});
+        const persisted = connectorAccessMode(g.type, g.caps);
+        select.value = persisted;
+      }
+      const persisted = connectorAccessMode(g.type, g.caps || {});
+      gStatus.textContent = r.ok ? `${persisted === 'read-write' ? 'read + write enabled' : 'read-only'} — re-ratify in Configuration` : 'failed: ' + r.error;
       if (r.ok) loadRoster();
     });
     rv.onclick = async () => {
@@ -2241,41 +2959,48 @@ async function renderConnectors(c) {
     };
     if (g.type === 'mcp') {
       // Discover with THIS agent's sealed credential (post-OAuth), tick, apply.
+      // OAuth-backed servers must never offer a knowingly unauthenticated
+      // probe: authenticate first, then enumerate the agent's actual tools.
+      const oauthPending = !!(g.caps && (g.caps.oauth || g.caps.oauth_client_id) && !g.credential);
       const dRow = el('div', 'row');
       const disc = el('button', 'btn', 'DISCOVER TOOLS');
       const dSt = el('span', 'meta', '');
       dRow.append(disc, dSt);
       const toolsBox = el('div');
-      box.append(dRow, toolsBox);
+      if (oauthPending) {
+        dSt.textContent = 'Connect with OAuth below before discovering tools.';
+        box.append(dSt);
+      } else {
+        box.append(dRow, toolsBox);
+      }
       disc.onclick = async () => {
         dSt.textContent = 'probing with this agent’s credential…';
         const key = (g.caps && (g.caps.library_name || g.caps.url || g.caps.command)) || 'mcp';
         const r = await j(api('/connectors/' + encodeURIComponent(key) + '/discover'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
         if (!r.ok) { dSt.textContent = 'failed: ' + r.error; return; }
-        const allowed = new Set(g.caps.allowed_tools || []);
-        const picked = new Set(allowed);
-        const readOnly = connectorAccessMode('mcp', g.caps || {}) === 'read-only';
+        const policies = mcpToolPolicies(r.tools, g.caps || {});
         toolsBox.replaceChildren();
-        dSt.textContent = `${r.tools.length} tools — ${readOnly ? 'only explicitly read-only tools are available' : 'tick what this agent may use'}`;
-        toolsBox.append(help('MCP read/write labels are supplied by the server. Apiary treats missing readOnlyHint as write-capable.'));
-        for (const t of r.tools) {
-          const unavailable = readOnly && !t.read_only;
-          if (unavailable) picked.delete(t.name);
-          const cb = el('input'); cb.type = 'checkbox'; cb.style.width = 'auto'; cb.disabled = unavailable; cb.checked = !unavailable && (allowed.has('*') || allowed.has(t.name));
-          const lab = el('label', null, ` ${t.name} · ${t.read_only ? 'read only' : 'may write'}${t.description ? ' — ' + t.description.slice(0, 120) : ''}`); lab.prepend(cb); lab.style.display = 'block';
-          cb.onchange = () => { if (cb.checked) picked.add(t.name); else picked.delete(t.name); picked.delete('*'); };
-          toolsBox.append(lab);
-        }
+        dSt.textContent = `${r.tools.length} tools — choose category or per-tool access`;
+        renderMcpToolPolicyPicker(toolsBox, r.tools, policies);
         const apply = el('button', 'btn solid', 'APPLY ALLOWLIST (AMEND)');
         const aSt = el('span', 'meta', '');
         const aRow = el('div', 'row'); aRow.append(apply, aSt);
         toolsBox.append(aRow);
         apply.onclick = async () => {
-          const rr = await j(api('/connectors/mcp/allowed_tools'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tools: [...picked] }) });
-          aSt.textContent = rr.ok ? 'applied — re-ratify in Configuration' : 'failed: ' + rr.error;
-          if (rr.ok) { loadRoster(); setTimeout(render, 800); }
+          const toolAccess = mcpToolPolicyObject(policies);
+          const rr = await j(api('/connectors/mcp/allowed_tools'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tools: Object.keys(toolAccess), tool_access: toolAccess }) });
+          aSt.textContent = rr.ok ? 'Applied. Opening review and approval…' : 'failed: ' + rr.error;
+          if (rr.ok) {
+            g.caps = Object.assign({}, g.caps || {}, { allowed_tools: rr.allowed_tools, tool_access: rr.tool_access || toolAccess, access: rr.access || 'mixed' });
+            await loadRoster(); openTab('overview');
+          }
         };
       };
+      const autoKey = (g.caps && (g.caps.library_name || g.caps.url || g.caps.command)) || 'mcp';
+      if (window.__autoDiscoverMcp === autoKey) {
+        window.__autoDiscoverMcp = null;
+        setTimeout(() => disc.click(), 0);
+      }
     }
     gSec.append(box);
   }
@@ -2297,9 +3022,12 @@ async function renderConnectors(c) {
   const updateGrantHint = () => {
     const entry = (lib.library || []).find(e => e.name === gSel.value);
     const catalog = (lib.catalog || []).find(item => entry && entry.caps && entry.caps.catalog_id === item.id);
+    const wantsOauth = !!(entry && entry.caps && (entry.caps.oauth || entry.caps.oauth_client_id));
     gCred.placeholder = catalog && catalog.credential_label
       ? catalog.credential_label + ' — encrypted for this agent'
       : 'secret to seal to this agent (optional)';
+    gCred.disabled = wantsOauth;
+    gGo.textContent = wantsOauth ? 'CONNECT WITH OAUTH' : 'GRANT';
   };
   gSel.onchange = updateGrantHint; updateGrantHint();
   gGo.onclick = async () => {
@@ -2312,7 +3040,7 @@ async function renderConnectors(c) {
       gCred.focus();
       return;
     }
-    const wantsOauth = entry && entry.caps && entry.caps.oauth_client_id && !gCred.value;
+    const wantsOauth = entry && entry.caps && (entry.caps.oauth || entry.caps.oauth_client_id) && !gCred.value;
     if (wantsOauth) {
       gStatus.textContent = 'starting OAuth…';
       const r = await j(api('/connectors/oauth'), {
@@ -2321,15 +3049,16 @@ async function renderConnectors(c) {
       });
       if (!r.ok) { gStatus.textContent = 'failed: ' + r.error; return; }
       gStatus.replaceChildren();
-      const a = el('a', null, 'AUTHORIZE IN BROWSER →');
-      a.href = r.auth_url; a.target = '_blank'; a.style.color = 'var(--amber)';
+      const a = oauthAuthorizeControl('AUTHORIZE IN BROWSER →', r.auth_url);
       gStatus.append(a, el('span', 'meta', ' waiting for the callback…'));
-      const before = grants.length;
       const poll = setInterval(async () => {
         const d2 = await j(api('/manifest'));
-        if (d2.ok && (d2.manifest.connectors || []).length > before) {
+        const connected = d2.ok && (d2.manifest.connectors || []).some(connector =>
+          connector.type === 'mcp' && connector.credential && connector.caps && connector.caps.library_name === gSel.value);
+        if (connected) {
           clearInterval(poll);
-          gStatus.textContent = 'granted via OAuth — re-ratify in Configuration';
+          window.__autoDiscoverMcp = gSel.value;
+          gStatus.textContent = 'OAuth complete — discovering tools…';
           loadRoster(); render();
         }
       }, 3000);
@@ -2369,16 +3098,22 @@ function connectorDetails(card, kind, caps, onAccess) {
     card.append(kv('transport', caps.transport === 'http' ? `remote · ${caps.url}` : `local · ${caps.command || '?'} ${(caps.args || []).join(' ')}`.trim()));
     if (caps.oauth_client_id) card.append(kv('auth', 'OAuth (sign-in at grant)'));
     const mode = connectorAccessMode(kind, caps);
-    if (onAccess && connectorSupportsReadWrite(kind, caps)) {
+    if (mode === 'mixed') {
+      card.append(kv('access', 'Per tool · open Discover tools to edit'));
+    } else if (onAccess && connectorSupportsReadWrite(kind, caps)) {
       const select = accessSelect(mode); select.onchange = () => onAccess(select.value, select);
       const accessRow = el('div', 'kv'); const value = el('span', 'v'); value.append(select);
       accessRow.append(el('span', 'k', 'access'), value); card.append(accessRow);
     } else card.append(kv('access', mode === 'read-only' ? 'Read only' : 'Read + write'));
     const tools = caps.allowed_tools || [];
     const tv = el('span', 'v');
-    if (!tools.length) tv.textContent = 'none allowed';
+    if (!tools.length) tv.textContent = caps.oauth || caps.oauth_client_id ? 'none selected yet' : 'none allowed';
     else if (tools.includes('*')) tv.textContent = 'all tools (*)';
-    else for (const t of tools) { const chip = el('span', 'chip', t); chip.style.marginRight = '4px'; tv.append(chip); }
+    else for (const t of tools) {
+      const policy = caps.tool_access && caps.tool_access[t];
+      const chip = el('span', 'chip', policy ? `${t} · ${policy === 'read-only' ? 'R' : 'R/W'}` : t);
+      chip.style.marginRight = '4px'; tv.append(chip);
+    }
     const row = el('div', 'kv'); row.append(el('span', 'k', 'tools'), tv); card.append(row);
   } else if (kind === 'nostr-publish') {
     card.append(kv('access', 'Write only · publish public notes'), kv('relays', (caps.relays || []).join(', ')));
@@ -2412,7 +3147,8 @@ function capsSummary(kind, caps) {
   if (kind === 'mcp') {
     const where = caps.transport === 'http' ? caps.url : `${caps.command || '?'} ${(caps.args || []).join(' ')}`.trim();
     const tools = (caps.allowed_tools || []).join(', ') || 'no tools allowed';
-    const access = connectorAccessMode(kind, caps) === 'read-only' ? 'Read only' : 'Read + write';
+    const mode = connectorAccessMode(kind, caps);
+    const access = mode === 'mixed' ? 'Per tool' : mode === 'read-only' ? 'Read only' : 'Read + write';
     return `${where}${caps.oauth_client_id ? ' · OAuth' : ''} · ${access} · tools: ${tools}`;
   }
   if (kind === 'nostr-publish') return `relays: ${(caps.relays || []).join(', ')}`;
@@ -2490,7 +3226,7 @@ async function renderLibrary(c) {
       del.onclick = async () => { entries.splice(i, 1); window.__libFlash = `removed ${e.name} (grants already made are untouched)`; await saveLib(); };
       gBtn.onclick = async () => {
         const npub = sel.value; if (!npub) return;
-        const needsSecret = e.kind === 'web-search' || (e.kind === 'mcp' && caps.transport === 'http' && !caps.oauth_client_id);
+        const needsSecret = e.kind === 'web-search' || (e.kind === 'mcp' && caps.transport === 'http' && !caps.oauth && !caps.oauth_client_id);
         if (needsSecret) { gSt.textContent = 'this one needs an API key sealed to the agent — grant it from the agent’s Capabilities'; return; }
         gBtn.disabled = true; gSt.textContent = 'granting…';
         const r = await j(`/api/agents/${encodeURIComponent(npub)}/connectors`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: e.name }) });
@@ -2545,7 +3281,7 @@ async function renderLibrary(c) {
     const addVault = (name = '', path = '') => {
       const r = el('div', 'row');
       const n = el('input'); n.placeholder = 'vault name (e.g. notes)'; n.value = name;
-      const pth = el('input', 'grow'); pth.placeholder = obsidian ? '/Users/you/Obsidian/MyVault' : '/Users/you/repos/some-kb/docs'; pth.value = path;
+      const pth = technicalInput(el('input', 'grow')); pth.placeholder = obsidian ? '/Users/you/Obsidian/MyVault' : '/Users/you/repos/some-kb/docs'; pth.value = path;
       const choose = el('button', 'btn', 'CHOOSE…');
       choose.title = 'open the system folder picker';
       choose.onclick = async () => {
@@ -2585,7 +3321,7 @@ async function renderLibrary(c) {
     const addRoot = (name = '', path = '') => {
       const row = el('div', 'row');
       const rootName = el('input'); rootName.placeholder = `${noun} name`; rootName.value = name;
-      const rootPath = el('input', 'grow'); rootPath.placeholder = pathHint; rootPath.value = path;
+      const rootPath = technicalInput(el('input', 'grow')); rootPath.placeholder = pathHint; rootPath.value = path;
       const choose = el('button', 'btn', 'CHOOSE…'); choose.type = 'button';
       const remove = el('button', 'btn', '−'); remove.type = 'button';
       choose.onclick = async () => {
@@ -2618,7 +3354,7 @@ async function renderLibrary(c) {
     fields.replaceChildren();
     const restrict = el('input'); restrict.type = 'checkbox'; restrict.style.width = 'auto';
     const restrictLabel = el('label', null, ' restrict access to specific domains'); restrictLabel.prepend(restrict);
-    const domains = el('textarea'); domains.rows = 3; domains.placeholder = 'docs.example.com\napi.example.com';
+    const domains = technicalInput(el('textarea')); domains.rows = 3; domains.placeholder = 'docs.example.com\napi.example.com';
     const subdomains = el('input'); subdomains.type = 'checkbox'; subdomains.style.width = 'auto';
     const subdomainsLabel = el('label', null, ' also allow subdomains of each domain'); subdomainsLabel.prepend(subdomains);
     const domainBox = el('div'); domainBox.style.display = 'none';
@@ -2709,60 +3445,99 @@ async function renderLibrary(c) {
     for (const [v, t] of [['stdio', 'local program (stdio) — e.g. npx @modelcontextprotocol/server-filesystem'], ['http', 'remote server (HTTP) — URL, optionally OAuth']]) { const o = el('option', null, t); o.value = v; tr.append(o); }
     const access = accessSelect('read-only');
     const stdioBox = el('div');
-    const cmd = el('input'); cmd.placeholder = 'command (npx, uvx, /path/to/server)';
-    const args = el('input', 'grow'); args.placeholder = 'arguments, space-separated (-y @modelcontextprotocol/server-filesystem /Users/you/docs)';
-    const envs = el('input'); envs.placeholder = 'env vars to pass through (optional, comma-separated)';
+    const cmd = technicalInput(el('input')); cmd.placeholder = 'command (npx, uvx, /path/to/server)';
+    const args = technicalInput(el('input', 'grow')); args.placeholder = 'arguments, space-separated (-y @modelcontextprotocol/server-filesystem /Users/you/docs)';
+    const envs = technicalInput(el('input')); envs.placeholder = 'env vars to pass through (optional, comma-separated)';
     const r1 = el('div', 'row'); r1.append(cmd, args); const r1b = el('div', 'row'); r1b.append(envs);
     stdioBox.append(r1, r1b, help('The program is spawned with a scrubbed environment (PATH, HOME, TMPDIR, LANG + what you list). Pre-run `npx …` once in a terminal so the first probe isn’t a download.'));
     const httpBox = el('div'); httpBox.style.display = 'none';
-    const url = el('input', 'grow'); url.placeholder = 'https://mcp.example.com/mcp';
-    const oauth = el('input'); oauth.placeholder = 'OAuth client id (if the server uses OAuth)';
-    const bearer = el('input'); bearer.type = 'password'; bearer.placeholder = 'API key / bearer for discovery only (not stored)';
-    const r2 = el('div', 'row'); r2.append(url); const r2b = el('div', 'row'); r2b.append(oauth, bearer);
-    httpBox.append(r2, r2b, help('OAuth servers: leave the key blank; when you GRANT this to an agent the cockpit runs the sign-in and seals the tokens to that agent. Then use “Discover tools” on the agent’s Capabilities. API-key servers: the key is sealed at grant time; you can paste it here just to discover.'));
+    const url = technicalInput(el('input', 'grow')); url.placeholder = 'https://mcp.example.com/mcp';
+    const authMode = el('select');
+    for (const [value, label] of [
+      ['oauth', 'OAuth sign-in (recommended)'],
+      ['bearer', 'API key / bearer token'],
+      ['none', 'No authentication'],
+    ]) { const option = el('option', null, label); option.value = value; authMode.append(option); }
+    const oauth = technicalInput(el('input')); oauth.placeholder = 'OAuth client id (advanced; usually automatic)';
+    const bearer = technicalInput(el('input')); bearer.type = 'password'; bearer.placeholder = 'API key / bearer for discovery only (not stored)';
+    const r2 = el('div', 'row'); r2.append(url); const r2b = el('div', 'row'); r2b.append(authMode, oauth, bearer);
+    const oauthTarget = el('select');
+    for (const agent of agents) { const option = el('option', null, agent.name || shortNostrId(agent.npub)); option.value = agent.npub; oauthTarget.append(option); }
+    const oauthTargetField = field('Connect for agent', oauthTarget, 'OAuth credentials are sealed to one agent. No tools are enabled until you explicitly choose them.');
+    oauthTargetField.style.display = 'none';
+    const authHelp = help('OAuth signs in first and then discovers the authenticated tool list. A client id is only needed when the server does not support automatic registration. API keys are entered again when granting and are sealed to that agent.');
+    httpBox.append(r2, r2b, authHelp, oauthTargetField);
     const disc = el('button', 'btn', 'DISCOVER TOOLS');
     const dStatus = el('span', 'meta', '');
     const toolsBox = el('div');
     const dRow = el('div', 'row'); dRow.append(disc, dStatus);
-    let picked = new Set();
+    let policies = new Map();
     let known = [];
+    const syncHttpAuth = () => {
+      const isHttp = tr.value === 'http';
+      const isOauth = isHttp && authMode.value === 'oauth';
+      oauth.style.display = isOauth ? '' : 'none';
+      bearer.style.display = isHttp && authMode.value === 'bearer' ? '' : 'none';
+      oauthTargetField.style.display = isOauth && agents.length ? '' : 'none';
+      dRow.style.display = isOauth ? 'none' : '';
+      nGo.textContent = isOauth
+        ? (agents.length ? 'SAVE & CONNECT WITH OAUTH' : 'SAVE OAUTH CONNECTOR')
+        : 'ADD TO LIBRARY';
+      drawTools();
+    };
     const drawTools = () => {
       toolsBox.replaceChildren();
-      if (!known.length) { toolsBox.append(help('Tools must be allowed by name. Discover the server first; in Read only mode, Apiary exposes only tools explicitly marked readOnlyHint=true.')); return; }
-      const readOnly = access.value === 'read-only';
-      const all = el('input'); all.type = 'checkbox'; all.style.width = 'auto';
-      const al = el('label', null, readOnly ? ' allow every tool marked read only (*)' : ' allow every tool the server exposes (*)'); al.prepend(all);
-      toolsBox.append(al, help('MCP access labels come from the server and are trust metadata, not a sandbox guarantee. Missing readOnlyHint is treated as write-capable.'));
-      all.onchange = () => { if (all.checked) { picked = new Set(['*']); } else { picked.delete('*'); } drawTools(); };
-      all.checked = picked.has('*');
-      for (const t of known) {
-        const unavailable = readOnly && !t.read_only;
-        if (unavailable) picked.delete(t.name);
-        const cb = el('input'); cb.type = 'checkbox'; cb.style.width = 'auto'; cb.disabled = unavailable; cb.checked = !unavailable && (picked.has('*') || picked.has(t.name));
-        const risk = t.read_only ? 'read only' : 'may write';
-        const lab = el('label', null, ` ${t.name} · ${risk}${t.description ? ' — ' + t.description.slice(0, 120) : ''}`); lab.prepend(cb);
-        lab.style.display = 'block';
-        cb.onchange = () => { picked.delete('*'); if (cb.checked) picked.add(t.name); else picked.delete(t.name); drawTools(); };
-        toolsBox.append(lab);
+      if (tr.value === 'http' && authMode.value === 'oauth') {
+        toolsBox.append(help('Authenticate first. Apiary will discover this agent’s tools automatically after the OAuth callback, then ask you to select the allowed tools.'));
+        return;
       }
+      if (!known.length) { toolsBox.append(help('Tools must be allowed by name. Discover the server first; in Read only mode, Apiary exposes only tools explicitly marked readOnlyHint=true.')); return; }
+      renderMcpToolPolicyPicker(toolsBox, known, policies);
     };
     drawTools();
-    tr.onchange = () => { stdioBox.style.display = tr.value === 'stdio' ? '' : 'none'; httpBox.style.display = tr.value === 'http' ? '' : 'none'; };
+    tr.onchange = () => {
+      stdioBox.style.display = tr.value === 'stdio' ? '' : 'none';
+      httpBox.style.display = tr.value === 'http' ? '' : 'none';
+      syncHttpAuth();
+    };
+    authMode.onchange = syncHttpAuth;
     access.onchange = drawTools;
     const trRow = el('div', 'row'); trRow.append(tr);
     fields.append(trRow, field('Access', access, 'Read only fails closed: unmarked tools are excluded. Read + write permits every tool you explicitly select.'), stdioBox, httpBox, dRow, toolsBox);
     const buildCaps = () => {
-      const caps = { transport: tr.value, access: access.value, allowed_tools: [...picked] };
+      const toolAccess = mcpToolPolicyObject(policies);
+      const caps = {
+        transport: tr.value,
+        access: Object.keys(toolAccess).length ? 'mixed' : access.value,
+        allowed_tools: Object.keys(toolAccess),
+      };
+      if (Object.keys(toolAccess).length) caps.tool_access = toolAccess;
       if (tr.value === 'stdio') { caps.command = cmd.value.trim(); caps.args = args.value.trim() ? args.value.trim().split(/\s+/) : []; if (envs.value.trim()) caps.env = envs.value.split(',').map(x => x.trim()).filter(Boolean); }
-      else { caps.url = url.value.trim(); if (oauth.value.trim()) caps.oauth_client_id = oauth.value.trim(); }
+      else {
+        caps.url = url.value.trim();
+        if (authMode.value === 'oauth') {
+          caps.oauth = true;
+          if (oauth.value.trim()) caps.oauth_client_id = oauth.value.trim();
+        }
+      }
       return caps;
     };
     disc.onclick = async () => {
       dStatus.textContent = 'probing…';
       const caps = buildCaps();
+      if (caps.oauth) {
+        dStatus.textContent = 'Authenticate with OAuth before discovering tools.';
+        return;
+      }
       const r = await j('/api/connectors/discover', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ caps, bearer: bearer.value || undefined }) });
-      if (r.ok) { known = r.tools || []; dStatus.textContent = `${known.length} tools`; drawTools(); }
-      else if (r.auth_required) { dStatus.textContent = 'server wants OAuth — save the entry, grant it to an agent (that runs the sign-in), then discover from the agent’s Capabilities'; }
+      if (r.ok) { known = r.tools || []; policies = mcpToolPolicies(known, {}); dStatus.textContent = `${known.length} tools grouped by category`; drawTools(); }
+      else if (r.auth_required) {
+        authMode.value = 'oauth';
+        syncHttpAuth();
+        dStatus.textContent = agents.length
+          ? 'OAuth required — save and connect; Apiary will discover tools after authorization'
+          : 'OAuth required — save this disabled connector, then create an agent to complete sign-in and tool discovery';
+      }
       else dStatus.textContent = 'failed: ' + r.error;
     };
     current = {
@@ -2770,15 +3545,48 @@ async function renderLibrary(c) {
       validate: () => {
         if (tr.value === 'stdio' && !cmd.value.trim()) return 'command required';
         if (tr.value === 'http' && !(/^(https?:\/\/|apiary:\/\/local\/mcp$)/.test(url.value.trim()))) return 'use a full HTTP URL or apiary://local/mcp';
-        if (!picked.size) return 'allow at least one tool (Discover, then tick) — or * for all';
-        if (access.value === 'read-only' && known.length && !known.some(t => t.read_only)) return 'this server marks no tools as read only; choose Read + write or use a server with readOnlyHint metadata';
+        const oauthFlow = tr.value === 'http' && authMode.value === 'oauth';
+        if (!policies.size && !oauthFlow) return 'allow at least one category or tool after discovery';
         return null;
       },
+      afterSave: async (name, caps) => {
+        if (!caps.oauth) return false;
+        if (!agents.length || !oauthTarget.value) {
+          lStatus.textContent = 'saved with no tools enabled — create an agent, then connect from that agent’s Capabilities';
+          return true;
+        }
+        const npub = oauthTarget.value;
+        lStatus.textContent = 'starting OAuth…';
+        const started = await j(`/api/agents/${encodeURIComponent(npub)}/connectors/oauth`, {
+          method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name }),
+        });
+        if (!started.ok) {
+          lStatus.textContent = 'saved safely with no tools enabled; OAuth could not start: ' + started.error;
+          return true;
+        }
+        lStatus.replaceChildren();
+        const authorize = oauthAuthorizeControl('AUTHORIZE WITH OAUTH →', started.auth_url);
+        lStatus.append(authorize, el('span', 'meta', ' then return here; Apiary will discover tools automatically'));
+        const poll = setInterval(async () => {
+          const manifest = await j(`/api/agents/${encodeURIComponent(npub)}/manifest`);
+          const connected = manifest.ok && (manifest.manifest.connectors || []).some(connector =>
+            connector.type === 'mcp' && connector.credential && connector.caps && connector.caps.library_name === name);
+          if (connected) {
+            clearInterval(poll);
+            sel = npub;
+            window.__autoDiscoverMcp = name;
+            await loadRoster();
+            openTab('connectors');
+          }
+        }, 2000);
+        return true;
+      },
     };
+    syncHttpAuth();
   };
   const nostrBuilder = () => {
     fields.replaceChildren();
-    const relays = el('textarea', 'address-list'); relays.rows = 4;
+    const relays = technicalInput(el('textarea', 'address-list')); relays.rows = 4;
     relays.placeholder = 'wss://nos.lol\nwss://relay.damus.io';
     relays.value = 'wss://nos.lol\nwss://relay.damus.io';
     const relayValues = () => relays.value.split(/[\s,]+/).map(x => x.trim()).filter(Boolean);
@@ -2810,13 +3618,13 @@ async function renderLibrary(c) {
   nKind.onchange = () => { selectedCatalogId = null; pickBuilder(); };
   pickBuilder();
 
-  const saveLib = async () => {
+  const saveLib = async (rerender = true) => {
     const r = await j('/api/connectors', {
       method: 'PUT', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ library: entries }),
     });
     lStatus.textContent = r.ok ? `saved (${r.count} entries)` : 'rejected: ' + r.error;
-    if (r.ok) render();
+    if (r.ok && rerender) render();
     return r.ok;
   };
   const uniqueName = (base) => {
@@ -2883,7 +3691,9 @@ async function renderLibrary(c) {
     nGo.disabled = true; nGo.textContent = 'ADDING…';
     entries.push({ name, kind: nKind.value, caps });
     window.__libFlash = `added ${name} (${nKind.value}) — now GRANT it from an agent’s Capabilities, then ratify`;
-    await saveLib();
+    const saved = await saveLib(false);
+    const handled = saved && current.afterSave ? await current.afterSave(name, caps) : false;
+    if (saved && !handled) render();
     nGo.disabled = false; nGo.textContent = 'ADD TO LIBRARY';
   };
 
@@ -2897,7 +3707,7 @@ async function renderLibrary(c) {
   docs.append(el('summary', null, 'how connectors work'));
   const docsBody = el('div');
   docsBody.append(help('Two layers: the host library holds named configurations (kind + caps, never secrets); grants are per-agent and constitutional — they travel in the manifest, so portability includes capabilities and their sealed credentials. A destination host only needs to bind the kind; a declared kind it cannot bind fails loudly at run start.'));
-  docsBody.append(help('The mcp kind speaks the Model Context Protocol (2026-07-28, automatic fallback to initialize-era servers). For OAuth-protected remote servers, grant an entry carrying oauth_client_id and the browser consent runs at grant time; for token servers, paste the bearer token as the secret. caps.allowed_tools is always required — the server offers whatever it likes, the manifest decides.'));
+  docsBody.append(help('The mcp kind speaks the Model Context Protocol (2026-07-28, automatic fallback to initialize-era servers). OAuth connectors are saved with no tools enabled, authorized for one agent, and discovered only after sign-in. Apiary then requires an explicit tool allowlist before the connector can run; the server offers tools, but the manifest decides what the agent receives.'));
   docs.append(docsBody);
   c.append(docs);
 }
@@ -2944,6 +3754,24 @@ function renderCreds(c) {
 }
 
 // ------------------------------------------------------------ founding
+
+const hostViewButtons = {
+  found: 'foundtoggle',
+  managers: 'managerstoggle',
+  audit: 'audittoggle',
+  library: 'libtoggle',
+  import: 'importtoggle',
+};
+
+function syncSidebarSelection() {
+  const activeId = hostView ? hostViewButtons[hostView] : null;
+  document.querySelectorAll('.side-action').forEach(button => {
+    const current = button.id === activeId;
+    button.classList.toggle('sel', current);
+    if (current) button.setAttribute('aria-current', 'page');
+    else button.removeAttribute('aria-current');
+  });
+}
 
 document.getElementById('managerstoggle').onclick = () => {
   hostView = 'managers';
@@ -3066,7 +3894,7 @@ function renderManagers(c) {
   const add = section('Add a person by Nostr ID',
     'Paste an npub or public-key hex. They authenticate with their own signer; never ask them for an nsec or private key.');
   const name = el('input', 'grow'); name.placeholder = 'Name or local label';
-  const npub = el('input', 'grow'); npub.placeholder = 'npub1… or 64-character public key';
+  const npub = technicalInput(el('input', 'grow')); npub.placeholder = 'npub1… or 64-character public key';
   const go = el('button', 'btn solid', 'Add host manager');
   const status = el('span', 'meta', '');
   const row = el('div', 'row'); row.append(go, status);
@@ -3196,21 +4024,53 @@ function renderImport(c) {
   const bundle = el('textarea'); bundle.rows = 8; bundle.placeholder = 'paste .apiary.json bundle or sealed envelope';
   bundle.setAttribute('aria-label', 'Bundle JSON');
   const pass = el('input', 'grow'); pass.type = 'password';
-  pass.placeholder = 'Only needed for a passphrase-protected handoff';
+  pass.placeholder = 'Handoff or source workspace passphrase';
   const paste = el('details', 'technical'); paste.append(el('summary', null, 'Or paste bundle JSON'), bundle);
   const go = el('button', 'btn solid', 'Verify and import');
   const st = el('div', 'meta', '');
   st.setAttribute('role', 'status');
   st.setAttribute('aria-live', 'polite');
   const row = el('div', 'row'); row.append(pass, go);
-  sec.append(field('Export bundle', file), paste, field('Handoff passphrase', pass), row, st,
-    help('Sealed recipient bundles do not need a handoff passphrase. The imported private key is re-encrypted for this workspace.'));
+  const passField = field('Transfer or source workspace passphrase', pass);
+  const passLabel = passField.querySelector('span');
+  sec.append(field('Export bundle', file), paste, passField, row, st,
+    help('Agents do not have passphrases. This field only opens the encrypted private key carried by a plain export: use its disposable transfer passphrase or, for an older same-workspace backup, the source workspace passphrase. Recipient-sealed bundles need neither.'));
   c.append(sec);
+
+  const inspectBundle = (parsed, loadedName = '') => {
+    const sealed = parsed && Number(parsed.kind) === 4602 && !!parsed.sig;
+    const protection = parsed && parsed.key_protection;
+    pass.disabled = sealed;
+    if (sealed) {
+      pass.value = '';
+      passLabel.textContent = 'No passphrase needed';
+      pass.placeholder = 'Not needed — sealed to a recipient identity';
+      st.textContent = `${loadedName ? `Loaded ${loadedName}. ` : ''}Recipient-sealed bundle; no passphrase is needed.`;
+    } else if (protection === 'handoff_passphrase') {
+      passLabel.textContent = 'One-time transfer passphrase';
+      pass.placeholder = 'Passphrase chosen when this bundle was exported';
+      st.textContent = `${loadedName ? `Loaded ${loadedName}. ` : ''}Enter the handoff passphrase used during export.`;
+    } else if (protection === 'source_workspace_passphrase') {
+      passLabel.textContent = 'Source workspace passphrase';
+      pass.placeholder = 'Passphrase for the workspace that exported this agent';
+      st.textContent = `${loadedName ? `Loaded ${loadedName}. ` : ''}Enter the source workspace passphrase.`;
+    } else {
+      passLabel.textContent = 'Transfer or source workspace passphrase';
+      pass.placeholder = 'Handoff passphrase, or the source workspace passphrase';
+      st.textContent = `${loadedName ? `Loaded ${loadedName}. ` : ''}This legacy bundle does not identify its protection mode. Enter its handoff passphrase; if none was set, use the source workspace passphrase.`;
+    }
+  };
   file.onchange = async () => {
     const chosen = file.files && file.files[0];
     if (!chosen) return;
-    try { bundle.value = await chosen.text(); st.textContent = `Loaded ${chosen.name}.`; }
-    catch (err) { st.textContent = 'Could not read the file: ' + err; }
+    try {
+      bundle.value = await chosen.text();
+      inspectBundle(JSON.parse(bundle.value), chosen.name);
+    }
+    catch (err) {
+      if (bundle.value) st.textContent = 'The selected file is not valid JSON.';
+      else st.textContent = 'Could not read the file: ' + err;
+    }
   };
   go.onclick = async () => {
     let parsed;
@@ -3222,9 +4082,16 @@ function renderImport(c) {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ bundle: parsed, bundle_passphrase: pass.value || null }),
       });
+      const mismatch = !r.ok && (
+        String(r.error || '').includes('passphrase mismatch')
+        || String(r.error || '').includes('the agent has no passphrase')
+      );
       st.textContent = r.ok
         ? `Imported ${r.name || shortNostrId(r.npub)} with ${r.log_entries} signed history entries. It is inactive on this host.`
-        : 'Could not import: ' + (r.error || 'The host refused the bundle.');
+        : mismatch
+          ? 'The agent has no passphrase. This older export copied its workspace-encrypted private key. Enter the source workspace passphrase, or re-export the agent from that workspace with a disposable transfer passphrase.'
+          : 'Could not import: ' + (r.error || 'The host refused the bundle.');
+      if (mismatch) { pass.disabled = false; pass.focus(); }
       if (r.ok) {
         bundle.value = ''; file.value = ''; hostView = null; sel = r.npub; tab = 'overview';
         await loadRoster(); openTab('overview');
@@ -3242,9 +4109,40 @@ function renderStartupError(error) {
   const root = document.getElementById('content');
   root.replaceChildren();
   const card = section('Sign in to Apiary', error && error.message ? error.message : String(error));
-  const retry = el('button', 'btn solid', 'Try Nostr sign-in again');
-  retry.onclick = () => location.reload();
-  card.append(retry, help('Apiary asks your signer once, opens an eight-hour off-chain session, and still enforces your role separately for every agent.'));
+  const desktopManagers = error && Array.isArray(error.desktopManagers) ? error.desktopManagers : [];
+  if (desktopManagers.length) {
+    const manager = el('select');
+    manager.setAttribute('aria-label', 'Approved host manager');
+    for (const identity of desktopManagers) {
+      const option = el('option', null, `${identity.name} (${shortNostrId(identity.npub)})`);
+      option.value = identity.npub;
+      manager.append(option);
+    }
+    const retry = el('button', 'btn solid', 'Continue as selected manager');
+    const status = el('span', 'meta');
+    const row = el('div', 'row');
+    row.append(manager, retry, status);
+    retry.onclick = async () => {
+      retry.disabled = true;
+      status.textContent = 'Opening the desktop session…';
+      try {
+        await establishDesktopSession(manager.value);
+        location.reload();
+      } catch (retryError) {
+        retry.disabled = false;
+        status.textContent = retryError && retryError.message ? retryError.message : 'Could not open the desktop session.';
+      }
+    };
+    card.append(row, help('Choose which approved identity this SSH-authenticated desktop session should use.'));
+  } else if (DESKTOP) {
+    const reconnect = el('button', 'btn solid', 'Reconnect desktop session');
+    reconnect.onclick = () => desktopAction('reconnect');
+    card.append(reconnect, help('Apiary will reopen the SSH connection and obtain a fresh desktop credential. A browser Nostr extension is not required.'));
+  } else {
+    const retry = el('button', 'btn solid', 'Try Nostr sign-in again');
+    retry.onclick = () => location.reload();
+    card.append(retry, help('Apiary asks your signer once, opens an eight-hour off-chain session, and still enforces your role separately for every agent.'));
+  }
   root.append(card);
   document.getElementById('roster').replaceChildren(el('div', 'empty', 'Authentication required'));
 }
@@ -3252,6 +4150,10 @@ function renderStartupError(error) {
 loadStatus()
   .then(() => Promise.all([loadOwners(), loadManagers()]))
   .then(loadRoster)
-  .then(render)
-  .then(() => { setInterval(loadStatus, 15000); })
+  .then(() => {
+    if (INITIAL_AGENT && agents.some(agent => agent.npub === INITIAL_AGENT)) sel = INITIAL_AGENT;
+    if (INITIAL_TAB && document.querySelector(`nav button[data-tab="${CSS.escape(INITIAL_TAB)}"]`)) tab = INITIAL_TAB;
+    return render();
+  })
+  .then(() => { setInterval(() => loadStatus().catch(() => {}), 15000); })
   .catch(renderStartupError);

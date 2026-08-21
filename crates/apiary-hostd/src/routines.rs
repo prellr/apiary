@@ -675,7 +675,7 @@ pub async fn decide_proposal(
     headers: axum::http::HeaderMap,
     raw_body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let (ks, npub, dir, _raw, current) =
+    let (ks, npub, dir, raw, current) =
         match crate::ops::gate_pub(&state, &headers, "POST", &uri, Some(&raw_body), &npub) {
             Ok(v) => v,
             Err(e) => return e.into_response(),
@@ -715,8 +715,22 @@ pub async fn decide_proposal(
             )
             .into_response();
         }
-        if let Err(e) = std::fs::write(dir.join("manifest.yaml"), &yaml) {
-            return crate::err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        if let Err(error) = crate::agent_store::replace_manifest(&dir, &raw, &yaml) {
+            return match error {
+                crate::agent_store::StoreError::Conflict { current_revision } => (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "ok": false,
+                        "error": "the agent changed while this proposal was being reviewed; reload it before deciding",
+                        "code": "manifest_revision_conflict",
+                        "current_revision": current_revision,
+                    })),
+                )
+                    .into_response(),
+                crate::agent_store::StoreError::Io(error) => {
+                    crate::err(StatusCode::INTERNAL_SERVER_ERROR, error).into_response()
+                }
+            };
         }
     }
     apiary_runtime::proposal::clear_proposal(&dir);
