@@ -2473,28 +2473,70 @@ async function renderManifest(c) {
 
 // ------------------------------------------------------------ buzz
 
-function relayInput() {
+function workspaceDraftScope() {
+  const host = hostDisplayName() || location.origin || 'apiary';
+  return `${host}::${sel || ''}`;
+}
+
+function workspaceDraftKey(field) {
+  return `apiary.workspace.${encodeURIComponent(workspaceDraftScope())}.${field}`;
+}
+
+function workspaceDraft(field, fallback = '') {
+  const saved = localStorage.getItem(workspaceDraftKey(field));
+  return saved === null ? String(fallback || '') : saved;
+}
+
+function saveWorkspaceDraft(field, value) {
+  localStorage.setItem(workspaceDraftKey(field), String(value || ''));
+}
+
+function configuredBuzz(manifestResult) {
+  const manifest = manifestResult && manifestResult.manifest ? manifestResult.manifest : {};
+  const buzz = manifest.presence && manifest.presence.buzz;
+  return buzz && typeof buzz === 'object' ? buzz : {};
+}
+
+function relayInput(configuredRelay = '') {
   const inp = technicalInput(el('input', 'relay-address'));
   inp.placeholder = 'wss://your-buzz-relay';
-  inp.value = localStorage.getItem('apiary.relay') || '';
-  inp.onchange = () => localStorage.setItem('apiary.relay', inp.value.trim());
+  const scopedRelay = localStorage.getItem(workspaceDraftKey('relay'));
+  const fallbackRelay = configuredRelay || localStorage.getItem('apiary.relay') || '';
+  inp.value = scopedRelay === null ? fallbackRelay : scopedRelay;
+  if (scopedRelay === null && fallbackRelay) saveWorkspaceDraft('relay', fallbackRelay);
+  inp.oninput = () => saveWorkspaceDraft('relay', inp.value);
+  inp.onchange = () => {
+    inp.value = inp.value.trim();
+    saveWorkspaceDraft('relay', inp.value);
+  };
   return inp;
 }
 
 async function renderBuzz(c) {
   const roster = agents.find(a => a.npub === sel) || {};
+  const manifestResult = await currentManifest();
+  const buzz = configuredBuzz(manifestResult);
+  const configuredRelay = typeof buzz.relay === 'string'
+    ? buzz.relay
+    : (typeof buzz.url === 'string' ? buzz.url : '');
   c.append(help('Buzz is a nostr-native agent workspace — and structurally just a relay, so the agent joins with its own key (NIP-42 auth), not a bot token. Everything here acts AS the selected agent and logs to its signed history.'));
 
   const relaySec = section('Workspace relay', 'The Buzz relay URL. Membership is admitted relay-side (buzz-admin); until admitted, operations will be refused politely.');
-  const relay = relayInput();
+  const relay = relayInput(configuredRelay);
   relaySec.append(relay);
   c.append(relaySec);
   const rv = () => relay.value.trim();
 
   const profSec = section('Profile',
     'Publishes a kind-0 profile so the workspace shows a name instead of a hex key. Also lands in the public log.');
-  const pName = el('input'); pName.placeholder = 'display name';
-  const pAbout = el('input', 'grow'); pAbout.placeholder = 'about (optional)';
+  const pName = el('input');
+  pName.placeholder = 'display name';
+  pName.value = workspaceDraft('profile.name', roster.name || '');
+  pName.oninput = () => saveWorkspaceDraft('profile.name', pName.value);
+  const pAbout = el('input', 'grow');
+  pAbout.placeholder = 'about (optional)';
+  pAbout.value = workspaceDraft('profile.about');
+  pAbout.oninput = () => saveWorkspaceDraft('profile.about', pAbout.value);
   const pGo = el('button', 'btn', 'PUBLISH PROFILE');
   const pSt = el('span', 'meta', '');
   const pRow = el('div', 'row'); pRow.append(pName, pAbout, pGo, pSt);
@@ -2506,6 +2548,12 @@ async function renderBuzz(c) {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ relay: rv(), name: pName.value.trim(), about: pAbout.value.trim() || null }),
     });
+    if (r.ok) {
+      pName.value = pName.value.trim();
+      pAbout.value = pAbout.value.trim();
+      saveWorkspaceDraft('profile.name', pName.value);
+      saveWorkspaceDraft('profile.about', pAbout.value);
+    }
     pSt.textContent = r.ok ? 'published ✓' : 'failed: ' + r.error;
   };
 
@@ -2522,13 +2570,18 @@ async function renderBuzz(c) {
   const postGo = el('button', 'btn solid', 'POST');
   const postRow = el('div', 'row'); postRow.append(postIn, postGo);
   postRow.style.display = 'none';
-  let curChan = null;
+  let curChan = workspaceDraft('channel.id') || null;
+  let curChanName = workspaceDraft('channel.name') || null;
   chanSec.append(chRow, chList, joinRow, msgs, postRow);
   c.append(chanSec);
 
   const readChan = async (id, name) => {
+    const displayName = name || curChanName || id;
     curChan = id;
-    msgs.replaceChildren(el('div', 'meta', 'reading #' + (name || id) + '…'));
+    curChanName = displayName;
+    saveWorkspaceDraft('channel.id', id);
+    saveWorkspaceDraft('channel.name', displayName);
+    msgs.replaceChildren(el('div', 'meta', 'reading #' + displayName + '…'));
     const r = await j(api('/buzz/read') + `?relay=${encodeURIComponent(rv())}&channel=${encodeURIComponent(id)}&limit=30`);
     msgs.replaceChildren();
     postRow.style.display = 'flex';
@@ -2546,11 +2599,14 @@ async function renderBuzz(c) {
     const r = await j(api('/buzz/channels') + '?relay=' + encodeURIComponent(rv()));
     chSt.textContent = r.ok ? (r.channels.length + ' channels') : 'failed: ' + r.error;
     chList.replaceChildren();
+    if (!r.ok) return;
     for (const ch of (r.channels || [])) {
       const n = el('div', 'chan', '#' + (ch.name || '(unnamed)') + ' · ' + ch.id);
       n.onclick = () => readChan(ch.id, ch.name);
       chList.append(n);
     }
+    const remembered = (r.channels || []).find(ch => ch.id === curChan);
+    if (remembered) await readChan(remembered.id, remembered.name);
   };
   joinGo.onclick = async () => {
     chSt.textContent = 'requesting…';
@@ -2566,7 +2622,7 @@ async function renderBuzz(c) {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ relay: rv(), channel: curChan, message: postIn.value }),
     });
-    if (r.ok) { postIn.value = ''; readChan(curChan); }
+    if (r.ok) { postIn.value = ''; readChan(curChan, curChanName); }
     else msgs.append(el('div', 'ev err', 'post failed: ' + r.error));
   };
 

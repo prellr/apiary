@@ -57,3 +57,44 @@ fn routines_validate_shape_and_targets() {
     assert_eq!(m.routines[0].class, "routine");
     assert!(m.routines[0].enabled);
 }
+
+#[test]
+fn mcp_connector_without_allowlist_is_invalid() {
+    let m = |caps: &str| {
+        Manifest::from_yaml(&format!(
+            r#"
+manifest_version: 1
+identity:
+  npub: npub1m8mfxnr32mlkylq9s0cj5l6vheatdu39kaze26e65ptzfr8vudgse6kgv3
+inference:
+  - name: brain
+    provider: mock
+routing:
+  default: brain
+connectors:
+  - type: mcp
+    caps:
+{caps}
+memory:
+  log: local
+governance:
+  suspend_keys:
+    - npub1kpmddremcthyftcuua6hjkt9hekc729j78qkhfgfvv35efjz0mnsgddfeg
+"#
+        ))
+    };
+    let bare = m("      transport: stdio\n      command: npx\n");
+    assert!(bare.is_err(), "no allowlist must not validate");
+    assert!(
+        bare.unwrap_err().to_string().contains("DISCOVER TOOLS"),
+        "error names the fix"
+    );
+    assert!(
+        m("      transport: stdio\n      command: npx\n      allowed_tools: [read_file]\n").is_ok()
+    );
+    assert!(m("      transport: stdio\n      command: npx\n      tool_access:\n        read_file: read-only\n").is_ok());
+    assert!(
+        m("      transport: stdio\n      command: npx\n      allowed_tools: []\n").is_err(),
+        "empty list is no allowlist"
+    );
+}

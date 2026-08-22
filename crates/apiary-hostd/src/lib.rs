@@ -1528,4 +1528,21 @@ mod tests {
             .unwrap();
         assert!(String::from_utf8_lossy(&body).contains("New agent"));
     }
+    #[test]
+    fn cockpit_workspace_fields_rehydrate_from_agent_state() {
+        let renderer = include_str!("cockpit.js");
+
+        assert!(renderer.contains("function workspaceDraftKey"));
+        assert!(renderer.contains("manifest.presence && manifest.presence.buzz"));
+        assert!(renderer.contains("relayInput(configuredRelay)"));
+        assert!(renderer.contains("inp.oninput = () => saveWorkspaceDraft('relay'"));
+        assert!(renderer.contains("pName.value = workspaceDraft('profile.name'"));
+        assert!(renderer.contains("pAbout.value = workspaceDraft('profile.about'"));
+        assert!(renderer.contains("workspaceDraft('channel.id')"));
+        assert!(renderer.contains("saveWorkspaceDraft('channel.id', id)"));
+        assert!(renderer.contains("saveWorkspaceDraft('channel.name', displayName)"));
+        assert!(!renderer.contains("saveWorkspaceDraft('message"));
+        assert!(!renderer.contains("saveWorkspaceDraft('credential"));
+        assert!(!renderer.contains("saveWorkspaceDraft('passphrase"));
+    }
 }

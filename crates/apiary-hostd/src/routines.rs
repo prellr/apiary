@@ -43,7 +43,7 @@ pub fn reconcile_routines(state: &App) {
         }
         let raw = std::fs::read_to_string(dir.join("manifest.yaml")).unwrap_or_default();
         let Ok(manifest) = Manifest::from_yaml(&raw) else {
-            continue;
+            continue; // presence reconcile already noted the load failure
         };
         if manifest.routines.is_empty() {
             continue;

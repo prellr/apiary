@@ -22,6 +22,15 @@ use zeroize::Zeroizing;
 type Resp = (StatusCode, Json<serde_json::Value>);
 
 fn persist_manifest(dir: &std::path::Path, expected_raw: &str, yaml: &str) -> Result<String, Resp> {
+    // Never write a manifest the host cannot load back: a bad amendment
+    // must fail HERE, in the amender's face, not at the next mention (or
+    // worse, silently stop the agent when from_yaml rejects it later).
+    if let Err(e) = apiary_core::manifest::Manifest::from_yaml(yaml) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("this amendment would make the manifest invalid: {e}"),
+        ));
+    }
     crate::agent_store::replace_manifest(dir, expected_raw, yaml).map_err(|error| match error {
         crate::agent_store::StoreError::Conflict { current_revision } => (
             StatusCode::CONFLICT,
@@ -5376,7 +5385,23 @@ fn reconcile(state: &App, backoff: &mut std::collections::HashMap<String, u64>) 
         let active = is_active(&dir);
         let raw = std::fs::read_to_string(dir.join("manifest.yaml")).unwrap_or_default();
         let disk_sha = ceremony::manifest_hash(&raw);
-        let manifest = apiary_core::manifest::Manifest::from_yaml(&raw).ok();
+        let manifest = match apiary_core::manifest::Manifest::from_yaml(&raw) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                // Loud: an unloadable manifest silently stopping the agent
+                // is the least legible failure there is.
+                state
+                    .supervisor_notes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        npub.clone(),
+                        format!("manifest does not load — everything is stopped: {e}"),
+                    );
+                eprintln!("supervisor: manifest for {npub} does not load: {e}");
+                None
+            }
+        };
         if active {
             if let Some(manifest) = manifest.clone() {
                 apiary_runtime::index::schedule_refresh(manifest, dir.clone());

@@ -911,6 +911,32 @@ impl Manifest {
                 }
             }
         }
+        // MCP connectors must carry their allowlist IN THE MANIFEST — the
+        // bind also enforces this, but a run-time refusal answers nobody;
+        // a validation error lands in the governor's face at save/ratify.
+        for c in self.connectors.iter().filter(|c| c.kind == "mcp") {
+            let has_allowed = c
+                .caps
+                .get("allowed_tools")
+                .and_then(|v| v.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            let has_access = c
+                .caps
+                .get("tool_access")
+                .and_then(|v| v.as_object())
+                .map(|o| !o.is_empty())
+                .unwrap_or(false);
+            if !has_allowed && !has_access {
+                return Err(crate::Error::Manifest(
+                    "an mcp connector has no tool allowlist (caps.allowed_tools or \
+                     caps.tool_access). Fix: the agent's Connectors tab → DISCOVER TOOLS → \
+                     tick what it may use → APPLY, then ratify. [\"*\"] allows every tool — \
+                     say so deliberately."
+                        .into(),
+                ));
+            }
+        }
         // Routines: one schedule spelling, tz where it matters, valid
         // delivery targets, unique names.
         let mut rnames = std::collections::BTreeSet::new();
