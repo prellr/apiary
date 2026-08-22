@@ -3795,9 +3795,16 @@ pub async fn agent_connector_discover(
                 |t| json!({"name": t.name, "description": t.description, "read_only": t.read_only}),
             )
             .collect())
-    })
-    .await
-    .unwrap_or_else(|e| Err(e.to_string()));
+    });
+    // A hard deadline: a hung MCP server or OAuth token endpoint must
+    // surface as an error, never as a cockpit spinner that outlives hope.
+    let res = match tokio::time::timeout(std::time::Duration::from_secs(75), res).await {
+        Ok(joined) => joined.unwrap_or_else(|e| Err(e.to_string())),
+        Err(_) => Err(
+            "discovery timed out after 75s — the MCP server or its OAuth token endpoint is not              answering"
+                .to_string(),
+        ),
+    };
     match res {
         Ok(tools) => Json(json!({"ok": true, "tools": tools})).into_response(),
         Err(e) => err(StatusCode::BAD_GATEWAY, e).into_response(),

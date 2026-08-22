@@ -557,7 +557,10 @@ pub fn refresh_access_token(oauth: &Value) -> Result<String, crate::Error> {
     if let Some(resource) = oauth.get("resource").and_then(Value::as_str) {
         form.push(("resource", resource.to_string()));
     }
-    let resp = reqwest::blocking::Client::new()
+    let resp = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| crate::Error::Provider(format!("refresh client: {e}")))?
         .post(token_endpoint)
         .form(&form)
         .send()
