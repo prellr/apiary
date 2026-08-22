@@ -55,6 +55,7 @@ pub struct CallOutcome {
 }
 
 /// Where and how to reach the server.
+#[derive(Clone)]
 pub enum Binding {
     Stdio {
         command: String,

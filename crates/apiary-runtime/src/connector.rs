@@ -537,7 +537,9 @@ impl Connector for McpToolConnector {
 /// OAuth refresh-token grant (public client shape). Returns the new access
 /// token; the refreshed session lives for this run only — the durable seed
 /// stays sealed in the manifest.
-fn refresh_access_token(oauth: &Value) -> Result<String, crate::Error> {
+/// One refresh-token exchange; used by the 401-recovery in tool calls
+/// and by tool DISCOVERY (which otherwise dies on a stale access token).
+pub fn refresh_access_token(oauth: &Value) -> Result<String, crate::Error> {
     let get = |k: &str| {
         oauth
             .get(k)

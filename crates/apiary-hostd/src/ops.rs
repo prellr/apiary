@@ -3700,18 +3700,23 @@ pub async fn agent_connector_discover(
         Ok(v) => v,
         Err(e) => return err(StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
     };
-    let bearer = match &entry.credential {
+    let (bearer, oauth_refresh) = match &entry.credential {
         Some(blob) => match custody.open(&handle, blob) {
             Ok(z) => {
                 let raw = z.as_str().to_string();
                 match serde_json::from_str::<serde_json::Value>(&raw) {
-                    Ok(v) if v["type"] == "oauth" => v["access_token"].as_str().map(String::from),
-                    _ => Some(raw),
+                    Ok(v) if v["type"] == "oauth" => (
+                        v["access_token"].as_str().map(String::from),
+                        // Keep the whole OAuth object: a stale access token
+                        // is refreshed exactly like the tool-call path does.
+                        Some(v),
+                    ),
+                    _ => (Some(raw), None),
                 }
             }
             Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         },
-        None => None,
+        None => (None, None),
     };
     let caps = serde_json::to_value(&entry.caps).unwrap_or_default();
     let local_control_url = std::fs::read_to_string(state.home.join("control.json"))
@@ -3749,11 +3754,42 @@ pub async fn agent_connector_discover(
                 bearer,
             },
         };
-        let mut client =
-            apiary_runtime::mcp::McpClient::connect(binding).map_err(|e| e.to_string())?;
-        Ok(client
-            .tools_list()
-            .map_err(|e| e.to_string())?
+        // Connect + list, with one refresh retry on a stale OAuth token,
+        // the same bounded recovery the tool-call path has. Discovery is
+        // how an allowlist gets fixed; it must not require a fresh token.
+        let probe = |bearer: Option<String>| -> Result<Vec<apiary_runtime::mcp::McpTool>, String> {
+            let b = match &binding {
+                apiary_runtime::mcp::Binding::Http { url, .. } => {
+                    apiary_runtime::mcp::Binding::Http {
+                        url: url.clone(),
+                        bearer,
+                    }
+                }
+                other => other.clone(),
+            };
+            let mut client =
+                apiary_runtime::mcp::McpClient::connect(b).map_err(|e| e.to_string())?;
+            client.tools_list().map_err(|e| e.to_string())
+        };
+        let first_bearer = match &binding {
+            apiary_runtime::mcp::Binding::Http { bearer, .. } => bearer.clone(),
+            _ => None,
+        };
+        let tools = match probe(first_bearer) {
+            Ok(t) => t,
+            Err(e) if e.contains("mcp-auth-required") => {
+                let fresh = oauth_refresh
+                    .as_ref()
+                    .and_then(|o| apiary_runtime::connector::refresh_access_token(o).ok())
+                    .ok_or(format!(
+                        "token expired and refresh failed; re-grant the connector (CONNECT WITH \
+                         OAUTH) to re-authorize. Original: {e}"
+                    ))?;
+                probe(Some(fresh))?
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(tools
             .into_iter()
             .map(
                 |t| json!({"name": t.name, "description": t.description, "read_only": t.read_only}),
