@@ -521,7 +521,12 @@ pub fn load_manifest(
 ) -> Result<(String, Manifest), (StatusCode, Json<serde_json::Value>)> {
     let raw = std::fs::read_to_string(dir.join("manifest.yaml"))
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let m = Manifest::from_yaml(&raw).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // Unvalidated on purpose: the API must be able to SHOW and REPAIR an
+    // invalid manifest (e.g. an mcp grant missing its allowlist) — the
+    // cockpit's fix flow runs through these endpoints. Anything that
+    // EXECUTES the agent checks validate() and refuses with the reason.
+    let m = Manifest::from_yaml_unvalidated(&raw)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok((raw, m))
 }
 

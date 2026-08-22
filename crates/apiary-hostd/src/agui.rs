@@ -228,6 +228,13 @@ pub async fn run_stream(
     }
     // One host gate projects the signed ceremony into an operational answer.
     // A configuration change cannot reuse the preceding decision.
+    if let Err(e) = manifest.validate() {
+        return err(
+            StatusCode::CONFLICT,
+            format!("manifest is invalid — fix and re-ratify before running: {e}"),
+        )
+        .into_response();
+    }
     if !agent_decision(&state, &dir, &npub, &raw, &manifest).ratified {
         return err(
             StatusCode::CONFLICT,

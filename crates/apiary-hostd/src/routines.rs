@@ -579,6 +579,13 @@ pub async fn run_routine_now(
             Ok(v) => v,
             Err(e) => return e.into_response(),
         };
+    if let Err(e) = manifest.validate() {
+        return crate::err(
+            StatusCode::CONFLICT,
+            format!("manifest is invalid — fix and re-ratify before firing routines: {e}"),
+        )
+        .into_response();
+    }
     let Some(r) = manifest.routines.iter().find(|r| r.name == name).cloned() else {
         return crate::err(StatusCode::NOT_FOUND, format!("no routine '{name}'")).into_response();
     };

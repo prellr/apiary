@@ -786,6 +786,14 @@ impl Manifest {
         Ok(m)
     }
 
+    /// Parse WITHOUT the invariant checks — for surfaces that must be able
+    /// to display and REPAIR an invalid manifest (the cockpit's Connectors
+    /// tab fixing a missing allowlist). Never run an agent from this:
+    /// callers that execute must call validate() and refuse.
+    pub fn from_yaml_unvalidated(s: &str) -> Result<Self, crate::Error> {
+        Ok(serde_yaml::from_str(s)?)
+    }
+
     pub fn to_yaml(&self) -> Result<String, crate::Error> {
         Ok(serde_yaml::to_string(self)?)
     }
